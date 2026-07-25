@@ -22,7 +22,6 @@
 开发模式：
 
 ```powershell
-cd D:\DLOW\DM\TEST2\V16\file-terminal-desktop
 npm install
 npm run desktop:dev
 ```
