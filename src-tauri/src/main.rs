@@ -39,6 +39,17 @@ struct IndexItem {
     score: usize,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderRef {
+    id: String,
+    name: String,
+    path: String,
+    note: String,
+    tags: Vec<String>,
+    item_count: usize,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FolderImport {
@@ -314,6 +325,42 @@ fn import_folder(input: FolderImport, state: State<'_, AppState>) -> Result<usiz
 }
 
 #[tauri::command]
+fn list_folder_refs(state: State<'_, AppState>) -> Result<Vec<FolderRef>, String> {
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT folder_refs.id, folder_refs.name, folder_refs.root_path, folder_refs.note, folder_refs.tags_json, COUNT(index_items.id)
+             FROM folder_refs LEFT JOIN index_items ON index_items.folder_id = folder_refs.id
+             GROUP BY folder_refs.id
+             ORDER BY folder_refs.imported_at DESC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, usize>(5)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(rows
+        .filter_map(Result::ok)
+        .map(|(id, name, path, note, tags_json, item_count)| FolderRef {
+            id,
+            name,
+            path,
+            note,
+            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+            item_count,
+        })
+        .collect())
+}
+
+#[tauri::command]
 fn ask_assistant(question: String, state: State<'_, AppState>) -> Result<Vec<IndexItem>, String> {
     let terms = model_terms(&question, &state.data_dir);
     if terms.is_empty() { return Ok(Vec::new()); }
@@ -392,7 +439,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState { database: Mutex::new(connection), data_dir })
-        .invoke_handler(tauri::generate_handler![get_runtime_status, download_model, download_runtime, import_folder, ask_assistant, preview_file, reveal_in_explorer])
+        .invoke_handler(tauri::generate_handler![get_runtime_status, download_model, download_runtime, import_folder, list_folder_refs, ask_assistant, preview_file, reveal_in_explorer])
         .run(tauri::generate_context!())
         .expect("error while running 资料终端");
 }
