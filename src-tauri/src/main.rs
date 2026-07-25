@@ -37,6 +37,7 @@ struct IndexItem {
     note: String,
     tags: Vec<String>,
     score: usize,
+    display_path: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -48,6 +49,16 @@ struct FolderRef {
     note: String,
     tags: Vec<String>,
     item_count: usize,
+    display_path: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderEntry {
+    name: String,
+    path: String,
+    display_path: String,
+    item_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +95,16 @@ struct FilePreview {
     content: String,
     message: String,
     truncated: bool,
+    display_path: String,
+}
+
+fn display_path(path: &Path) -> String {
+    let value = path.display().to_string();
+    value
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| value.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or(value)
 }
 
 fn app_data_dir() -> Result<PathBuf, String> {
@@ -143,6 +164,24 @@ fn indexed_path(path: &Path, state: &AppState) -> Result<PathBuf, String> {
         .filter_map(|root| fs::canonicalize(root).ok())
         .any(|root| target.starts_with(root));
     permitted.then_some(target).ok_or_else(|| "只能预览已接入资料夹中的文件。".to_string())
+}
+
+fn folder_path(folder_id: &str, path: Option<&str>, state: &AppState) -> Result<PathBuf, String> {
+    let root_value = {
+        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+        connection
+            .query_row("SELECT root_path FROM folder_refs WHERE id = ?1", params![folder_id], |row| row.get::<_, String>(0))
+            .map_err(|_| "已接入的文件夹不存在。".to_string())?
+    };
+    let root = fs::canonicalize(root_value).map_err(|_| "已接入的文件夹已无法访问。".to_string())?;
+    let target = match path {
+        Some(value) => fs::canonicalize(value).map_err(|_| "文件夹不存在或无法访问。".to_string())?,
+        None => root.clone(),
+    };
+    if !target.is_dir() || !target.starts_with(&root) {
+        return Err("只能浏览已接入资料夹中的目录。".to_string());
+    }
+    Ok(target)
 }
 
 fn preview_mime(extension: &str) -> Option<(&'static str, &'static str)> {
@@ -352,12 +391,34 @@ fn list_folder_refs(state: State<'_, AppState>) -> Result<Vec<FolderRef>, String
         .map(|(id, name, path, note, tags_json, item_count)| FolderRef {
             id,
             name,
+            display_path: display_path(Path::new(&path)),
             path,
             note,
             tags: serde_json::from_str(&tags_json).unwrap_or_default(),
             item_count,
         })
         .collect())
+}
+
+#[tauri::command]
+fn list_folder_children(folder_id: String, path: Option<String>, state: State<'_, AppState>) -> Result<Vec<FolderEntry>, String> {
+    let directory = folder_path(&folder_id, path.as_deref(), &state)?;
+    let mut entries = fs::read_dir(&directory)
+        .map_err(|error| format!("无法读取文件夹：{error}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let entry_path = entry.path();
+            let item_type = if entry_path.is_dir() { "folder" } else { "file" };
+            Some(FolderEntry {
+                name: entry.file_name().to_string_lossy().to_string(),
+                display_path: display_path(&entry_path),
+                path: entry_path.display().to_string(),
+                item_type: item_type.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.item_type.cmp(&right.item_type).then_with(|| left.name.cmp(&right.name)));
+    Ok(entries)
 }
 
 #[tauri::command]
@@ -384,7 +445,7 @@ fn ask_assistant(question: String, state: State<'_, AppState>) -> Result<Vec<Ind
         .filter_map(|(id, item_type, name, path, note, tags_json)| {
             let tags = serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default();
             let score = matches_terms(&format!("{name} {path} {note} {}", tags.join(" ")), &terms);
-            (score > 0).then_some(IndexItem { id, item_type, name, path, note, tags, score })
+            (score > 0).then_some(IndexItem { id, item_type, name, display_path: display_path(Path::new(&path)), path, note, tags, score })
         })
         .collect::<Vec<_>>();
     results.sort_by(|left, right| right.score.cmp(&left.score).then_with(|| left.name.cmp(&right.name)));
@@ -397,22 +458,22 @@ fn preview_file(path: String, state: State<'_, AppState>) -> Result<FilePreview,
     let target = indexed_path(Path::new(&path), &state)?;
     let name = target.file_name().and_then(|value| value.to_str()).unwrap_or("未命名文件").to_string();
     if target.is_dir() {
-        return Ok(FilePreview { kind: "folder".into(), name, path: target.display().to_string(), mime_type: String::new(), content: String::new(), message: "文件夹不能直接预览；可在资源管理器中打开。".into(), truncated: false });
+        return Ok(FilePreview { kind: "folder".into(), name, display_path: display_path(&target), path: target.display().to_string(), mime_type: String::new(), content: String::new(), message: "文件夹不能直接预览；可在资源管理器中打开。".into(), truncated: false });
     }
     let metadata = fs::metadata(&target).map_err(|error| error.to_string())?;
     let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
     let Some((kind, mime_type)) = preview_mime(&extension) else {
-        return Ok(FilePreview { kind: "unsupported".into(), name, path: target.display().to_string(), mime_type: String::new(), content: String::new(), message: "此文件格式暂不支持内置预览；可在资源管理器中打开。".into(), truncated: false });
+        return Ok(FilePreview { kind: "unsupported".into(), name, display_path: display_path(&target), path: target.display().to_string(), mime_type: String::new(), content: String::new(), message: "此文件格式暂不支持内置预览；可在资源管理器中打开。".into(), truncated: false });
     };
     if metadata.len() > MAX_PREVIEW_BYTES {
-        return Ok(FilePreview { kind: "unsupported".into(), name, path: target.display().to_string(), mime_type: mime_type.into(), content: String::new(), message: "文件超过 1 MB，为避免卡顿未加载预览；可在资源管理器中打开。".into(), truncated: true });
+        return Ok(FilePreview { kind: "unsupported".into(), name, display_path: display_path(&target), path: target.display().to_string(), mime_type: mime_type.into(), content: String::new(), message: "文件超过 1 MB，为避免卡顿未加载预览；可在资源管理器中打开。".into(), truncated: true });
     }
     let bytes = fs::read(&target).map_err(|error| error.to_string())?;
     let (content, message) = match kind {
         "text" => (String::from_utf8_lossy(&bytes).to_string(), String::new()),
         _ => (BASE64.encode(bytes), String::new()),
     };
-    Ok(FilePreview { kind: kind.into(), name, path: target.display().to_string(), mime_type: mime_type.into(), content, message, truncated: false })
+    Ok(FilePreview { kind: kind.into(), name, display_path: display_path(&target), path: target.display().to_string(), mime_type: mime_type.into(), content, message, truncated: false })
 }
 
 #[tauri::command]
@@ -439,14 +500,15 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState { database: Mutex::new(connection), data_dir })
-        .invoke_handler(tauri::generate_handler![get_runtime_status, download_model, download_runtime, import_folder, list_folder_refs, ask_assistant, preview_file, reveal_in_explorer])
+        .invoke_handler(tauri::generate_handler![get_runtime_status, download_model, download_runtime, import_folder, list_folder_refs, list_folder_children, ask_assistant, preview_file, reveal_in_explorer])
         .run(tauri::generate_context!())
         .expect("error while running 资料终端");
 }
 
 #[cfg(test)]
 mod preview_tests {
-    use super::preview_mime;
+    use super::{display_path, preview_mime};
+    use std::path::Path;
 
     #[test]
     fn classifies_supported_preview_extensions() {
@@ -454,5 +516,10 @@ mod preview_tests {
         assert_eq!(preview_mime("md"), Some(("text", "text/plain")));
         assert_eq!(preview_mime("pdf"), Some(("pdf", "application/pdf")));
         assert_eq!(preview_mime("docx"), None);
+    }
+
+    #[test]
+    fn hides_windows_extended_path_prefix() {
+        assert_eq!(display_path(Path::new(r"\\?\D:\资料\模型")), r"D:\资料\模型");
     }
 }
