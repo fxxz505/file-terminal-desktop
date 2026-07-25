@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "资料终端",
+  "version": "0.1.1",
+  "identifier": "com.local.fileterminal",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:5189",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "资料终端",
+        "width": 1320,
+        "height": 860,
+        "minWidth": 980,
+        "minHeight": 680
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' https://huggingface.co https://github.com https://api.github.com; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "nsis",
+    "createUpdaterArtifacts": true,
+    "icon": ["icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM2MkM5NkRDMTgzMzEzRDgKUldUWUV6TVkzSllzTnBWdHhkMGxtQ0s3ekErTmxWVENFb2hPRU5NcmR4dS82czRRWUR2Qnd2V2kK",
+      "endpoints": [
+        "https://github.com/fxxz505/file-terminal-desktop/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}
