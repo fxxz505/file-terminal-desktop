@@ -6,16 +6,21 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import './styles.css';
 
 type RuntimeStatus = { modelInstalled: boolean; runtimeInstalled: boolean; modelPath: string };
-type Result = { id: string; itemType: string; name: string; path: string; note: string; tags: string[]; score: number };
-type FolderRef = { id: string; name: string; path: string; note: string; tags: string[]; itemCount: number };
+type Result = { id: string; itemType: string; name: string; path: string; displayPath: string; note: string; tags: string[]; score: number };
+type FolderRef = { id: string; name: string; path: string; displayPath: string; note: string; tags: string[]; itemCount: number };
+type FolderEntry = { name: string; path: string; displayPath: string; itemType: 'folder' | 'file' };
 type DownloadProgress = { kind: 'model' | 'runtime'; completed: number; total?: number };
-type FilePreview = { kind: 'image' | 'text' | 'pdf' | 'folder' | 'unsupported'; name: string; path: string; mimeType: string; content: string; message: string; truncated: boolean };
+type FilePreview = { kind: 'image' | 'text' | 'pdf' | 'folder' | 'unsupported'; name: string; path: string; displayPath: string; mimeType: string; content: string; message: string; truncated: boolean };
 type View = 'workspace' | 'search' | 'assistant';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 let status: RuntimeStatus = { modelInstalled: false, runtimeInstalled: false, modelPath: '' };
 let results: Result[] = [];
 let folderRefs: FolderRef[] = [];
+let activeFolder: FolderRef | null = null;
+let browserPath: string | null = null;
+let browserHistory: string[] = [];
+let folderEntries: FolderEntry[] = [];
 let progress: DownloadProgress | null = null;
 let preview: FilePreview | null = null;
 let error = '';
@@ -38,10 +43,11 @@ const icons = {
 
 function bytes(value = 0) { return value ? `${(value / 1024 / 1024).toFixed(value > 1024 * 1024 * 1024 ? 0 : 1)} MB` : '等待下载'; }
 function escapeHtml(value: string) { return value.replace(/[&<>'"]/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;' }[character]!)); }
+function displayPath(value: string) { return value.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, ''); }
 function stateChip(ready: boolean, waiting: string, readyText: string) { return `<span class="state setup-state ${ready ? 'ready' : ''}">${ready ? readyText : waiting}</span>`; }
 
 function resultRows(empty: string) {
-  return results.length ? `<div class="results">${results.map(result => `<button class="result preview-file" data-path="${escapeHtml(result.path)}"><span>${result.itemType === 'folder' ? icons.folder : icons.file}</span><b>${escapeHtml(result.name)}</b><small>${escapeHtml(result.path)}</small><em>匹配 ${result.score}</em></button>`).join('')}</div>` : `<div class="result-placeholder">${empty}</div>`;
+  return results.length ? `<div class="results">${results.map(result => `<button class="result preview-file" data-path="${escapeHtml(result.path)}"><span>${result.itemType === 'folder' ? icons.folder : icons.file}</span><b>${escapeHtml(result.name)}</b><small>${escapeHtml(result.displayPath)}</small><em>匹配 ${result.score}</em></button>`).join('')}</div>` : `<div class="result-placeholder">${empty}</div>`;
 }
 
 function previewPanel() {
@@ -49,7 +55,7 @@ function previewPanel() {
   const body = preview.kind === 'image' ? `<img src="data:${preview.mimeType};base64,${preview.content}" alt="${escapeHtml(preview.name)}">`
     : preview.kind === 'pdf' ? `<iframe title="${escapeHtml(preview.name)}" src="data:application/pdf;base64,${preview.content}"></iframe>`
       : preview.kind === 'text' ? `<pre>${escapeHtml(preview.content)}</pre>` : `<p>${escapeHtml(preview.message)}</p>`;
-  return `<section class="file-preview"><header><div><small>LOCAL PREVIEW</small><h2>${escapeHtml(preview.name)}</h2><span>${escapeHtml(preview.path)}</span></div><div><button class="quiet" id="reveal-file">在资源管理器中打开</button><button class="quiet" id="close-preview">关闭</button></div></header><div class="preview-body">${body}</div></section>`;
+  return `<section class="file-preview"><header><div><small>LOCAL PREVIEW</small><h2>${escapeHtml(preview.name)}</h2><span>${escapeHtml(preview.displayPath)}</span></div><div><button class="quiet" id="reveal-file">在资源管理器中打开</button><button class="quiet" id="close-preview">关闭</button></div></header><div class="preview-body">${body}</div></section>`;
 }
 
 function searchPanel() {
@@ -62,7 +68,13 @@ function assistantPanel() {
 
 function folderList() {
   if (!folderRefs.length) return `<div class="empty-folder"><span>${icons.folder}</span><strong>选择一个文件夹开始</strong><p>桌面端会原位建立目录索引，保留空目录和层级，后续可持续增量扫描。</p><button class="outline" id="choose-folder">选择本机文件夹</button></div>`;
-  return `<div class="imported-folders">${folderRefs.map(folder => `<article class="folder-ref"><span>${icons.folder}</span><div><b>${escapeHtml(folder.name)}</b><small>${escapeHtml(folder.path)}</small>${folder.note ? `<p>${escapeHtml(folder.note)}</p>` : ''}${folder.tags.length ? `<div class="tags">${folder.tags.map(tag => `<i>${escapeHtml(tag)}</i>`).join('')}</div>` : ''}</div><em>${folder.itemCount} 项索引</em></article>`).join('')}</div>`;
+  return `<div class="imported-folders">${folderRefs.map(folder => `<button class="folder-ref folder-ref-button" data-folder-id="${escapeHtml(folder.id)}"><span>${icons.folder}</span><div><b>${escapeHtml(folder.name)}</b><small>${escapeHtml(folder.displayPath)}</small>${folder.note ? `<p>${escapeHtml(folder.note)}</p>` : ''}${folder.tags.length ? `<div class="tags">${folder.tags.map(tag => `<i>${escapeHtml(tag)}</i>`).join('')}</div>` : ''}</div><em>${folder.itemCount} 项索引</em></button>`).join('')}</div>`;
+}
+
+function folderBrowser() {
+  if (!activeFolder) return '';
+  const currentPath = browserPath ?? activeFolder.path;
+  return `<section class="folder-browser panel"><header><div><small>INLINE BROWSER</small><h2>${escapeHtml(activeFolder.name)}</h2><span>${escapeHtml(displayPath(browserPath ?? activeFolder.displayPath))}</span></div><div><button class="quiet" id="browser-back" ${browserHistory.length ? '' : 'disabled'}>返回上级</button><button class="quiet" id="browser-reveal">在资源管理器中打开</button><button class="quiet" id="close-browser">关闭</button></div></header><div class="browser-items">${folderEntries.length ? folderEntries.map(entry => `<button class="browser-entry ${entry.itemType === 'folder' ? 'browser-folder' : 'preview-file'}" data-path="${escapeHtml(entry.path)}"><span>${entry.itemType === 'folder' ? icons.folder : icons.file}</span><b>${escapeHtml(entry.name)}</b><small>${escapeHtml(entry.displayPath)}</small></button>`).join('') : `<p>此文件夹为空。</p>`}</div><input type="hidden" value="${escapeHtml(currentPath)}"></section>`;
 }
 
 function workspacePanel() {
@@ -79,12 +91,16 @@ function render() {
     assistant: { title: 'AI 助手', subtitle: '理解问题后，以本地索引给出结果', content: assistantPanel() },
   };
   const page = pages[activeView];
-  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-view="assistant">${icons.spark}<span>AI 助手</span></button></nav><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>`;
+  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-view="assistant">${icons.spark}<span>AI 助手</span></button></nav><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${folderBrowser()}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>`;
   bind();
 }
 
 async function refreshStatus() { [status, folderRefs] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs')]); render(); }
 async function loadFolderRefs() { folderRefs = await invoke<FolderRef[]>('list_folder_refs'); }
+async function openFolder(folderId: string, path?: string) { const folder = folderRefs.find(item => item.id === folderId); if (!folder) return; activeFolder = folder; browserPath = path ?? folder.path; folderEntries = await invoke<FolderEntry[]>('list_folder_children', { folderId, path: browserPath }); render(); }
+async function navigateFolder(path: string) { if (!activeFolder) return; browserHistory.push(browserPath ?? activeFolder.path); await openFolder(activeFolder.id, path); }
+async function browserBack() { if (!activeFolder || !browserHistory.length) return; const previous = browserHistory.pop(); await openFolder(activeFolder.id, previous); }
+async function revealFolder() { if (!activeFolder) return; try { await invoke('reveal_in_explorer', { path: browserPath ?? activeFolder.path }); } catch (reason) { error = `无法打开资源管理器：${String(reason)}`; render(); } }
 async function selectFolder() {
   const selected = await open({ directory: true, multiple: false, title: '选择要接入的文件夹' });
   if (!selected || Array.isArray(selected)) return;
@@ -136,6 +152,11 @@ async function installUpdate() {
 }
 
 function bind() {
+  document.querySelectorAll<HTMLElement>('.folder-ref-button').forEach(button => button.addEventListener('click', () => openFolder(button.dataset.folderId ?? '').catch(reason => { error = `无法打开文件夹：${String(reason)}`; render(); })));
+  document.querySelectorAll<HTMLElement>('.browser-folder').forEach(button => button.addEventListener('click', () => navigateFolder(button.dataset.path ?? '').catch(reason => { error = `无法读取文件夹：${String(reason)}`; render(); })));
+  document.querySelector('#browser-back')?.addEventListener('click', () => browserBack().catch(reason => { error = `无法返回上级：${String(reason)}`; render(); }));
+  document.querySelector('#browser-reveal')?.addEventListener('click', revealFolder);
+  document.querySelector('#close-browser')?.addEventListener('click', () => { activeFolder = null; browserPath = null; browserHistory = []; folderEntries = []; render(); });
   document.querySelectorAll<HTMLElement>('.preview-file').forEach(button => button.addEventListener('click', () => loadPreview(button.dataset.path ?? '')));
   document.querySelector('#close-preview')?.addEventListener('click', () => { preview = null; render(); });
   document.querySelector('#reveal-file')?.addEventListener('click', revealPreview);

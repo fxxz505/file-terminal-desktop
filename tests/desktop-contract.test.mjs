@@ -29,6 +29,18 @@ test('workspace loads and displays each imported folder reference', async () => 
   assert.match(shell, /imported-folders/);
 });
 
+test('imported folders use readable Windows paths and open in the inline browser', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /fn display_path/);
+  assert.match(backend, /fn list_folder_children/);
+  assert.match(backend, /display_path:/);
+  assert.match(shell, /displayPath/);
+  assert.match(shell, /openFolder/);
+  assert.match(shell, /folder-browser/);
+  assert.match(shell, /folder-ref-button/);
+});
+
 test('search results support safe local file previews and Explorer opening', async () => {
   const source = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
