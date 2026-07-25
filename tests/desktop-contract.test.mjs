@@ -18,6 +18,17 @@ test('desktop shell exposes native model download and grounded assistant command
   assert.match(source, /fn import_folder/);
 });
 
+test('workspace loads and displays each imported folder reference', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /fn list_folder_refs/);
+  assert.match(backend, /COUNT\(index_items\.id\)/);
+  assert.match(backend, /list_folder_refs/);
+  assert.match(shell, /folderRefs/);
+  assert.match(shell, /loadFolderRefs/);
+  assert.match(shell, /imported-folders/);
+});
+
 test('search results support safe local file previews and Explorer opening', async () => {
   const source = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
