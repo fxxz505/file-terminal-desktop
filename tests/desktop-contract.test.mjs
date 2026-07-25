@@ -18,6 +18,11 @@ test('desktop shell exposes native model download and grounded assistant command
   assert.match(source, /fn import_folder/);
 });
 
+test('Windows release starts without a console window', async () => {
+  const source = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  assert.match(source, /cfg_attr\(not\(debug_assertions\), windows_subsystem = "windows"\)/);
+});
+
 test('assistant contract includes a deterministic fallback for game intent', async () => {
   const source = await readFile(new URL('../src-tauri/src/assistant.rs', import.meta.url), 'utf8');
   assert.match(source, /normalized\.contains\("游戏"\) \|\| normalized\.contains\("玩"\)/);

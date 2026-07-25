@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use file_terminal_desktop::assistant::{extract_search_terms, matches_terms, parse_model_terms};
 use futures_util::StreamExt;
 use rusqlite::{params, Connection};
