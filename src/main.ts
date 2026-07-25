@@ -8,12 +8,14 @@ import './styles.css';
 type RuntimeStatus = { modelInstalled: boolean; runtimeInstalled: boolean; modelPath: string };
 type Result = { id: string; itemType: string; name: string; path: string; note: string; tags: string[]; score: number };
 type DownloadProgress = { kind: 'model' | 'runtime'; completed: number; total?: number };
+type FilePreview = { kind: 'image' | 'text' | 'pdf' | 'folder' | 'unsupported'; name: string; path: string; mimeType: string; content: string; message: string; truncated: boolean };
 type View = 'workspace' | 'search' | 'assistant';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 let status: RuntimeStatus = { modelInstalled: false, runtimeInstalled: false, modelPath: '' };
 let results: Result[] = [];
 let progress: DownloadProgress | null = null;
+let preview: FilePreview | null = null;
 let error = '';
 let isWorking = false;
 let activeView: View = 'workspace';
@@ -37,7 +39,15 @@ function escapeHtml(value: string) { return value.replace(/[&<>'"]/g, character 
 function stateChip(ready: boolean, waiting: string, readyText: string) { return `<span class="state setup-state ${ready ? 'ready' : ''}">${ready ? readyText : waiting}</span>`; }
 
 function resultRows(empty: string) {
-  return results.length ? `<div class="results">${results.map(result => `<button class="result"><span>${result.itemType === 'folder' ? icons.folder : icons.file}</span><b>${escapeHtml(result.name)}</b><small>${escapeHtml(result.path)}</small><em>匹配 ${result.score}</em></button>`).join('')}</div>` : `<div class="result-placeholder">${empty}</div>`;
+  return results.length ? `<div class="results">${results.map(result => `<button class="result preview-file" data-path="${escapeHtml(result.path)}"><span>${result.itemType === 'folder' ? icons.folder : icons.file}</span><b>${escapeHtml(result.name)}</b><small>${escapeHtml(result.path)}</small><em>匹配 ${result.score}</em></button>`).join('')}</div>` : `<div class="result-placeholder">${empty}</div>`;
+}
+
+function previewPanel() {
+  if (!preview) return '';
+  const body = preview.kind === 'image' ? `<img src="data:${preview.mimeType};base64,${preview.content}" alt="${escapeHtml(preview.name)}">`
+    : preview.kind === 'pdf' ? `<iframe title="${escapeHtml(preview.name)}" src="data:application/pdf;base64,${preview.content}"></iframe>`
+      : preview.kind === 'text' ? `<pre>${escapeHtml(preview.content)}</pre>` : `<p>${escapeHtml(preview.message)}</p>`;
+  return `<section class="file-preview"><header><div><small>LOCAL PREVIEW</small><h2>${escapeHtml(preview.name)}</h2><span>${escapeHtml(preview.path)}</span></div><div><button class="quiet" id="reveal-file">在资源管理器中打开</button><button class="quiet" id="close-preview">关闭</button></div></header><div class="preview-body">${body}</div></section>`;
 }
 
 function searchPanel() {
@@ -62,7 +72,7 @@ function render() {
     assistant: { title: 'AI 助手', subtitle: '理解问题后，以本地索引给出结果', content: assistantPanel() },
   };
   const page = pages[activeView];
-  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-view="assistant">${icons.spark}<span>AI 助手</span></button></nav><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>`;
+  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-view="assistant">${icons.spark}<span>AI 助手</span></button></nav><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>`;
   bind();
 }
 
@@ -77,6 +87,8 @@ async function selectFolder() {
 }
 async function provision(kind: 'runtime' | 'model') { isWorking = true; error = ''; progress = { kind, completed: 0 }; render(); try { status = await invoke<RuntimeStatus>(kind === 'runtime' ? 'download_runtime' : 'download_model'); } catch (reason) { error = String(reason); } finally { isWorking = false; progress = null; render(); } }
 async function ask(question: string) { isWorking = true; error = ''; render(); try { results = await invoke<Result[]>('ask_assistant', { question }); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
+async function loadPreview(path: string) { if (!path) return; isWorking = true; error = ''; render(); try { preview = await invoke<FilePreview>('preview_file', { path }); } catch (reason) { error = `无法预览文件：${String(reason)}`; } finally { isWorking = false; render(); } }
+async function revealPreview() { if (!preview) return; try { await invoke('reveal_in_explorer', { path: preview.path }); } catch (reason) { error = `无法打开资源管理器：${String(reason)}`; render(); } }
 async function checkForUpdate() {
   try {
     const update = await check();
@@ -116,6 +128,9 @@ async function installUpdate() {
 }
 
 function bind() {
+  document.querySelectorAll<HTMLElement>('.preview-file').forEach(button => button.addEventListener('click', () => loadPreview(button.dataset.path ?? '')));
+  document.querySelector('#close-preview')?.addEventListener('click', () => { preview = null; render(); });
+  document.querySelector('#reveal-file')?.addEventListener('click', revealPreview);
   document.querySelectorAll<HTMLElement>('[data-view]').forEach(button => button.addEventListener('click', () => { activeView = button.dataset.view as View; render(); }));
   document.querySelector('#import-folder')?.addEventListener('click', selectFolder); document.querySelector('#choose-folder')?.addEventListener('click', selectFolder); document.querySelector('#refresh')?.addEventListener('click', refreshStatus); document.querySelector('#download-runtime')?.addEventListener('click', () => provision('runtime')); document.querySelector('#download-model')?.addEventListener('click', () => provision('model'));
   document.querySelector('#install-update')?.addEventListener('click', installUpdate);

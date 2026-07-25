@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use file_terminal_desktop::assistant::{extract_search_terms, matches_terms, parse_model_terms};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::StreamExt;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ const APP_FOLDER: &str = "资料终端";
 const RUNTIME_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b10107/llama-b10107-bin-win-cpu-x64.zip";
 const MODEL_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf";
 const MODEL_FILE: &str = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
+const MAX_PREVIEW_BYTES: u64 = 1_048_576;
 
 struct AppState {
     database: Mutex<Connection>,
@@ -59,6 +61,18 @@ struct RuntimeStatus {
     model_installed: bool,
     runtime_installed: bool,
     model_path: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FilePreview {
+    kind: String,
+    name: String,
+    path: String,
+    mime_type: String,
+    content: String,
+    message: String,
+    truncated: bool,
 }
 
 fn app_data_dir() -> Result<PathBuf, String> {
@@ -102,6 +116,35 @@ fn validate_folder_path(value: &str) -> Result<PathBuf, String> {
         return Err("请选择一个存在的文件夹。".to_string());
     }
     fs::canonicalize(path).map_err(|error| format!("无法访问文件夹：{error}"))
+}
+
+fn indexed_path(path: &Path, state: &AppState) -> Result<PathBuf, String> {
+    let target = fs::canonicalize(path).map_err(|_| "文件不存在或无法访问。".to_string())?;
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut statement = connection
+        .prepare("SELECT root_path FROM folder_refs")
+        .map_err(|error| error.to_string())?;
+    let roots = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let permitted = roots
+        .filter_map(Result::ok)
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .any(|root| target.starts_with(root));
+    permitted.then_some(target).ok_or_else(|| "只能预览已接入资料夹中的文件。".to_string())
+}
+
+fn preview_mime(extension: &str) -> Option<(&'static str, &'static str)> {
+    match extension {
+        "png" => Some(("image", "image/png")),
+        "jpg" | "jpeg" => Some(("image", "image/jpeg")),
+        "gif" => Some(("image", "image/gif")),
+        "webp" => Some(("image", "image/webp")),
+        "bmp" => Some(("image", "image/bmp")),
+        "pdf" => Some(("pdf", "application/pdf")),
+        "txt" | "md" | "csv" | "json" | "log" | "rs" | "ts" | "js" | "html" | "css" | "xml" | "yml" | "yaml" | "toml" => Some(("text", "text/plain")),
+        _ => None,
+    }
 }
 
 fn safe_file_name(url: &str, default_name: &str) -> String {
@@ -302,6 +345,42 @@ fn ask_assistant(question: String, state: State<'_, AppState>) -> Result<Vec<Ind
     Ok(results)
 }
 
+#[tauri::command]
+fn preview_file(path: String, state: State<'_, AppState>) -> Result<FilePreview, String> {
+    let target = indexed_path(Path::new(&path), &state)?;
+    let name = target.file_name().and_then(|value| value.to_str()).unwrap_or("未命名文件").to_string();
+    if target.is_dir() {
+        return Ok(FilePreview { kind: "folder".into(), name, path: target.display().to_string(), mime_type: String::new(), content: String::new(), message: "文件夹不能直接预览；可在资源管理器中打开。".into(), truncated: false });
+    }
+    let metadata = fs::metadata(&target).map_err(|error| error.to_string())?;
+    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+    let Some((kind, mime_type)) = preview_mime(&extension) else {
+        return Ok(FilePreview { kind: "unsupported".into(), name, path: target.display().to_string(), mime_type: String::new(), content: String::new(), message: "此文件格式暂不支持内置预览；可在资源管理器中打开。".into(), truncated: false });
+    };
+    if metadata.len() > MAX_PREVIEW_BYTES {
+        return Ok(FilePreview { kind: "unsupported".into(), name, path: target.display().to_string(), mime_type: mime_type.into(), content: String::new(), message: "文件超过 1 MB，为避免卡顿未加载预览；可在资源管理器中打开。".into(), truncated: true });
+    }
+    let bytes = fs::read(&target).map_err(|error| error.to_string())?;
+    let (content, message) = match kind {
+        "text" => (String::from_utf8_lossy(&bytes).to_string(), String::new()),
+        _ => (BASE64.encode(bytes), String::new()),
+    };
+    Ok(FilePreview { kind: kind.into(), name, path: target.display().to_string(), mime_type: mime_type.into(), content, message, truncated: false })
+}
+
+#[tauri::command]
+fn reveal_in_explorer(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let target = indexed_path(Path::new(&path), &state)?;
+    let mut command = Command::new("explorer.exe");
+    if target.is_file() {
+        command.arg("/select,").arg(&target);
+    } else {
+        command.arg(&target);
+    }
+    command.spawn().map_err(|error| format!("无法打开资源管理器：{error}"))?;
+    Ok(())
+}
+
 fn main() {
     let data_dir = app_data_dir().expect("unable to locate app data directory");
     fs::create_dir_all(&data_dir).expect("unable to create app data directory");
@@ -313,7 +392,20 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState { database: Mutex::new(connection), data_dir })
-        .invoke_handler(tauri::generate_handler![get_runtime_status, download_model, download_runtime, import_folder, ask_assistant])
+        .invoke_handler(tauri::generate_handler![get_runtime_status, download_model, download_runtime, import_folder, ask_assistant, preview_file, reveal_in_explorer])
         .run(tauri::generate_context!())
         .expect("error while running 资料终端");
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::preview_mime;
+
+    #[test]
+    fn classifies_supported_preview_extensions() {
+        assert_eq!(preview_mime("png"), Some(("image", "image/png")));
+        assert_eq!(preview_mime("md"), Some(("text", "text/plain")));
+        assert_eq!(preview_mime("pdf"), Some(("pdf", "application/pdf")));
+        assert_eq!(preview_mime("docx"), None);
+    }
 }

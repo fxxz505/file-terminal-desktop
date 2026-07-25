@@ -18,6 +18,18 @@ test('desktop shell exposes native model download and grounded assistant command
   assert.match(source, /fn import_folder/);
 });
 
+test('search results support safe local file previews and Explorer opening', async () => {
+  const source = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(source, /fn preview_file/);
+  assert.match(source, /fn reveal_in_explorer/);
+  assert.match(source, /MAX_PREVIEW_BYTES/);
+  assert.match(source, /tauri::generate_handler!\[[^\]]*preview_file[^\]]*reveal_in_explorer/s);
+  assert.match(shell, /preview-file/);
+  assert.match(shell, /file-preview/);
+  assert.match(shell, /reveal_in_explorer/);
+});
+
 test('Windows release starts without a console window', async () => {
   const source = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   assert.match(source, /cfg_attr\(not\(debug_assertions\), windows_subsystem = "windows"\)/);

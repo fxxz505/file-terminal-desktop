@@ -1,6 +1,6 @@
 [package]
 name = "file-terminal-desktop"
-version = "0.1.2"
+version = "0.1.3"
 description = "A local-first file assistant"
 authors = ["local"]
 edition = "2021"
@@ -26,6 +26,7 @@ uuid = { version = "1.16", features = ["v4"] }
 url = "2.5"
 thiserror = "2.0"
 dirs = "6.0"
+base64 = "0.22"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 
