@@ -2,6 +2,12 @@
 
 一个 Windows 本地优先的文件夹助手：文件仍保留在原位置，应用用 SQLite 在本机保存索引、备注和标签，并将小型语言模型下载到应用自身的数据目录中运行。
 
+## 下载 Windows 版
+
+**[下载最新 Windows 安装包](https://github.com/fxxz505/file-terminal-desktop/releases/latest)**
+
+打开页面后，在 `Assets` 中点击 `_x64-setup.exe` 下载并安装。后续版本会通过应用内自动更新，无需重新查找安装包。
+
 ## 已完成的桌面能力
 
 - 选择本机文件夹，递归建立目录/文件索引，不复制、移动或删除原文件。
@@ -17,7 +23,7 @@
 - 文件夹仅被读取来建立索引；不会上传、移动、删除或改写任何原文件。
 - 模型及运行时仅在你点击应用内下载按钮后下载。默认模型下载约 1 GB，运行时从 llama.cpp 官方 GitHub Releases 下载。
 
-## 运行
+## 从源码运行
 
 开发模式：
 
@@ -25,10 +31,6 @@
 npm install
 npm run desktop:dev
 ```
-
-已生成的 Windows 安装包：
-
-`src-tauri\target\release\bundle\nsis\资料终端_0.1.1_x64-setup.exe`
 
 ## 自动更新
 
