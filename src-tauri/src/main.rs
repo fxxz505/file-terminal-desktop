@@ -582,6 +582,15 @@ struct AgentEvent {
     created_at: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentEvidenceReport {
+    run_id: String,
+    status: String,
+    final_evidence: Vec<String>,
+    restricted_bindings: usize,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FolderIdInput {
@@ -744,6 +753,16 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS agent_events_run_idx ON agent_events(run_id, created_at);
+            CREATE TABLE IF NOT EXISTS agent_source_bindings (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                source_item_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                cloud_policy TEXT NOT NULL,
+                is_restricted INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS agent_source_bindings_run_idx ON agent_source_bindings(run_id);
             CREATE TABLE IF NOT EXISTS local_models (
                 id TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL,
@@ -3595,6 +3614,25 @@ fn store_agent_run(run: &AgentRun, state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+// Bind source identities and paths locally only; cloud payloads never receive these bindings.
+fn bind_agent_sources(run_id: &str, sources: &[IndexItem], state: &AppState) -> Result<(), String> {
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    for source in sources {
+        connection.execute("INSERT INTO agent_source_bindings (id, run_id, source_item_id, source_path, cloud_policy, is_restricted, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))", params![Uuid::new_v4().to_string(), run_id, source.id, source.path, source.cloud_policy.as_database(), source.cloud_policy != CloudPolicy::CloudAllowed]).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_agent_evidence_report(input: AgentRunIdInput, state: State<'_, AppState>) -> Result<AgentEvidenceReport, String> {
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let status = connection.query_row("SELECT status FROM agent_runs WHERE id = ?1", params![input.run_id], |row| row.get::<_, String>(0)).map_err(|_| "任务不存在。".to_string())?;
+    let restricted_bindings = connection.query_row("SELECT COUNT(*) FROM agent_source_bindings WHERE run_id = ?1 AND is_restricted = 1", params![input.run_id], |row| row.get::<_, usize>(0)).map_err(|error| error.to_string())?;
+    let mut statement = connection.prepare("SELECT status, message, created_at FROM agent_events WHERE run_id = ?1 ORDER BY rowid ASC LIMIT 100").map_err(|error| error.to_string())?;
+    let evidence = statement.query_map(params![input.run_id], |row| Ok(format!("{} · {} · {}", row.get::<_, String>(2)?, row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map_err(|error| error.to_string())?.filter_map(Result::ok).collect();
+    Ok(AgentEvidenceReport { run_id: input.run_id, status, final_evidence: evidence, restricted_bindings })
+}
+
 fn update_agent_run_status(
     run_id: &str,
     status: &str,
@@ -3850,6 +3888,7 @@ fn prepare_agent_run(
         conversation_id: Some(user_message.conversation_id.clone()),
     };
     store_agent_run(&run, &state)?;
+    bind_agent_sources(&run.id, &sources, &state)?;
     state
         .prepared_runs
         .lock()
@@ -4403,6 +4442,7 @@ fn main() {
             approve_agent_step,
             retry_agent_run,
             list_agent_events,
+            get_agent_evidence_report,
             prepare_ai_output,
             write_ai_file,
             apply_agent_advice,

@@ -442,3 +442,15 @@ test('model execution settings and environment acceptance distinguish verified c
   assert.match(shell, /run_environment_acceptance/);
   assert.match(shell, /runtime-settings/);
 });
+
+test('agent run reports bind restricted sources locally and retain final build evidence without storing source content', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /CREATE TABLE IF NOT EXISTS agent_source_bindings/);
+  assert.match(backend, /fn bind_agent_sources/);
+  assert.match(backend, /fn get_agent_evidence_report/);
+  assert.match(backend, /final_evidence/);
+  assert.match(backend, /source_path TEXT/);
+  assert.match(shell, /get_agent_evidence_report/);
+  assert.match(shell, /agent-evidence-report/);
+});
