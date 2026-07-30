@@ -3319,9 +3319,13 @@ fn backup_key_entry() -> Result<Entry, String> {
 
 fn backup_key() -> Result<[u8; 32], String> {
     let entry = backup_key_entry()?;
-    if let Ok(encoded) = entry.get_password() {
-        let decoded = BASE64.decode(encoded).map_err(|_| "本地备份密钥无效。".to_string())?;
-        return decoded.try_into().map_err(|_| "本地备份密钥长度无效。".to_string());
+    match entry.get_password() {
+        Ok(encoded) => {
+            let decoded = BASE64.decode(encoded).map_err(|_| "本地备份密钥无效。".to_string())?;
+            return decoded.try_into().map_err(|_| "本地备份密钥长度无效。".to_string());
+        }
+        Err(keyring::Error::NoEntry) => {}
+        Err(_) => return Err("无法读取 Windows 凭据库中的备份密钥。".to_string()),
     }
     let mut key = [0u8; 32];
     rand::rng().fill_bytes(&mut key);
