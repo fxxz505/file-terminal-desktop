@@ -429,3 +429,16 @@ test('document parsing supports PDF body text and read-only Office text previews
   assert.match(backend, /fn office_preview_text/);
   assert.match(backend, /ffmpeg/);
 });
+
+test('model execution settings and environment acceptance distinguish verified capabilities from user-device checks', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /CREATE TABLE IF NOT EXISTS runtime_settings/);
+  assert.match(backend, /fn get_runtime_settings/);
+  assert.match(backend, /fn save_runtime_settings/);
+  assert.match(backend, /fn run_environment_acceptance/);
+  assert.match(backend, /--threads/);
+  assert.match(backend, /--ctx-size/);
+  assert.match(shell, /run_environment_acceptance/);
+  assert.match(shell, /runtime-settings/);
+});

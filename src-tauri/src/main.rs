@@ -372,6 +372,23 @@ struct RuntimeStatus {
     active_model_name: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeSettings {
+    execution_mode: String,
+    threads: usize,
+    context_size: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceptanceCheck {
+    id: String,
+    label: String,
+    status: String,
+    detail: String,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FilePreview {
@@ -739,6 +756,13 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 auto_apply_low_risk INTEGER NOT NULL DEFAULT 0
             );
             INSERT OR IGNORE INTO agent_preferences (id, auto_apply_low_risk) VALUES (1, 0);
+            CREATE TABLE IF NOT EXISTS runtime_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                execution_mode TEXT NOT NULL DEFAULT 'auto',
+                threads INTEGER NOT NULL DEFAULT 4,
+                context_size INTEGER NOT NULL DEFAULT 4096
+            );
+            INSERT OR IGNORE INTO runtime_settings (id, execution_mode, threads, context_size) VALUES (1, 'auto', 4, 4096);
             CREATE TABLE IF NOT EXISTS index_jobs (
                 id TEXT PRIMARY KEY,
                 folder_id TEXT NOT NULL,
@@ -1104,6 +1128,38 @@ fn active_model_path(state: &AppState) -> PathBuf {
     selected.unwrap_or_else(|| state.data_dir.join("models").join(MODEL_FILE))
 }
 
+fn runtime_settings(state: &AppState) -> RuntimeSettings {
+    state.database.lock().ok().and_then(|connection| connection.query_row("SELECT execution_mode, threads, context_size FROM runtime_settings WHERE id = 1", [], |row| Ok(RuntimeSettings { execution_mode: row.get(0)?, threads: row.get::<_, usize>(1)?, context_size: row.get::<_, usize>(2)? })).ok()).unwrap_or(RuntimeSettings { execution_mode: "auto".into(), threads: 4, context_size: 4096 })
+}
+
+#[tauri::command]
+fn get_runtime_settings(state: State<'_, AppState>) -> RuntimeSettings { runtime_settings(&state) }
+
+#[tauri::command]
+fn save_runtime_settings(input: RuntimeSettings, state: State<'_, AppState>) -> Result<RuntimeSettings, String> {
+    if !matches!(input.execution_mode.as_str(), "auto" | "cpu" | "gpu") || !(1..=64).contains(&input.threads) || !(512..=32768).contains(&input.context_size) { return Err("运行设置超出安全范围。".to_string()); }
+    state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?.execute("UPDATE runtime_settings SET execution_mode = ?1, threads = ?2, context_size = ?3 WHERE id = 1", params![input.execution_mode, input.threads, input.context_size]).map_err(|error| error.to_string())?;
+    Ok(input)
+}
+
+#[tauri::command]
+fn run_environment_acceptance(state: State<'_, AppState>) -> Vec<AcceptanceCheck> {
+    let runtime = state.data_dir.join("runtime").join("llama-cli.exe");
+    let model = active_model_path(&state);
+    let tools = get_local_tool_status();
+    vec![
+        AcceptanceCheck { id: "runtime".into(), label: "llama.cpp 运行时".into(), status: if runtime.is_file() { "passed" } else { "failed" }.into(), detail: "检查本机已下载运行时。".into() },
+        AcceptanceCheck { id: "model".into(), label: "本地 GGUF 模型".into(), status: if model.is_file() { "passed" } else { "failed" }.into(), detail: "检查当前模型文件可读。".into() },
+        AcceptanceCheck { id: "pdf".into(), label: "PDF 正文解析".into(), status: if tools.pdf_text { "passed" } else { "failed" }.into(), detail: "内置本地 PDF 文本解析器。".into() },
+        AcceptanceCheck { id: "office".into(), label: "Office 文本提取".into(), status: "manual".into(), detail: "需要在用户含复杂 Office 文件的设备上实测。".into() },
+        AcceptanceCheck { id: "ocr".into(), label: "OCR".into(), status: if tools.ocr { "manual" } else { "skipped" }.into(), detail: "需安装本地 Tesseract 后使用。".into() },
+        AcceptanceCheck { id: "transcription".into(), label: "音视频转写".into(), status: if tools.transcription && tools.ffmpeg { "manual" } else { "skipped" }.into(), detail: "需安装本地 Whisper 和 FFmpeg 后使用。".into() },
+        AcceptanceCheck { id: "chinese_path".into(), label: "中文路径".into(), status: "manual".into(), detail: "需在最终用户设备选择中文路径资料夹实测。".into() },
+        AcceptanceCheck { id: "cloud".into(), label: "云端协作".into(), status: "manual".into(), detail: "需配置用户自己的供应商后发送脱敏测试请求。".into() },
+        AcceptanceCheck { id: "updater".into(), label: "自动更新".into(), status: "manual".into(), detail: "需使用已签名发布包在最终用户设备实测。".into() },
+    ]
+}
+
 fn index_content(connection: &Connection, item_id: &str, path: &Path) -> Result<(), String> {
     connection
         .execute(
@@ -1336,6 +1392,7 @@ fn model_terms(question: &str, state: &AppState) -> Vec<String> {
     let prompt = format!(
         "You extract local-file search keywords. Return only a comma-separated list of at most 6 Chinese or English keywords. User question: {question}"
     );
+    let settings = runtime_settings(state);
     let output = Command::new(runtime)
         .arg("-m")
         .arg(model)
@@ -1345,6 +1402,10 @@ fn model_terms(question: &str, state: &AppState) -> Vec<String> {
         .arg("48")
         .arg("--temp")
         .arg("0")
+        .arg("--threads")
+        .arg(settings.threads.to_string())
+        .arg("--ctx-size")
+        .arg(settings.context_size.to_string())
         .output();
     output
         .ok()
@@ -1417,7 +1478,9 @@ fn local_agent_reply(
     let prompt = format!(
         "你是完全离线的资料助手。仅根据下方本地对话和索引摘要回答，不能编造文件、不能执行命令、不能联网。返回单个 JSON 对象：{{\"answer\":\"...\",\"steps\":[\"...\"]}}。回答中文、简短。\n本地对话：\n{context}\n当前问题：{question}\n本地索引：\n{source_summary}"
     );
-    let mut child = match Command::new(runtime)
+    let settings = runtime_settings(state);
+    let mut command = Command::new(runtime);
+    command
         .arg("-m")
         .arg(model)
         .arg("-p")
@@ -1426,11 +1489,15 @@ fn local_agent_reply(
         .arg("360")
         .arg("--temp")
         .arg("0.2")
+        .arg("--threads")
+        .arg(settings.threads.to_string())
+        .arg("--ctx-size")
+        .arg(settings.context_size.to_string())
         .arg("--no-display-prompt")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    if settings.execution_mode == "cpu" { command.arg("-ngl").arg("0"); }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return Ok(fallback),
     };
@@ -4288,6 +4355,9 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_runtime_status,
+            get_runtime_settings,
+            save_runtime_settings,
+            run_environment_acceptance,
             download_model,
             download_runtime,
             list_local_models,

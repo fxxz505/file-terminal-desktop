@@ -33,6 +33,8 @@ type IndexJob = { id: string; folderId: string; status: 'queued' | 'running' | '
 type FolderChangeDetected = { folderId: string; changedAt: string };
 type AgentPreferences = { autoApplyLowRisk: boolean };
 type PrivacyStatus = { databaseEncrypted: boolean; message: string; recommendation: string };
+type RuntimeSettings = { executionMode: 'auto' | 'cpu' | 'gpu'; threads: number; contextSize: number };
+type AcceptanceCheck = { id: string; label: string; status: 'passed' | 'failed' | 'manual' | 'skipped'; detail: string };
 type EncryptedBackup = { path: string; displayPath: string; createdAt: string; databaseBytes: number };
 type SensitiveFinding = { itemId: string; name: string; displayPath: string; category: string; matchCount: number };
 type MetadataAuditEntry = { id: string; targetType: string; targetId: string; action: string; oldPolicy?: string; newPolicy?: string; createdAt: string };
@@ -82,6 +84,8 @@ let privacyStatus: PrivacyStatus | null = null;
 let encryptedBackup: EncryptedBackup | null = null;
 let sensitiveFindings: SensitiveFinding[] = [];
 let auditEntries: MetadataAuditEntry[] = [];
+let runtimeSettings: RuntimeSettings = { executionMode: 'auto', threads: 4, contextSize: 4096 };
+let acceptanceChecks: AcceptanceCheck[] = [];
 const folderRefreshTimers = new Map<string, number>();
 
 const icon = (name: string) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${name}"/></svg>`;
@@ -171,7 +175,8 @@ function workspaceExtras() {
   const watching = folderRefs.length ? '<div class="index-progress"><b>自动索引</b><span>正在监听已接入资料夹</span></div>' : '';
   const queue = indexJobs.length ? `<section class="index-jobs"><b>索引队列</b>${indexJobs.map(job => `<div><span>${escapeHtml(folderRefs.find(folder => folder.id === job.folderId)?.name ?? '资料夹')} · ${escapeHtml(job.status)} · ${job.completed}/${job.total} · 变更 ${job.changed}</span>${job.status === 'running' || job.status === 'queued' ? `<button class="quiet" data-pause-index-job="${escapeHtml(job.id)}">暂停</button>` : `<button class="quiet" data-resume-index-job="${escapeHtml(job.id)}">恢复</button>`}</div>`).join('')}</section>` : '';
   const privacy = privacyStatus ? `<section class="privacy-status" id="privacy-status"><b>隐私状态</b><span>${escapeHtml(privacyStatus.message)}</span><small>磁盘加密：${escapeHtml(privacyStatus.recommendation)}</small></section>` : '';
-  return `<section class="workspace-extras">${privacy}<label class="agent-preference"><input id="auto-apply-low-risk" type="checkbox" ${agentPreferences.autoApplyLowRisk ? 'checked' : ''}> 自动执行低风险工作区步骤（不覆盖、不删除、不联网、不发布）</label>${watching}${indexing}${queue}</section>`;
+  const acceptance = acceptanceChecks.length ? `<ul class="audit-list">${acceptanceChecks.map(item => `<li><b>${escapeHtml(item.label)}</b> · ${escapeHtml(item.status)} <small>${escapeHtml(item.detail)}</small></li>`).join('')}</ul>` : '';
+  return `<section class="workspace-extras">${privacy}<form id="runtime-settings" class="runtime-settings"><b>本地模型运行设置</b><label>模式 <select id="runtime-mode"><option value="auto" ${runtimeSettings.executionMode === 'auto' ? 'selected' : ''}>自动</option><option value="cpu" ${runtimeSettings.executionMode === 'cpu' ? 'selected' : ''}>CPU</option><option value="gpu" ${runtimeSettings.executionMode === 'gpu' ? 'selected' : ''}>GPU</option></select></label><label>线程 <input id="runtime-threads" type="number" min="1" max="64" value="${runtimeSettings.threads}"></label><label>上下文 <input id="runtime-context" type="number" min="512" max="32768" value="${runtimeSettings.contextSize}"></label><button class="quiet" type="submit">保存运行设置</button></form><button class="quiet" id="run-environment-acceptance">运行环境验收</button>${acceptance}<label class="agent-preference"><input id="auto-apply-low-risk" type="checkbox" ${agentPreferences.autoApplyLowRisk ? 'checked' : ''}> 自动执行低风险工作区步骤（不覆盖、不删除、不联网、不发布）</label>${watching}${indexing}${queue}</section>`;
 }
 
 function render() {
@@ -186,7 +191,7 @@ function render() {
   bind();
 }
 
-async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus, indexJobs] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status'), invoke<IndexJob[]>('list_index_jobs')]); render(); }
+async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus, indexJobs, runtimeSettings] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status'), invoke<IndexJob[]>('list_index_jobs'), invoke<RuntimeSettings>('get_runtime_settings')]); render(); }
 async function loadFolderRefs() { folderRefs = await invoke<FolderRef[]>('list_folder_refs'); }
 async function openFolder(folderId: string, path?: string) { const folder = folderRefs.find(item => item.id === folderId); if (!folder) return; activeFolder = folder; browserPath = path ?? folder.path; folderEntries = await invoke<FolderEntry[]>('list_folder_children', { folderId, path: browserPath }); render(); }
 async function navigateFolder(path: string) { if (!activeFolder) return; browserHistory.push(browserPath ?? activeFolder.path); await openFolder(activeFolder.id, path); }
@@ -264,6 +269,8 @@ function scheduleFolderRefresh(change: FolderChangeDetected) {
 async function removeFolderReference(folderId: string) { if (!window.confirm('仅移除软件内索引、备注和标签；不会删除原文件夹或其中任何文件。')) return; isWorking = true; error = ''; render(); try { await invoke('remove_folder_reference', { input: { folderId } }); if (activeFolder?.id === folderId) activeFolder = null; await loadFolderRefs(); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function searchDocuments(page = 0) { if (!searchQuery) return; isWorking = true; error = ''; render(); try { const result = await invoke<SearchDocumentsResult>('search_documents', { input: { query: searchQuery, tag: searchFilter || undefined, folderId: searchFolderFilter || undefined, itemType: searchTypeFilter || undefined, page } }); results = result.items; searchTotal = result.total; searchPage = result.page; } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function saveAgentPreferences() { const autoApplyLowRisk = document.querySelector<HTMLInputElement>('#auto-apply-low-risk')?.checked ?? false; try { agentPreferences = await invoke<AgentPreferences>('save_agent_preferences', { input: { autoApplyLowRisk } }); } catch (reason) { error = String(reason); } render(); }
+async function saveRuntimeSettings(event: SubmitEvent) { event.preventDefault(); const executionMode = document.querySelector<HTMLSelectElement>('#runtime-mode')?.value as RuntimeSettings['executionMode'] ?? 'auto'; const threads = Number(document.querySelector<HTMLInputElement>('#runtime-threads')?.value ?? 4); const contextSize = Number(document.querySelector<HTMLInputElement>('#runtime-context')?.value ?? 4096); isWorking = true; error = ''; render(); try { runtimeSettings = await invoke<RuntimeSettings>('save_runtime_settings', { input: { executionMode, threads, contextSize } }); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
+async function runEnvironmentAcceptance() { isWorking = true; error = ''; render(); try { acceptanceChecks = await invoke<AcceptanceCheck[]>('run_environment_acceptance'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function ask(question: string) {
   isWorking = true; error = ''; agentRun = null; render();
   try {
@@ -400,6 +407,8 @@ function bind() {
   document.querySelectorAll<HTMLButtonElement>('#clear-local-data').forEach(button => button.addEventListener('click', () => clearLocalData(button.dataset.clearScope ?? '')));
   document.querySelector<HTMLFormElement>('#ask-form')?.addEventListener('submit', event => { event.preventDefault(); const question = document.querySelector<HTMLInputElement>('#question')?.value.trim() ?? ''; if (question) ask(question); });
   document.querySelector<HTMLInputElement>('#auto-apply-low-risk')?.addEventListener('change', saveAgentPreferences);
+  document.querySelector<HTMLFormElement>('#runtime-settings')?.addEventListener('submit', saveRuntimeSettings);
+  document.querySelector('#run-environment-acceptance')?.addEventListener('click', runEnvironmentAcceptance);
   document.querySelector<HTMLFormElement>('#search-form')?.addEventListener('submit', event => { event.preventDefault(); searchQuery = document.querySelector<HTMLInputElement>('#search-question')?.value.trim() ?? ''; searchFilter = document.querySelector<HTMLInputElement>('#search-filter')?.value.trim() ?? ''; searchFolderFilter = document.querySelector<HTMLSelectElement>('#search-folder-filter')?.value ?? ''; searchTypeFilter = document.querySelector<HTMLSelectElement>('#search-type-filter')?.value ?? ''; searchDocuments(0); });
   document.querySelector('#search-page-previous')?.addEventListener('click', () => searchDocuments(Math.max(0, searchPage - 1)));
   document.querySelector('#search-page-next')?.addEventListener('click', () => searchDocuments(searchPage + 1));
