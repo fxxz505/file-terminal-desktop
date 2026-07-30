@@ -419,3 +419,13 @@ test('local governance creates Windows-key-protected encrypted backups, deferred
   assert.match(shell, /scan_sensitive_index/);
   assert.match(shell, /list_metadata_audit/);
 });
+
+test('document parsing supports PDF body text and read-only Office text previews with explicit local tool availability', async () => {
+  const cargo = await readFile(new URL('../src-tauri/Cargo.toml', import.meta.url), 'utf8');
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  assert.match(cargo, /lopdf/);
+  assert.match(backend, /fn extract_pdf_text/);
+  assert.match(backend, /fn get_local_tool_status/);
+  assert.match(backend, /fn office_preview_text/);
+  assert.match(backend, /ffmpeg/);
+});

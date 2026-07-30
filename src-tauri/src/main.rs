@@ -5,6 +5,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use file_terminal_desktop::assistant::{extract_search_terms, matches_terms, parse_model_terms};
 use futures_util::StreamExt;
 use keyring::Entry;
+use lopdf::Document;
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use rand::RngCore;
@@ -274,6 +275,16 @@ struct MetadataAuditEntry {
     old_policy: Option<String>,
     new_policy: Option<String>,
     created_at: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalToolStatus {
+    pdf_text: bool,
+    ffmpeg: bool,
+    ocr: bool,
+    transcription: bool,
+    office_converter: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -975,6 +986,34 @@ fn preview_mime(extension: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+fn command_available(command: &str) -> bool {
+    Command::new(command).arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+}
+
+#[tauri::command]
+fn get_local_tool_status() -> LocalToolStatus {
+    LocalToolStatus {
+        pdf_text: true,
+        ffmpeg: command_available("ffmpeg"),
+        ocr: command_available("tesseract"),
+        transcription: command_available("whisper-cli") || command_available("whisper"),
+        office_converter: command_available("soffice"),
+    }
+}
+
+fn extract_pdf_text(path: &Path) -> Option<String> {
+    const MAX_PDF_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+    const MAX_PDF_INDEX_CHARS: usize = 100_000;
+    if fs::metadata(path).ok()?.len() > MAX_PDF_INDEX_BYTES { return None; }
+    let document = Document::load(path).ok()?;
+    let pages = document.get_pages().into_iter().take(200).map(|(page, _)| page).collect::<Vec<_>>();
+    document.extract_text(&pages).ok().map(|content| content.chars().take(MAX_PDF_INDEX_CHARS).collect()).filter(|content: &String| !content.trim().is_empty())
+}
+
+fn office_preview_text(path: &Path) -> Option<String> {
+    extract_document_text(path)
+}
+
 fn safe_file_name(url: &str, default_name: &str) -> String {
     url.rsplit('/')
         .next()
@@ -992,6 +1031,7 @@ fn extract_document_text(path: &Path) -> Option<String> {
         return None;
     }
     match extension.as_str() {
+        "pdf" => extract_pdf_text(path),
         "txt" | "md" | "csv" | "json" | "log" | "rs" | "ts" | "js" | "html" | "css" | "xml"
         | "yml" | "yaml" | "toml" | "py" | "java" | "kt" | "sql" => {
             let content = fs::read(path).ok()?;
@@ -4159,6 +4199,14 @@ fn preview_file(path: String, state: State<'_, AppState>) -> Result<FilePreview,
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    if matches!(extension.as_str(), "docx" | "pptx" | "xlsx") {
+        let content = office_preview_text(&target).unwrap_or_default();
+        return Ok(FilePreview {
+            kind: "text".into(), name, display_path: display_path(&target), path: target.display().to_string(),
+            mime_type: "text/plain".into(), message: if content.is_empty() { "无法从此 Office 文档提取可预览文本；原文件未改动。".into() } else { "只读文本预览，复杂版式、公式和嵌入对象可能不显示。".into() },
+            content, truncated: false,
+        });
+    }
     let Some((kind, mime_type)) = preview_mime(&extension) else {
         return Ok(FilePreview {
             kind: "unsupported".into(),
@@ -4272,6 +4320,7 @@ fn main() {
             export_local_governance,
             clear_local_data,
             get_privacy_status,
+            get_local_tool_status,
             create_encrypted_backup,
             stage_encrypted_restore,
             scan_sensitive_index,
