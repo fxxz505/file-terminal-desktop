@@ -388,3 +388,18 @@ test('desktop automatically notices referenced-folder changes and schedules a sa
   assert.match(shell, /refresh_folder_index/);
   assert.match(shell, /正在监听已接入资料夹/);
 });
+
+test('index refreshes use a persisted single-worker queue with pause, resume, and per-file change tracking', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /CREATE TABLE IF NOT EXISTS index_jobs/);
+  assert.match(backend, /source_modified_ms/);
+  assert.match(backend, /fn enqueue_index_job/);
+  assert.match(backend, /fn pause_index_job/);
+  assert.match(backend, /fn resume_index_job/);
+  assert.match(backend, /fn incremental_index_folder/);
+  assert.match(backend, /index-job-progress/);
+  assert.match(shell, /pause_index_job/);
+  assert.match(shell, /resume_index_job/);
+  assert.match(shell, /indexJobs/);
+});
