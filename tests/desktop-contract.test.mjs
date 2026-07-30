@@ -376,3 +376,14 @@ test('index progress has an explicit completion phase for UI state recovery', as
   assert.match(backend, /phase: "complete"/);
   assert.match(shell, /event\.payload\.phase === 'complete'/);
 });
+
+test('desktop automatically notices referenced-folder changes and schedules a safe refresh', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /fn start_folder_change_watch/);
+  assert.match(backend, /fn folder_tree_signature/);
+  assert.match(backend, /folder-change-detected/);
+  assert.match(shell, /folder-change-detected/);
+  assert.match(shell, /scheduleFolderRefresh/);
+  assert.match(shell, /refresh_folder_index/);
+});
