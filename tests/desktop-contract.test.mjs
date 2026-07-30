@@ -381,9 +381,10 @@ test('desktop automatically notices referenced-folder changes and schedules a sa
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.match(backend, /fn start_folder_change_watch/);
-  assert.match(backend, /fn folder_tree_signature/);
+  assert.match(backend, /RecommendedWatcher/);
   assert.match(backend, /folder-change-detected/);
   assert.match(shell, /folder-change-detected/);
   assert.match(shell, /scheduleFolderRefresh/);
   assert.match(shell, /refresh_folder_index/);
+  assert.match(shell, /正在监听已接入资料夹/);
 });

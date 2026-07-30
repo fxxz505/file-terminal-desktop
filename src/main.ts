@@ -29,6 +29,7 @@ type AgentEvent = { id: string; runId: string; status: string; message: string; 
 type GovernanceExport = { exportedAt: string; conversations: Conversation[]; sensitiveRules: SensitiveRule[]; metadataAuditCount: number; agentEventCount: number };
 type LocalModel = { id: string; displayName: string; path: string; active: boolean };
 type IndexProgress = { folderId: string; phase: string; completed: number; total: number };
+type FolderChangeDetected = { folderId: string; changedAt: string };
 type AgentPreferences = { autoApplyLowRisk: boolean };
 type PrivacyStatus = { databaseEncrypted: boolean; message: string; recommendation: string };
 type View = 'workspace' | 'search' | 'assistant';
@@ -73,6 +74,7 @@ let searchFolderFilter = '';
 let searchTypeFilter = '';
 let agentPreferences: AgentPreferences = { autoApplyLowRisk: false };
 let privacyStatus: PrivacyStatus | null = null;
+const folderRefreshTimers = new Map<string, number>();
 
 const icon = (name: string) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${name}"/></svg>`;
 const icons = {
@@ -155,8 +157,9 @@ function workspacePanel() {
 
 function workspaceExtras() {
   const indexing = indexProgress ? `<div class="index-progress"><b>索引中</b><span>${indexProgress.completed} / ${indexProgress.total}</span></div>` : '';
+  const watching = folderRefs.length ? '<div class="index-progress"><b>自动索引</b><span>正在监听已接入资料夹</span></div>' : '';
   const privacy = privacyStatus ? `<section class="privacy-status" id="privacy-status"><b>隐私状态</b><span>${escapeHtml(privacyStatus.message)}</span><small>磁盘加密：${escapeHtml(privacyStatus.recommendation)}</small></section>` : '';
-  return `<section class="workspace-extras">${privacy}<label class="agent-preference"><input id="auto-apply-low-risk" type="checkbox" ${agentPreferences.autoApplyLowRisk ? 'checked' : ''}> 自动执行低风险工作区步骤（不覆盖、不删除、不联网、不发布）</label>${indexing}</section>`;
+  return `<section class="workspace-extras">${privacy}<label class="agent-preference"><input id="auto-apply-low-risk" type="checkbox" ${agentPreferences.autoApplyLowRisk ? 'checked' : ''}> 自动执行低风险工作区步骤（不覆盖、不删除、不联网、不发布）</label>${watching}${indexing}</section>`;
 }
 
 function render() {
@@ -235,6 +238,15 @@ async function registerLocalModel() { const selected = await open({ multiple: fa
 async function selectLocalModel(id: string) { isWorking = true; error = ''; render(); try { await invoke('select_local_model', { input: { id } }); [status, localModels] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<LocalModel[]>('list_local_models')]); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function deleteLocalModel(id: string) { if (!window.confirm('移除该模型登记？不会删除电脑中的 GGUF 模型文件。')) return; isWorking = true; error = ''; render(); try { await invoke('delete_local_model', { input: { id } }); [status, localModels] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<LocalModel[]>('list_local_models')]); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function refreshFolderIndex(folderId: string) { isWorking = true; error = ''; render(); try { await invoke('refresh_folder_index', { input: { folderId } }); await loadFolderRefs(); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
+function scheduleFolderRefresh(change: FolderChangeDetected) {
+  const existing = folderRefreshTimers.get(change.folderId);
+  if (existing) window.clearTimeout(existing);
+  const timer = window.setTimeout(() => {
+    folderRefreshTimers.delete(change.folderId);
+    refreshFolderIndex(change.folderId).catch(reason => { error = `自动刷新失败：${String(reason)}`; render(); });
+  }, 1_500);
+  folderRefreshTimers.set(change.folderId, timer);
+}
 async function removeFolderReference(folderId: string) { if (!window.confirm('仅移除软件内索引、备注和标签；不会删除原文件夹或其中任何文件。')) return; isWorking = true; error = ''; render(); try { await invoke('remove_folder_reference', { input: { folderId } }); if (activeFolder?.id === folderId) activeFolder = null; await loadFolderRefs(); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function searchDocuments(page = 0) { if (!searchQuery) return; isWorking = true; error = ''; render(); try { const result = await invoke<SearchDocumentsResult>('search_documents', { input: { query: searchQuery, tag: searchFilter || undefined, folderId: searchFolderFilter || undefined, itemType: searchTypeFilter || undefined, page } }); results = result.items; searchTotal = result.total; searchPage = result.page; } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function saveAgentPreferences() { const autoApplyLowRisk = document.querySelector<HTMLInputElement>('#auto-apply-low-risk')?.checked ?? false; try { agentPreferences = await invoke<AgentPreferences>('save_agent_preferences', { input: { autoApplyLowRisk } }); } catch (reason) { error = String(reason); } render(); }
@@ -373,6 +385,7 @@ document.addEventListener('click', () => { if (contextTarget) { contextTarget = 
 
 listen<DownloadProgress>('download-progress', event => { progress = event.payload; render(); }).catch(reason => { error = `无法接收下载进度：${String(reason)}`; render(); });
 listen<IndexProgress>('index-progress', event => { indexProgress = event.payload; render(); if (event.payload.phase === 'complete') window.setTimeout(() => { indexProgress = null; render(); }, 1_500); }).catch(reason => { error = `无法接收索引进度：${String(reason)}`; render(); });
+listen<FolderChangeDetected>('folder-change-detected', event => { scheduleFolderRefresh(event.payload); }).catch(reason => { error = `无法接收文件夹变动：${String(reason)}`; render(); });
 refreshStatus().catch(reason => { error = `无法连接桌面端：${String(reason)}`; render(); });
 
 checkForUpdate();

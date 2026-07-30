@@ -4,6 +4,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use file_terminal_desktop::assistant::{extract_search_terms, matches_terms, parse_model_terms};
 use futures_util::StreamExt;
 use keyring::Entry;
+use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde::{Deserialize, Serialize};
@@ -183,6 +184,13 @@ struct IndexProgress {
     phase: String,
     completed: usize,
     total: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderChangeDetected {
+    folder_id: String,
+    changed_at: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -687,6 +695,71 @@ fn ensure_column(
             "ALTER TABLE {table} ADD COLUMN {column} {definition}"
         ))
         .map_err(|error| error.to_string())
+}
+
+fn start_folder_change_watch(app: AppHandle, data_dir: PathBuf) {
+    thread::spawn(move || {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let Ok(mut watcher) = RecommendedWatcher::new(sender, NotifyConfig::default()) else {
+            return;
+        };
+        let mut watched_roots = HashMap::<PathBuf, String>::new();
+        loop {
+            let Ok(connection) = Connection::open(data_dir.join("file-terminal.db")) else {
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            };
+            let Ok(mut statement) = connection.prepare("SELECT id, root_path FROM folder_refs")
+            else {
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            };
+            let roots = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        PathBuf::from(row.get::<_, String>(1)?),
+                    ))
+                })
+                .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let active_roots = roots.iter().map(|(_, root)| root.clone()).collect::<HashSet<_>>();
+            let removed_roots = watched_roots
+                .keys()
+                .filter(|root| !active_roots.contains(*root))
+                .cloned()
+                .collect::<Vec<_>>();
+            for root in removed_roots {
+                let _ = watcher.unwatch(&root);
+                watched_roots.remove(&root);
+            }
+            for (folder_id, root) in roots {
+                if root.is_dir() && !watched_roots.contains_key(&root) {
+                    if watcher.watch(&root, RecursiveMode::Recursive).is_ok() {
+                        watched_roots.insert(root, folder_id);
+                    }
+                }
+            }
+            while let Ok(Ok(event)) = receiver.try_recv() {
+                let folder_id = event.paths.iter().find_map(|path| {
+                    watched_roots
+                        .iter()
+                        .find(|(root, _)| path.starts_with(root))
+                        .map(|(_, id)| id.clone())
+                });
+                if let Some(folder_id) = folder_id {
+                    let _ = app.emit(
+                        "folder-change-detected",
+                        FolderChangeDetected {
+                            folder_id,
+                            changed_at: "现在".to_string(),
+                        },
+                    );
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
 }
 
 fn ai_output_roots(data_dir: &Path) -> Result<PathBuf, String> {
@@ -3727,6 +3800,10 @@ fn main() {
             data_dir,
             prepared_runs: Mutex::new(HashMap::new()),
             cancelled_runs: Mutex::new(HashMap::new()),
+        })
+        .setup(|app| {
+            start_folder_change_watch(app.handle().clone(), app_data_dir()?);
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_runtime_status,
