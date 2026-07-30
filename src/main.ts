@@ -29,6 +29,7 @@ type AgentEvent = { id: string; runId: string; status: string; message: string; 
 type GovernanceExport = { exportedAt: string; conversations: Conversation[]; sensitiveRules: SensitiveRule[]; metadataAuditCount: number; agentEventCount: number };
 type LocalModel = { id: string; displayName: string; path: string; active: boolean };
 type IndexProgress = { folderId: string; phase: string; completed: number; total: number };
+type IndexJob = { id: string; folderId: string; status: 'queued' | 'running' | 'paused' | 'failed' | 'completed'; completed: number; total: number; changed: number; createdAt: string; updatedAt: string; error?: string };
 type FolderChangeDetected = { folderId: string; changedAt: string };
 type AgentPreferences = { autoApplyLowRisk: boolean };
 type PrivacyStatus = { databaseEncrypted: boolean; message: string; recommendation: string };
@@ -67,6 +68,7 @@ let agentEvents: AgentEvent[] = [];
 let governanceExport: GovernanceExport | null = null;
 let localModels: LocalModel[] = [];
 let indexProgress: IndexProgress | null = null;
+let indexJobs: IndexJob[] = [];
 let searchPage = 0;
 let searchTotal = 0;
 let searchFilter = '';
@@ -158,8 +160,9 @@ function workspacePanel() {
 function workspaceExtras() {
   const indexing = indexProgress ? `<div class="index-progress"><b>索引中</b><span>${indexProgress.completed} / ${indexProgress.total}</span></div>` : '';
   const watching = folderRefs.length ? '<div class="index-progress"><b>自动索引</b><span>正在监听已接入资料夹</span></div>' : '';
+  const queue = indexJobs.length ? `<section class="index-jobs"><b>索引队列</b>${indexJobs.map(job => `<div><span>${escapeHtml(folderRefs.find(folder => folder.id === job.folderId)?.name ?? '资料夹')} · ${escapeHtml(job.status)} · ${job.completed}/${job.total} · 变更 ${job.changed}</span>${job.status === 'running' || job.status === 'queued' ? `<button class="quiet" data-pause-index-job="${escapeHtml(job.id)}">暂停</button>` : `<button class="quiet" data-resume-index-job="${escapeHtml(job.id)}">恢复</button>`}</div>`).join('')}</section>` : '';
   const privacy = privacyStatus ? `<section class="privacy-status" id="privacy-status"><b>隐私状态</b><span>${escapeHtml(privacyStatus.message)}</span><small>磁盘加密：${escapeHtml(privacyStatus.recommendation)}</small></section>` : '';
-  return `<section class="workspace-extras">${privacy}<label class="agent-preference"><input id="auto-apply-low-risk" type="checkbox" ${agentPreferences.autoApplyLowRisk ? 'checked' : ''}> 自动执行低风险工作区步骤（不覆盖、不删除、不联网、不发布）</label>${watching}${indexing}</section>`;
+  return `<section class="workspace-extras">${privacy}<label class="agent-preference"><input id="auto-apply-low-risk" type="checkbox" ${agentPreferences.autoApplyLowRisk ? 'checked' : ''}> 自动执行低风险工作区步骤（不覆盖、不删除、不联网、不发布）</label>${watching}${indexing}${queue}</section>`;
 }
 
 function render() {
@@ -174,7 +177,7 @@ function render() {
   bind();
 }
 
-async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status')]); render(); }
+async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus, indexJobs] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status'), invoke<IndexJob[]>('list_index_jobs')]); render(); }
 async function loadFolderRefs() { folderRefs = await invoke<FolderRef[]>('list_folder_refs'); }
 async function openFolder(folderId: string, path?: string) { const folder = folderRefs.find(item => item.id === folderId); if (!folder) return; activeFolder = folder; browserPath = path ?? folder.path; folderEntries = await invoke<FolderEntry[]>('list_folder_children', { folderId, path: browserPath }); render(); }
 async function navigateFolder(path: string) { if (!activeFolder) return; browserHistory.push(browserPath ?? activeFolder.path); await openFolder(activeFolder.id, path); }
@@ -237,7 +240,9 @@ async function provision(kind: 'runtime' | 'model') { isWorking = true; error = 
 async function registerLocalModel() { const selected = await open({ multiple: false, directory: false, filters: [{ name: 'GGUF 模型', extensions: ['gguf'] }], title: '选择本地 GGUF 模型' }); if (!selected || Array.isArray(selected)) return; isWorking = true; error = ''; render(); try { await invoke<LocalModel>('register_local_model', { input: { path: selected } }); [status, localModels] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<LocalModel[]>('list_local_models')]); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function selectLocalModel(id: string) { isWorking = true; error = ''; render(); try { await invoke('select_local_model', { input: { id } }); [status, localModels] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<LocalModel[]>('list_local_models')]); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function deleteLocalModel(id: string) { if (!window.confirm('移除该模型登记？不会删除电脑中的 GGUF 模型文件。')) return; isWorking = true; error = ''; render(); try { await invoke('delete_local_model', { input: { id } }); [status, localModels] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<LocalModel[]>('list_local_models')]); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
-async function refreshFolderIndex(folderId: string) { isWorking = true; error = ''; render(); try { await invoke('refresh_folder_index', { input: { folderId } }); await loadFolderRefs(); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
+async function refreshFolderIndex(folderId: string) { try { await invoke('enqueue_index_job', { input: { folderId } }); indexJobs = await invoke<IndexJob[]>('list_index_jobs'); render(); } catch (reason) { error = String(reason); render(); } }
+async function pauseIndexJob(id: string) { await invoke('pause_index_job', { input: { id } }); indexJobs = await invoke<IndexJob[]>('list_index_jobs'); render(); }
+async function resumeIndexJob(id: string) { await invoke('resume_index_job', { input: { id } }); indexJobs = await invoke<IndexJob[]>('list_index_jobs'); render(); }
 function scheduleFolderRefresh(change: FolderChangeDetected) {
   const existing = folderRefreshTimers.get(change.folderId);
   if (existing) window.clearTimeout(existing);
@@ -352,6 +357,8 @@ function bind() {
   document.querySelectorAll<HTMLButtonElement>('[data-local-model-id]').forEach(button => button.addEventListener('click', () => selectLocalModel(button.dataset.localModelId ?? '')));
   document.querySelectorAll<HTMLButtonElement>('.delete-local-model').forEach(button => button.addEventListener('click', () => deleteLocalModel(button.dataset.deleteLocalModelId ?? '')));
   document.querySelectorAll<HTMLButtonElement>('[data-refresh-folder-id]').forEach(button => button.addEventListener('click', () => refreshFolderIndex(button.dataset.refreshFolderId ?? '')));
+  document.querySelectorAll<HTMLButtonElement>('[data-pause-index-job]').forEach(button => button.addEventListener('click', () => pauseIndexJob(button.dataset.pauseIndexJob ?? '').catch(reason => { error = String(reason); render(); })));
+  document.querySelectorAll<HTMLButtonElement>('[data-resume-index-job]').forEach(button => button.addEventListener('click', () => resumeIndexJob(button.dataset.resumeIndexJob ?? '').catch(reason => { error = String(reason); render(); })));
   document.querySelectorAll<HTMLButtonElement>('.remove-folder-reference').forEach(button => button.addEventListener('click', () => removeFolderReference(button.dataset.folderId ?? '')));
   document.querySelector('#install-update')?.addEventListener('click', installUpdate);
   document.querySelector('#choose-ai-output')?.addEventListener('click', chooseAiOutputFolder);
@@ -385,6 +392,7 @@ document.addEventListener('click', () => { if (contextTarget) { contextTarget = 
 
 listen<DownloadProgress>('download-progress', event => { progress = event.payload; render(); }).catch(reason => { error = `无法接收下载进度：${String(reason)}`; render(); });
 listen<IndexProgress>('index-progress', event => { indexProgress = event.payload; render(); if (event.payload.phase === 'complete') window.setTimeout(() => { indexProgress = null; render(); }, 1_500); }).catch(reason => { error = `无法接收索引进度：${String(reason)}`; render(); });
+listen<IndexJob>('index-job-progress', event => { const next = event.payload; indexJobs = [...indexJobs.filter(job => job.id !== next.id && job.status !== 'completed'), next].filter(job => job.status !== 'completed'); if (next.status === 'completed') loadFolderRefs().then(render); render(); }).catch(reason => { error = `无法接收索引任务：${String(reason)}`; render(); });
 listen<FolderChangeDetected>('folder-change-detected', event => { scheduleFolderRefresh(event.payload); }).catch(reason => { error = `无法接收文件夹变动：${String(reason)}`; render(); });
 refreshStatus().catch(reason => { error = `无法连接桌面端：${String(reason)}`; render(); });
 

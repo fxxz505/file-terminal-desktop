@@ -385,7 +385,7 @@ test('desktop automatically notices referenced-folder changes and schedules a sa
   assert.match(backend, /folder-change-detected/);
   assert.match(shell, /folder-change-detected/);
   assert.match(shell, /scheduleFolderRefresh/);
-  assert.match(shell, /refresh_folder_index/);
+  assert.match(shell, /enqueue_index_job/);
   assert.match(shell, /正在监听已接入资料夹/);
 });
 

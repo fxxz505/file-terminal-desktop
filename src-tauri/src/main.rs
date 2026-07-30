@@ -21,7 +21,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
@@ -184,6 +184,26 @@ struct IndexProgress {
     phase: String,
     completed: usize,
     total: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexJob {
+    id: String,
+    folder_id: String,
+    status: String,
+    completed: usize,
+    total: usize,
+    changed: usize,
+    created_at: String,
+    updated_at: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexJobInput {
+    folder_id: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -562,6 +582,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 note TEXT NOT NULL,
                 tags_json TEXT NOT NULL,
                 cloud_policy TEXT NOT NULL DEFAULT 'inherit',
+                source_size INTEGER,
+                source_modified_ms INTEGER,
                 FOREIGN KEY(folder_id) REFERENCES folder_refs(id)
             );
             CREATE INDEX IF NOT EXISTS index_items_folder_idx ON index_items(folder_id);
@@ -651,6 +673,19 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 auto_apply_low_risk INTEGER NOT NULL DEFAULT 0
             );
             INSERT OR IGNORE INTO agent_preferences (id, auto_apply_low_risk) VALUES (1, 0);
+            CREATE TABLE IF NOT EXISTS index_jobs (
+                id TEXT PRIMARY KEY,
+                folder_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                total INTEGER NOT NULL DEFAULT 0,
+                changed INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(folder_id) REFERENCES folder_refs(id)
+            );
+            CREATE INDEX IF NOT EXISTS index_jobs_status_idx ON index_jobs(status, created_at);
             ",
         )
         .map_err(|error| error.to_string())?;
@@ -660,6 +695,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
         "cloud_policy",
         "TEXT NOT NULL DEFAULT 'local_only'",
     )?;
+    ensure_column(connection, "index_items", "source_size", "INTEGER")?;
+    ensure_column(connection, "index_items", "source_modified_ms", "INTEGER")?;
     ensure_column(
         connection,
         "index_items",
@@ -988,6 +1025,196 @@ fn index_content(connection: &Connection, item_id: &str, path: &Path) -> Result<
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn source_state(path: &Path) -> (Option<i64>, Option<i64>) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return (None, None);
+    };
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis().min(i64::MAX as u128) as i64);
+    (Some(metadata.len().min(i64::MAX as u64) as i64), modified_ms)
+}
+
+fn index_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexJob> {
+    Ok(IndexJob {
+        id: row.get(0)?,
+        folder_id: row.get(1)?,
+        status: row.get(2)?,
+        completed: row.get(3)?,
+        total: row.get(4)?,
+        changed: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        error: row.get(8)?,
+    })
+}
+
+fn emit_index_job(app: &AppHandle, job: &IndexJob) {
+    let _ = app.emit("index-job-progress", job);
+}
+
+fn create_index_job(connection: &Connection, folder_id: &str) -> Result<IndexJob, String> {
+    connection
+        .query_row(
+            "SELECT id, folder_id, status, completed, total, changed, created_at, updated_at, error FROM index_jobs WHERE folder_id = ?1 AND status IN ('queued', 'running', 'paused') ORDER BY created_at DESC LIMIT 1",
+            params![folder_id],
+            index_job_from_row,
+        )
+        .or_else(|_| {
+            let id = Uuid::new_v4().to_string();
+            connection.execute(
+                "INSERT INTO index_jobs (id, folder_id, status, completed, total, changed, created_at, updated_at) VALUES (?1, ?2, 'queued', 0, 0, 0, datetime('now'), datetime('now'))",
+                params![id, folder_id],
+            )?;
+            connection.query_row(
+                "SELECT id, folder_id, status, completed, total, changed, created_at, updated_at, error FROM index_jobs WHERE id = ?1",
+                params![id],
+                index_job_from_row,
+            )
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn incremental_index_folder(
+    connection: &Connection,
+    app: &AppHandle,
+    job_id: &str,
+    folder_id: &str,
+) -> Result<usize, String> {
+    let (root_path, folder_note, folder_tags) = connection
+        .query_row(
+            "SELECT root_path, note, tags_json FROM folder_refs WHERE id = ?1",
+            params![folder_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        )
+        .map_err(|_| "接入文件夹不存在。".to_string())?;
+    let root = PathBuf::from(root_path);
+    if !root.is_dir() {
+        return Err("接入文件夹原位置不可用。".to_string());
+    }
+    let existing = connection
+        .prepare("SELECT id, path, item_type, note, tags_json, cloud_policy, source_size, source_modified_ms FROM index_items WHERE folder_id = ?1")
+        .map_err(|error| error.to_string())?
+        .query_map(params![folder_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|value| (value.1.clone(), value))
+        .collect::<HashMap<_, _>>();
+    let entries = WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    let total = entries.len().max(1);
+    connection.execute(
+        "UPDATE index_jobs SET status = 'running', total = ?1, completed = 0, changed = 0, error = NULL, updated_at = datetime('now') WHERE id = ?2",
+        params![total, job_id],
+    ).map_err(|error| error.to_string())?;
+    let mut seen = HashSet::new();
+    let mut changed = 0usize;
+    for (position, entry) in entries.into_iter().enumerate() {
+        let status = connection.query_row("SELECT status FROM index_jobs WHERE id = ?1", params![job_id], |row| row.get::<_, String>(0)).unwrap_or_else(|_| "cancelled".to_string());
+        if status == "paused" {
+            return Ok(changed);
+        }
+        if status != "running" {
+            return Err("索引任务已取消。".to_string());
+        }
+        let path = entry.path();
+        let item_path = path.display().to_string();
+        seen.insert(item_path.clone());
+        let item_type = if entry.file_type().is_dir() { "folder" } else { "file" };
+        let name = if path == root {
+            root.file_name().and_then(|value| value.to_str()).unwrap_or("未命名文件夹").to_string()
+        } else {
+            entry.file_name().to_string_lossy().to_string()
+        };
+        let (source_size, source_modified_ms) = source_state(path);
+        match existing.get(&item_path) {
+            Some((id, _, previous_type, _, _, _, previous_size, previous_modified))
+                if previous_type == item_type && previous_size == &source_size && previous_modified == &source_modified_ms => {}
+            Some((id, _, _, _, _, _, _, _)) => {
+                connection.execute(
+                    "UPDATE index_items SET item_type = ?1, name = ?2, source_size = ?3, source_modified_ms = ?4 WHERE id = ?5",
+                    params![item_type, name, source_size, source_modified_ms, id],
+                ).map_err(|error| error.to_string())?;
+                if item_type == "file" { index_content(connection, id, path)?; }
+                changed += 1;
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                let (note, tags, policy) = if path == root {
+                    (folder_note.clone(), folder_tags.clone(), "inherit".to_string())
+                } else {
+                    (String::new(), folder_tags.clone(), "inherit".to_string())
+                };
+                connection.execute(
+                    "INSERT INTO index_items (id, folder_id, item_type, name, path, note, tags_json, cloud_policy, source_size, source_modified_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![id, folder_id, item_type, name, item_path, note, tags, policy, source_size, source_modified_ms],
+                ).map_err(|error| error.to_string())?;
+                if item_type == "file" { index_content(connection, &id, path)?; }
+                changed += 1;
+            }
+        }
+        if position % 25 == 0 || position + 1 == total {
+            connection.execute(
+                "UPDATE index_jobs SET completed = ?1, changed = ?2, updated_at = datetime('now') WHERE id = ?3",
+                params![position + 1, changed, job_id],
+            ).map_err(|error| error.to_string())?;
+            if let Ok(job) = connection.query_row("SELECT id, folder_id, status, completed, total, changed, created_at, updated_at, error FROM index_jobs WHERE id = ?1", params![job_id], index_job_from_row) {
+                emit_index_job(app, &job);
+            }
+        }
+    }
+    for (path, (id, _, _, _, _, _, _, _)) in existing {
+        if !seen.contains(&path) {
+            connection.execute("DELETE FROM index_content_fts WHERE item_id = ?1", params![id]).map_err(|error| error.to_string())?;
+            connection.execute("DELETE FROM index_items WHERE id = ?1", params![id]).map_err(|error| error.to_string())?;
+            changed += 1;
+        }
+    }
+    connection.execute(
+        "UPDATE index_jobs SET status = 'completed', completed = ?1, total = ?1, changed = ?2, updated_at = datetime('now') WHERE id = ?3",
+        params![total, changed, job_id],
+    ).map_err(|error| error.to_string())?;
+    Ok(changed)
+}
+
+fn start_index_worker(app: AppHandle, data_dir: PathBuf) {
+    thread::spawn(move || loop {
+        let Ok(connection) = Connection::open(data_dir.join("file-terminal.db")) else {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        let next = connection.query_row(
+            "SELECT id, folder_id FROM index_jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        );
+        if let Ok((job_id, folder_id)) = next {
+            let result = incremental_index_folder(&connection, &app, &job_id, &folder_id);
+            if let Err(error) = result {
+                let _ = connection.execute(
+                    "UPDATE index_jobs SET status = 'failed', error = ?1, updated_at = datetime('now') WHERE id = ?2 AND status <> 'paused'",
+                    params![error, job_id],
+                );
+            }
+            if let Ok(job) = connection.query_row("SELECT id, folder_id, status, completed, total, changed, created_at, updated_at, error FROM index_jobs WHERE id = ?1", params![job_id], index_job_from_row) {
+                emit_index_job(&app, &job);
+            }
+        }
+        thread::sleep(Duration::from_millis(300));
+    });
 }
 
 fn model_terms(question: &str, state: &AppState) -> Vec<String> {
@@ -1669,36 +1896,68 @@ fn refresh_folder_index(
     input: FolderIdInput,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<usize, String> {
-    let folder = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "本地数据库被占用。".to_string())?;
-        connection
-            .query_row(
-                "SELECT root_path, note, tags_json FROM folder_refs WHERE id = ?1",
-                params![input.folder_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .map_err(|_| "接入文件夹不存在。".to_string())?
-    };
-    let tags = serde_json::from_str::<Vec<String>>(&folder.2).unwrap_or_default();
-    import_folder(
-        FolderImport {
-            path: folder.0,
-            note: folder.1,
-            tags,
+) -> Result<IndexJob, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let job = create_index_job(&connection, &input.folder_id)?;
+    emit_index_job(&app, &job);
+    Ok(job)
+}
+
+#[tauri::command]
+fn enqueue_index_job(
+    input: IndexJobInput,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<IndexJob, String> {
+    refresh_folder_index(
+        FolderIdInput {
+            folder_id: input.folder_id,
         },
         app,
         state,
     )
+}
+
+#[tauri::command]
+fn list_index_jobs(state: State<'_, AppState>) -> Result<Vec<IndexJob>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut statement = connection
+        .prepare("SELECT id, folder_id, status, completed, total, changed, created_at, updated_at, error FROM index_jobs WHERE status IN ('queued', 'running', 'paused', 'failed') ORDER BY created_at")
+        .map_err(|error| error.to_string())?;
+    let jobs = statement
+        .query_map([], index_job_from_row)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    Ok(jobs)
+}
+
+#[tauri::command]
+fn pause_index_job(input: IdInput, state: State<'_, AppState>) -> Result<(), String> {
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let changed = connection.execute(
+        "UPDATE index_jobs SET status = 'paused', updated_at = datetime('now') WHERE id = ?1 AND status IN ('queued', 'running')",
+        params![input.id],
+    ).map_err(|error| error.to_string())?;
+    if changed == 0 { return Err("索引任务不可暂停。".to_string()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn resume_index_job(input: IdInput, state: State<'_, AppState>) -> Result<(), String> {
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let changed = connection.execute(
+        "UPDATE index_jobs SET status = 'queued', updated_at = datetime('now') WHERE id = ?1 AND status IN ('paused', 'failed')",
+        params![input.id],
+    ).map_err(|error| error.to_string())?;
+    if changed == 0 { return Err("索引任务不可恢复。".to_string()); }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3803,6 +4062,7 @@ fn main() {
         })
         .setup(|app| {
             start_folder_change_watch(app.handle().clone(), app_data_dir()?);
+            start_index_worker(app.handle().clone(), app_data_dir()?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3815,6 +4075,10 @@ fn main() {
             delete_local_model,
             import_folder,
             refresh_folder_index,
+            enqueue_index_job,
+            list_index_jobs,
+            pause_index_job,
+            resume_index_job,
             remove_folder_reference,
             folder_reference_status,
             list_folder_refs,
