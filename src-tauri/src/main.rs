@@ -4124,9 +4124,12 @@ fn main() {
 #[cfg(test)]
 mod preview_tests {
     use super::{
-        display_path, effective_cloud_policy, preview_mime, safe_relative_path, CloudPolicy,
+        display_path, effective_cloud_policy, incremental_index_folder_inner, initialize_database,
+        preview_mime, safe_relative_path, CloudPolicy,
     };
-    use std::path::Path;
+    use rusqlite::{params, Connection};
+    use std::{fs, path::Path, time::Instant};
+    use tempfile::tempdir;
 
     #[test]
     fn classifies_supported_preview_extensions() {
@@ -4164,5 +4167,81 @@ mod preview_tests {
         );
         assert!(safe_relative_path("../outside.txt").is_err());
         assert!(safe_relative_path(r"C:\\outside.txt").is_err());
+    }
+
+    #[test]
+    fn incremental_indexing_pauses_and_resumes_without_reextracting_unchanged_files() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..100 {
+            fs::write(root.join(format!("item-{index}.txt")), "stable content").unwrap();
+        }
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        let folder_id = "pause-folder";
+        let job_id = "pause-job";
+        connection.execute(
+            "INSERT INTO folder_refs (id, root_path, name, note, tags_json, cloud_policy, imported_at) VALUES (?1, ?2, 'fixture', '', '[]', 'local_only', datetime('now'))",
+            params![folder_id, root.display().to_string()],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO index_jobs (id, folder_id, status, completed, total, changed, created_at, updated_at) VALUES (?1, ?2, 'queued', 0, 0, 0, datetime('now'), datetime('now'))",
+            params![job_id, folder_id],
+        ).unwrap();
+
+        let mut paused = false;
+        let changed = incremental_index_folder_inner(&connection, job_id, folder_id, |job| {
+            if !paused && job.completed >= 25 {
+                connection.execute("UPDATE index_jobs SET status = 'paused' WHERE id = ?1", params![job_id]).unwrap();
+                paused = true;
+            }
+        }).unwrap();
+        assert!(paused);
+        assert!(changed >= 25 && changed < 101);
+        assert_eq!(connection.query_row("SELECT status FROM index_jobs WHERE id = ?1", params![job_id], |row| row.get::<_, String>(0)).unwrap(), "paused");
+
+        connection.execute("UPDATE index_jobs SET status = 'queued' WHERE id = ?1", params![job_id]).unwrap();
+        let resumed_changed = incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap();
+        assert_eq!(resumed_changed, 101 - changed);
+        assert_eq!(connection.query_row("SELECT status FROM index_jobs WHERE id = ?1", params![job_id], |row| row.get::<_, String>(0)).unwrap(), "completed");
+    }
+
+    #[test]
+    fn benchmarks_incremental_indexing_for_ten_thousand_files() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("benchmark");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..10_000 {
+            fs::write(root.join(format!("item-{index:05}.txt")), "benchmark content").unwrap();
+        }
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        let folder_id = "benchmark-folder";
+        let job_id = "benchmark-job";
+        connection.execute(
+            "INSERT INTO folder_refs (id, root_path, name, note, tags_json, cloud_policy, imported_at) VALUES (?1, ?2, 'benchmark', '', '[]', 'local_only', datetime('now'))",
+            params![folder_id, root.display().to_string()],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO index_jobs (id, folder_id, status, completed, total, changed, created_at, updated_at) VALUES (?1, ?2, 'queued', 0, 0, 0, datetime('now'), datetime('now'))",
+            params![job_id, folder_id],
+        ).unwrap();
+
+        let first_start = Instant::now();
+        assert_eq!(incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap(), 10_001);
+        let first = first_start.elapsed();
+        connection.execute("UPDATE index_jobs SET status = 'queued' WHERE id = ?1", params![job_id]).unwrap();
+        let unchanged_start = Instant::now();
+        assert_eq!(incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap(), 0);
+        let unchanged = unchanged_start.elapsed();
+        fs::write(root.join("item-05000.txt"), "changed benchmark content").unwrap();
+        connection.execute("UPDATE index_jobs SET status = 'queued' WHERE id = ?1", params![job_id]).unwrap();
+        let changed_start = Instant::now();
+        assert_eq!(incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap(), 1);
+        let one_changed = changed_start.elapsed();
+        eprintln!("10k incremental benchmark: first={first:?}, unchanged={unchanged:?}, one_changed={one_changed:?}");
+        // A deliberately broad ceiling catches accidental quadratic work without assuming a specific disk speed.
+        assert!(first.as_secs() < 120 && unchanged.as_secs() < 120 && one_changed.as_secs() < 120);
     }
 }
