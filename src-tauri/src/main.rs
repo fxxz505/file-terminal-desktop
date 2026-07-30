@@ -1085,6 +1085,21 @@ fn incremental_index_folder(
     job_id: &str,
     folder_id: &str,
 ) -> Result<usize, String> {
+    incremental_index_folder_inner(connection, job_id, folder_id, |job| {
+        emit_index_job(app, job);
+    })
+}
+
+// The queue worker and the benchmark share this core so measured behavior is production behavior.
+fn incremental_index_folder_inner<F>(
+    connection: &Connection,
+    job_id: &str,
+    folder_id: &str,
+    mut report_progress: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&IndexJob),
+{
     let (root_path, folder_note, folder_tags) = connection
         .query_row(
             "SELECT root_path, note, tags_json FROM folder_refs WHERE id = ?1",
@@ -1172,7 +1187,7 @@ fn incremental_index_folder(
                 params![position + 1, changed, job_id],
             ).map_err(|error| error.to_string())?;
             if let Ok(job) = connection.query_row("SELECT id, folder_id, status, completed, total, changed, created_at, updated_at, error FROM index_jobs WHERE id = ?1", params![job_id], index_job_from_row) {
-                emit_index_job(app, &job);
+                report_progress(&job);
             }
         }
     }
