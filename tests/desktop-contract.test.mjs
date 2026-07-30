@@ -403,3 +403,19 @@ test('index refreshes use a persisted single-worker queue with pause, resume, an
   assert.match(shell, /resume_index_job/);
   assert.match(shell, /indexJobs/);
 });
+
+test('local governance creates Windows-key-protected encrypted backups, deferred restores, sensitive reports, and filterable audits', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /Aes256Gcm/);
+  assert.match(backend, /fn create_encrypted_backup/);
+  assert.match(backend, /fn stage_encrypted_restore/);
+  assert.match(backend, /fn apply_pending_restore/);
+  assert.match(backend, /fn scan_sensitive_index/);
+  assert.match(backend, /fn list_metadata_audit/);
+  assert.match(backend, /BACKUP_KEYRING_SERVICE/);
+  assert.match(shell, /create_encrypted_backup/);
+  assert.match(shell, /stage_encrypted_restore/);
+  assert.match(shell, /scan_sensitive_index/);
+  assert.match(shell, /list_metadata_audit/);
+});

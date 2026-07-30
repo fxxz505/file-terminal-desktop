@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use file_terminal_desktop::assistant::{extract_search_terms, matches_terms, parse_model_terms};
 use futures_util::StreamExt;
 use keyring::Entry;
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
+use rand::RngCore;
 use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,6 +40,8 @@ const MODEL_FILE: &str = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
 const MAX_PREVIEW_BYTES: u64 = 1_048_576;
 const MAX_CLOUD_REQUEST_BYTES: usize = 48 * 1024;
 const CLOUD_KEYRING_SERVICE: &str = "file-terminal-desktop.cloud-provider";
+const BACKUP_KEYRING_SERVICE: &str = "file-terminal-desktop.encrypted-backup";
+const BACKUP_MAGIC: &[u8] = b"FTBK1";
 const MAX_GENERATED_FILES: usize = 40;
 const MAX_GENERATED_FILE_BYTES: usize = 256 * 1024;
 const ALLOWED_WORKSPACE_CHECKS: &[&str] =
@@ -219,6 +223,57 @@ struct PrivacyStatus {
     database_encrypted: bool,
     message: String,
     recommendation: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EncryptedBackup {
+    path: String,
+    display_path: String,
+    created_at: String,
+    database_bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupPathInput {
+    path: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreStage {
+    pending: bool,
+    message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SensitiveFinding {
+    item_id: String,
+    name: String,
+    display_path: String,
+    category: String,
+    match_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditFilterInput {
+    target_type: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetadataAuditEntry {
+    id: String,
+    target_type: String,
+    target_id: String,
+    action: String,
+    old_policy: Option<String>,
+    new_policy: Option<String>,
+    created_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3131,6 +3186,108 @@ fn get_privacy_status() -> PrivacyStatus {
     }
 }
 
+fn backup_key_entry() -> Result<Entry, String> {
+    Entry::new(BACKUP_KEYRING_SERVICE, "database-backup-key")
+        .map_err(|_| "无法访问 Windows 凭据库。".to_string())
+}
+
+fn backup_key() -> Result<[u8; 32], String> {
+    let entry = backup_key_entry()?;
+    if let Ok(encoded) = entry.get_password() {
+        let decoded = BASE64.decode(encoded).map_err(|_| "本地备份密钥无效。".to_string())?;
+        return decoded.try_into().map_err(|_| "本地备份密钥长度无效。".to_string());
+    }
+    let mut key = [0u8; 32];
+    rand::rng().fill_bytes(&mut key);
+    entry.set_password(&BASE64.encode(key)).map_err(|_| "无法在 Windows 凭据库保存备份密钥。".to_string())?;
+    Ok(key)
+}
+
+fn encrypt_backup(plain: &[u8]) -> Result<Vec<u8>, String> {
+    let key = backup_key()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "无法初始化备份加密。".to_string())?;
+    let mut nonce = [0u8; 12];
+    rand::rng().fill_bytes(&mut nonce);
+    let encrypted = cipher.encrypt(Nonce::from_slice(&nonce), plain).map_err(|_| "无法加密本地备份。".to_string())?;
+    let mut result = Vec::with_capacity(BACKUP_MAGIC.len() + nonce.len() + encrypted.len());
+    result.extend_from_slice(BACKUP_MAGIC);
+    result.extend_from_slice(&nonce);
+    result.extend_from_slice(&encrypted);
+    Ok(result)
+}
+
+fn decrypt_backup(value: &[u8]) -> Result<Vec<u8>, String> {
+    if value.len() <= BACKUP_MAGIC.len() + 12 || !value.starts_with(BACKUP_MAGIC) { return Err("不是资料终端加密备份。".to_string()); }
+    let key = backup_key()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "无法初始化备份解密。".to_string())?;
+    cipher.decrypt(Nonce::from_slice(&value[BACKUP_MAGIC.len()..BACKUP_MAGIC.len() + 12]), &value[BACKUP_MAGIC.len() + 12..])
+        .map_err(|_| "无法解密备份；请在创建备份的同一 Windows 用户账户中恢复。".to_string())
+}
+
+#[tauri::command]
+fn create_encrypted_backup(state: State<'_, AppState>) -> Result<EncryptedBackup, String> {
+    let backup_path = state.data_dir.join("backups").join(format!("file-terminal-{}.ftbackup", Uuid::new_v4()));
+    fs::create_dir_all(backup_path.parent().ok_or_else(|| "备份路径无效。".to_string())?).map_err(|error| error.to_string())?;
+    let temporary = state.data_dir.join(format!("backup-{}.db", Uuid::new_v4()));
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    connection.execute("VACUUM INTO ?1", params![temporary.display().to_string()]).map_err(|error| error.to_string())?;
+    drop(connection);
+    let plain = fs::read(&temporary).map_err(|error| error.to_string())?;
+    fs::write(&backup_path, encrypt_backup(&plain)?).map_err(|error| error.to_string())?;
+    let _ = fs::remove_file(temporary);
+    Ok(EncryptedBackup { path: backup_path.display().to_string(), display_path: display_path(&backup_path), created_at: "刚刚".to_string(), database_bytes: plain.len() })
+}
+
+#[tauri::command]
+fn stage_encrypted_restore(input: BackupPathInput, state: State<'_, AppState>) -> Result<RestoreStage, String> {
+    let source = PathBuf::from(input.path);
+    if !source.is_file() || source.extension().and_then(|value| value.to_str()) != Some("ftbackup") { return Err("请选择 .ftbackup 加密备份文件。".to_string()); }
+    let staged = state.data_dir.join("pending-restore.db");
+    fs::write(&staged, decrypt_backup(&fs::read(source).map_err(|error| error.to_string())?)?).map_err(|error| error.to_string())?;
+    if Connection::open(&staged).and_then(|connection| connection.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))).is_err() {
+        let _ = fs::remove_file(staged);
+        return Err("备份数据库校验失败，未替换任何本地数据。".to_string());
+    }
+    Ok(RestoreStage { pending: true, message: "备份已校验，重启应用后才会安全替换当前数据库。".to_string() })
+}
+
+fn apply_pending_restore(data_dir: &Path) -> Result<(), String> {
+    let staged = data_dir.join("pending-restore.db");
+    if !staged.is_file() { return Ok(()); }
+    let database = data_dir.join("file-terminal.db");
+    let preserved = data_dir.join("pre-restore.db");
+    let _ = fs::remove_file(&preserved);
+    if database.is_file() { fs::rename(&database, &preserved).map_err(|error| error.to_string())?; }
+    fs::rename(staged, database).map_err(|error| error.to_string())?;
+    let _ = fs::remove_file(data_dir.join("file-terminal.db-wal"));
+    let _ = fs::remove_file(data_dir.join("file-terminal.db-shm"));
+    Ok(())
+}
+
+#[tauri::command]
+fn scan_sensitive_index(state: State<'_, AppState>) -> Result<Vec<SensitiveFinding>, String> {
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut statement = connection.prepare("SELECT index_items.id, index_items.name, index_items.path, index_content_fts.content FROM index_items INNER JOIN index_content_fts ON index_items.id = index_content_fts.item_id LIMIT 10000").map_err(|error| error.to_string())?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))).map_err(|error| error.to_string())?;
+    let patterns = [("key", r"(?i)\b(?:sk|rk|pk)_[a-z0-9_-]{16,}\b"), ("email", r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"), ("phone", r"\b1[3-9]\d{9}\b"), ("id", r"\b\d{17}[\dXx]\b")];
+    let mut findings = Vec::new();
+    for row in rows.filter_map(Result::ok) { for (category, pattern) in patterns {
+        let count = Regex::new(pattern).map_err(|_| "敏感扫描规则无效。".to_string())?.find_iter(&row.3).count();
+        if count > 0 { findings.push(SensitiveFinding { item_id: row.0.clone(), name: row.1.clone(), display_path: display_path(Path::new(&row.2)), category: category.to_string(), match_count: count }); }
+    }}
+    Ok(findings)
+}
+
+#[tauri::command]
+fn list_metadata_audit(input: AuditFilterInput, state: State<'_, AppState>) -> Result<Vec<MetadataAuditEntry>, String> {
+    let target_type = input.target_type.filter(|value| matches!(value.as_str(), "folder" | "item"));
+    let limit = input.limit.unwrap_or(100).clamp(1, 500);
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut statement = connection.prepare("SELECT id, target_type, target_id, action, old_policy, new_policy, created_at FROM metadata_audit WHERE (?1 IS NULL OR target_type = ?1) ORDER BY rowid DESC LIMIT ?2").map_err(|error| error.to_string())?;
+    let rows = statement.query_map(params![target_type, limit], |row| Ok(MetadataAuditEntry { id: row.get(0)?, target_type: row.get(1)?, target_id: row.get(2)?, action: row.get(3)?, old_policy: row.get(4)?, new_policy: row.get(5)?, created_at: row.get(6)? })).map_err(|error| error.to_string())?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
 #[tauri::command]
 fn save_agent_preferences(
     input: AgentPreferences,
@@ -4061,6 +4218,7 @@ fn reveal_in_explorer(path: String, state: State<'_, AppState>) -> Result<(), St
 fn main() {
     let data_dir = app_data_dir().expect("unable to locate app data directory");
     fs::create_dir_all(&data_dir).expect("unable to create app data directory");
+    apply_pending_restore(&data_dir).expect("unable to apply pending restore");
     let connection =
         Connection::open(data_dir.join("file-terminal.db")).expect("unable to open database");
     initialize_database(&connection).expect("unable to initialize database");
@@ -4114,6 +4272,10 @@ fn main() {
             export_local_governance,
             clear_local_data,
             get_privacy_status,
+            create_encrypted_backup,
+            stage_encrypted_restore,
+            scan_sensitive_index,
+            list_metadata_audit,
             get_agent_preferences,
             save_agent_preferences,
             prepare_agent_run,
