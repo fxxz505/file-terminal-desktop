@@ -1,6 +1,6 @@
 [package]
 name = "file-terminal-desktop"
-version = "0.1.10"
+version = "0.1.11"
 description = "A local-first file assistant"
 authors = ["local"]
 edition = "2021"
@@ -38,6 +38,7 @@ notify = "8.2"
 tokio = { version = "1", features = ["macros", "time"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [dev-dependencies]
 tempfile = "3.19"

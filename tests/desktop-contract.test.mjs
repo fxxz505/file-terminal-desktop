@@ -480,6 +480,18 @@ test('application database uses SQLCipher with a Windows-credential key and migr
   assert.match(backend, /fn open_app_database/);
 });
 
+test('database key recovery never replaces an existing database after an update', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const cargo = await readFile(new URL('../src-tauri/Cargo.toml', import.meta.url), 'utf8');
+  assert.match(cargo, /windows-sys/);
+  assert.match(backend, /DATABASE_KEY_BACKUP_FILE/);
+  assert.match(backend, /CryptProtectData/);
+  assert.match(backend, /CryptUnprotectData/);
+  assert.match(backend, /fn load_database_key\(data_dir: &Path, database_exists: bool\)/);
+  assert.match(backend, /已有本地数据库但找不到可用密钥；为保护原数据，应用未创建空数据库。/);
+  assert.doesNotMatch(backend, /quarantine_unreadable_database\(data_dir, &database\)/);
+});
+
 test('runtime provisioning uses a versioned manifest with archive hashes and explicit GPU compatibility fallback', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   assert.match(backend, /struct RuntimeManifest/);
@@ -609,13 +621,12 @@ test('sidebar separates AI conversation history from assistant configuration and
   assert.match(styles, /\.control-cluster/);
 });
 
-test('desktop preserves an unreadable local database and opens a recoverable empty database instead of exiting before the window appears', async () => {
+test('desktop refuses to replace an unreadable local database with an empty database', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
-  assert.match(backend, /fn quarantine_unreadable_database/);
   assert.match(backend, /database-recovery/);
   assert.match(backend, /startup_recovery_notice/);
-  assert.match(backend, /无法解锁的本地数据库/);
+  assert.match(backend, /应用未创建空数据库/);
   assert.match(shell, /recoveryNotice/);
   assert.match(shell, /数据库恢复提示/);
 });

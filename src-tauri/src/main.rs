@@ -74,6 +74,7 @@ const MAX_CLOUD_REQUEST_BYTES: usize = 48 * 1024;
 const CLOUD_KEYRING_SERVICE: &str = "file-terminal-desktop.cloud-provider";
 const BACKUP_KEYRING_SERVICE: &str = "file-terminal-desktop.encrypted-backup";
 const DATABASE_KEYRING_SERVICE: &str = "file-terminal-desktop.sqlcipher";
+const DATABASE_KEY_BACKUP_FILE: &str = "database-key.dpapi";
 const BACKUP_MAGIC: &[u8] = b"FTBK1";
 const MAX_GENERATED_FILES: usize = 40;
 const MAX_GENERATED_FILE_BYTES: usize = 256 * 1024;
@@ -802,20 +803,143 @@ fn database_key_entry() -> Result<Entry, String> {
         .map_err(|_| "无法访问 Windows 凭据库。".to_string())
 }
 
-fn database_key() -> Result<String, String> {
-    let entry = database_key_entry()?;
-    match entry.get_password() {
-        Ok(key) if key.len() >= 32 && key.chars().all(|value| value.is_ascii_alphanumeric() || matches!(value, '+' | '/' | '=')) => Ok(key),
-        Ok(_) => Err("本地数据库密钥无效；应用拒绝打开数据库。".to_string()),
-        Err(keyring::Error::NoEntry) => {
-            let mut raw = [0u8; 32];
-            rand::rng().fill_bytes(&mut raw);
-            let key = BASE64.encode(raw);
-            entry.set_password(&key).map_err(|_| "无法将数据库密钥保存到 Windows 凭据库。".to_string())?;
-            Ok(key)
-        }
-        Err(_) => Err("无法读取 Windows 凭据库中的数据库密钥；应用拒绝打开数据库。".to_string()),
+fn valid_database_key(key: &str) -> bool {
+    key.len() >= 32 && key.chars().all(|value| value.is_ascii_alphanumeric() || matches!(value, '+' | '/' | '='))
+}
+
+#[cfg(windows)]
+fn protect_database_key_with_dpapi(value: &[u8]) -> Result<Vec<u8>, String> {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN},
+    };
+
+    if value.is_empty() || value.len() > u32::MAX as usize {
+        return Err("数据库密钥备份长度无效。".to_string());
     }
+    let input = CRYPT_INTEGER_BLOB { cbData: value.len() as u32, pbData: value.as_ptr() as *mut u8 };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let protected = unsafe {
+        CryptProtectData(&input, ptr::null(), ptr::null(), ptr::null(), ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+    };
+    if protected == 0 || output.pbData.is_null() {
+        return Err("Windows DPAPI 无法保护数据库密钥副本。".to_string());
+    }
+    let result = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe { LocalFree(output.pbData as *mut std::ffi::c_void); }
+    Ok(result)
+}
+
+#[cfg(windows)]
+fn unprotect_database_key_with_dpapi(value: &[u8]) -> Result<Vec<u8>, String> {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN},
+    };
+
+    if value.is_empty() || value.len() > u32::MAX as usize {
+        return Err("数据库密钥备份无效。".to_string());
+    }
+    let input = CRYPT_INTEGER_BLOB { cbData: value.len() as u32, pbData: value.as_ptr() as *mut u8 };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let unprotected = unsafe {
+        CryptUnprotectData(&input, ptr::null_mut(), ptr::null(), ptr::null(), ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+    };
+    if unprotected == 0 || output.pbData.is_null() {
+        return Err("Windows DPAPI 无法解锁数据库密钥副本。".to_string());
+    }
+    let result = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe { LocalFree(output.pbData as *mut std::ffi::c_void); }
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+fn protect_database_key_with_dpapi(_: &[u8]) -> Result<Vec<u8>, String> {
+    Err("数据库密钥恢复仅支持 Windows。".to_string())
+}
+
+#[cfg(not(windows))]
+fn unprotect_database_key_with_dpapi(_: &[u8]) -> Result<Vec<u8>, String> {
+    Err("数据库密钥恢复仅支持 Windows。".to_string())
+}
+
+fn database_key_backup_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(DATABASE_KEY_BACKUP_FILE)
+}
+
+fn read_database_key_backup(data_dir: &Path) -> Result<String, String> {
+    let protected = fs::read(database_key_backup_path(data_dir))
+        .map_err(|_| "找不到可用的 Windows DPAPI 数据库密钥副本。".to_string())?;
+    let key = String::from_utf8(unprotect_database_key_with_dpapi(&protected)?)
+        .map_err(|_| "Windows DPAPI 数据库密钥副本无效。".to_string())?;
+    if valid_database_key(&key) {
+        Ok(key)
+    } else {
+        Err("Windows DPAPI 数据库密钥副本无效。".to_string())
+    }
+}
+
+fn save_database_key_backup(data_dir: &Path, key: &str) -> Result<(), String> {
+    if let Ok(saved) = read_database_key_backup(data_dir) {
+        if saved == key {
+            return Ok(());
+        }
+    }
+    let protected = protect_database_key_with_dpapi(key.as_bytes())?;
+    let temporary = data_dir.join(format!("{DATABASE_KEY_BACKUP_FILE}.{}.pending", Uuid::new_v4()));
+    {
+        let mut file = File::create(&temporary).map_err(|_| "无法创建 Windows DPAPI 数据库密钥副本。".to_string())?;
+        file.write_all(&protected).map_err(|_| "无法写入 Windows DPAPI 数据库密钥副本。".to_string())?;
+        file.sync_all().map_err(|_| "无法保存 Windows DPAPI 数据库密钥副本。".to_string())?;
+    }
+    fs::rename(&temporary, database_key_backup_path(data_dir))
+        .or_else(|_| {
+            // The key never rotates. Replacing a damaged fallback is safe only after the new DPAPI blob is fully written.
+            fs::copy(&temporary, database_key_backup_path(data_dir)).map(|_| ()).and_then(|_| fs::remove_file(&temporary))
+        })
+        .map_err(|_| "无法保存 Windows DPAPI 数据库密钥副本。".to_string())
+}
+
+fn generate_and_store_database_key(data_dir: &Path) -> Result<String, String> {
+    let mut raw = [0u8; 32];
+    rand::rng().fill_bytes(&mut raw);
+    let key = BASE64.encode(raw);
+    database_key_entry()?.set_password(&key).map_err(|_| "无法将数据库密钥保存到 Windows 凭据库。".to_string())?;
+    if let Err(error) = save_database_key_backup(data_dir, &key) {
+        let _ = database_key_entry().and_then(|entry| entry.delete_credential().map_err(|_| "".to_string()));
+        return Err(error);
+    }
+    Ok(key)
+}
+
+fn load_database_key(data_dir: &Path, database_exists: bool) -> Result<String, String> {
+    let credential_key = database_key_entry().and_then(|entry| match entry.get_password() {
+        Ok(key) if valid_database_key(&key) => Ok(key),
+        Ok(_) => Err("本地数据库密钥无效。".to_string()),
+        Err(keyring::Error::NoEntry) => Err("Windows 凭据库中没有数据库密钥。".to_string()),
+        Err(_) => Err("无法读取 Windows 凭据库中的数据库密钥。".to_string()),
+    });
+    if let Ok(key) = credential_key {
+        // Keep legacy installs available even if DPAPI is temporarily unavailable; a later start retries the fallback copy.
+        if !database_exists {
+            save_database_key_backup(data_dir, &key)?;
+        } else {
+            let _ = save_database_key_backup(data_dir, &key);
+        }
+        return Ok(key);
+    }
+    if let Ok(key) = read_database_key_backup(data_dir) {
+        if let Ok(entry) = database_key_entry() {
+            let _ = entry.set_password(&key);
+        }
+        return Ok(key);
+    }
+    if database_exists {
+        return Err("已有本地数据库但找不到可用密钥；为保护原数据，应用未创建空数据库。请保留资料终端数据目录，并使用原 Windows 用户账户或加密备份恢复。".to_string());
+    }
+    generate_and_store_database_key(data_dir)
 }
 
 fn apply_database_key(connection: &Connection, key: &str) -> Result<(), String> {
@@ -874,30 +998,11 @@ fn migrate_plaintext_database(database: &Path, key: &str) -> Result<(), String> 
 
 fn open_app_database(data_dir: &Path) -> Result<Connection, String> {
     let database = data_dir.join("file-terminal.db");
-    let key = database_key()?;
+    let key = load_database_key(data_dir, database.is_file())?;
     if database.is_file() && fs::read(&database).map_err(|error| error.to_string())?.starts_with(b"SQLite format 3\0") {
         migrate_plaintext_database(&database, &key)?;
     }
     open_encrypted_database(&database, &key)
-}
-
-fn quarantine_unreadable_database(data_dir: &Path, database: &Path) -> Result<PathBuf, String> {
-    let recovery = data_dir
-        .join("database-recovery")
-        .join(format!("unreadable-{}", Uuid::new_v4()));
-    fs::create_dir_all(&recovery).map_err(|error| error.to_string())?;
-    for suffix in ["", "-wal", "-shm"] {
-        let source = PathBuf::from(format!("{}{}", database.display(), suffix));
-        if source.exists() {
-            let file_name = source
-                .file_name()
-                .ok_or_else(|| "无法确定数据库恢复文件名。".to_string())?;
-            fs::rename(&source, recovery.join(file_name)).map_err(|error| {
-                format!("无法保存无法解锁的本地数据库；应用未创建新数据库：{error}")
-            })?;
-        }
-    }
-    Ok(recovery)
 }
 
 const AUTO_RESTORE_STATUS_FILE: &str = "AUTO_RESTORE_STATUS.txt";
@@ -1054,7 +1159,7 @@ fn restore_quarantined_database(connection: &Connection, recovery: &Path, key: &
 fn restore_quarantined_databases(connection: &Connection, data_dir: &Path) -> Option<String> {
     let recovery_root = data_dir.join("database-recovery");
     let entries = fs::read_dir(&recovery_root).ok()?;
-    let key = match database_key() {
+    let key = match load_database_key(data_dir, true) {
         Ok(key) => key,
         Err(_) => return Some("已自动尝试恢复旧数据库，但 Windows 凭据库不可用；恢复副本仍被保留，未上传或修改任何旧数据。".to_string()),
     };
@@ -1113,18 +1218,6 @@ fn restore_quarantined_databases(connection: &Connection, data_dir: &Path) -> Op
 fn open_app_database_with_recovery(data_dir: &Path) -> Result<(Connection, Option<String>), String> {
     match open_app_database(data_dir) {
         Ok(connection) => Ok((connection, None)),
-        Err(error) if error == "无法使用本机凭据解锁数据库；数据未被修改。" => {
-            let database = data_dir.join("file-terminal.db");
-            let recovery = quarantine_unreadable_database(data_dir, &database)?;
-            let connection = open_app_database(data_dir)?;
-            Ok((
-                connection,
-                Some(format!(
-                    "检测到无法解锁的本地数据库。原文件和 WAL 恢复文件已保留在：{}。资料终端已创建新的空加密数据库；请勿删除恢复目录。",
-                    display_path(&recovery)
-                )),
-            ))
-        }
         Err(error) => Err(error),
     }
 }
@@ -4355,7 +4448,10 @@ fn stage_encrypted_restore(input: BackupPathInput, state: State<'_, AppState>) -
     if !source.is_file() || source.extension().and_then(|value| value.to_str()) != Some("ftbackup") { return Err("请选择 .ftbackup 加密备份文件。".to_string()); }
     let staged = state.data_dir.join("pending-restore.db");
     fs::write(&staged, decrypt_backup(&fs::read(source).map_err(|error| error.to_string())?)?).map_err(|error| error.to_string())?;
-    if database_key().and_then(|key| open_encrypted_database(&staged, &key)).is_err() {
+    if load_database_key(&state.data_dir, state.data_dir.join("file-terminal.db").is_file())
+        .and_then(|key| open_encrypted_database(&staged, &key))
+        .is_err()
+    {
         let _ = fs::remove_file(staged);
         return Err("备份数据库校验失败，未替换任何本地数据。".to_string());
     }
@@ -5907,7 +6003,7 @@ mod preview_tests {
     use super::{
         cosine_similarity, display_path, effective_cloud_policy, incremental_index_folder_inner,
         initialize_database, migrate_plaintext_database, open_encrypted_database, preview_mime,
-        quarantine_unreadable_database, restore_quarantined_database,
+        read_database_key_backup, restore_quarantined_database, save_database_key_backup,
         safe_relative_path, unique_library_file_path, CloudPolicy,
     };
     use rusqlite::{params, Connection};
@@ -5973,22 +6069,13 @@ mod preview_tests {
         assert!(!fs::read(&database).unwrap().starts_with(b"SQLite format 3\0"));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn preserves_an_unreadable_database_before_opening_a_new_one() {
+    fn dpapi_database_key_copy_round_trips_in_the_same_windows_account() {
         let temp = tempdir().unwrap();
-        let database = temp.path().join("file-terminal.db");
-        let wal = temp.path().join("file-terminal.db-wal");
-        let shm = temp.path().join("file-terminal.db-shm");
-        fs::write(&database, b"unreadable database").unwrap();
-        fs::write(&wal, b"wal").unwrap();
-        fs::write(&shm, b"shm").unwrap();
-
-        let recovery = quarantine_unreadable_database(temp.path(), &database).unwrap();
-
-        assert!(!database.exists());
-        assert_eq!(fs::read(recovery.join("file-terminal.db")).unwrap(), b"unreadable database");
-        assert_eq!(fs::read(recovery.join("file-terminal.db-wal")).unwrap(), b"wal");
-        assert_eq!(fs::read(recovery.join("file-terminal.db-shm")).unwrap(), b"shm");
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        save_database_key_backup(temp.path(), key).unwrap();
+        assert_eq!(read_database_key_backup(temp.path()).unwrap(), key);
     }
 
     #[test]

@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "file-terminal-desktop"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -966,6 +966,7 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

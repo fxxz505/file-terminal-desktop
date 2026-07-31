@@ -23,6 +23,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Run frontend contract tests
+        run: npm test
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
       - name: Build signed release and publish assets
         uses: tauri-apps/tauri-action@v1
         env:
