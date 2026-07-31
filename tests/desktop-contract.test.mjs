@@ -540,3 +540,16 @@ test('Office high-fidelity preview converts a referenced file with isolated loca
   assert.match(shell, /convert_office_preview/);
   assert.match(shell, /高保真预览/);
 });
+
+test('agent repair uses a maximum two-attempt diagnostic to cloud advice loop with controlled writes and fixed rechecks', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /MAX_AGENT_REPAIR_ATTEMPTS/);
+  assert.match(backend, /async fn auto_repair_agent_run/);
+  assert.match(backend, /repair_attempts/);
+  assert.match(backend, /最小修复/);
+  assert.match(backend, /run_workspace_check/);
+  assert.match(backend, /apply_agent_advice_inner/);
+  assert.match(shell, /auto_repair_agent_run/);
+  assert.match(shell, /自动最小修复/);
+});
