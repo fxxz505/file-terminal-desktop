@@ -479,3 +479,13 @@ test('application database uses SQLCipher with a Windows-credential key and migr
   assert.match(backend, /sqlcipher_export/);
   assert.match(backend, /fn open_app_database/);
 });
+
+test('runtime provisioning uses a versioned manifest with archive hashes and explicit GPU compatibility fallback', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  assert.match(backend, /struct RuntimeManifest/);
+  assert.match(backend, /RUNTIME_MANIFEST/);
+  assert.match(backend, /archive_sha256/);
+  assert.match(backend, /fn detect_gpu_compatibility/);
+  assert.match(backend, /runtime_variant_for_settings/);
+  assert.match(backend, /verify_sha256\(&archive/);
+});
