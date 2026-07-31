@@ -527,3 +527,16 @@ test('OCR and whisper transcription use a bounded persistent local media queue a
   assert.match(shell, /media-tasks/);
   assert.match(shell, /cancel_media_task/);
 });
+
+test('Office high-fidelity preview converts a referenced file with isolated local LibreOffice output', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /fn convert_office_preview/);
+  assert.match(backend, /soffice/);
+  assert.match(backend, /office-preview-cache/);
+  assert.match(backend, /--headless/);
+  assert.match(backend, /--outdir/);
+  assert.match(backend, /OFFICE_PREVIEW_TIMEOUT/);
+  assert.match(shell, /convert_office_preview/);
+  assert.match(shell, /高保真预览/);
+});
