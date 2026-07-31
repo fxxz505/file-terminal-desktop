@@ -46,7 +46,7 @@ type AgentEvidenceReport = { runId: string; status: string; finalEvidence: strin
 type EncryptedBackup = { path: string; displayPath: string; createdAt: string; databaseBytes: number };
 type SensitiveFinding = { itemId: string; name: string; displayPath: string; category: string; matchCount: number };
 type MetadataAuditEntry = { id: string; targetType: string; targetId: string; action: string; oldPolicy?: string; newPolicy?: string; createdAt: string };
-type View = 'workspace' | 'search' | 'assistant' | 'conversations';
+type View = 'workspace' | 'search' | 'assistant' | 'conversations' | 'settings';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 let status: RuntimeStatus = { modelInstalled: false, runtimeInstalled: false, modelPath: '', activeModelName: '默认模型' };
@@ -64,6 +64,7 @@ let activeView: View = 'workspace';
 let searchQuery = '';
 let updateVersion = '';
 let updateProgress: DownloadProgress | null = null;
+let updateStatus = '尚未检查更新';
 let contextTarget: MetadataTarget | null = null;
 let contextPosition = { x: 0, y: 0 };
 let aiOutputFolder: string | null = null;
@@ -108,6 +109,7 @@ let localTools: LocalToolStatus = { pdfText: true, ffmpeg: false, ocr: false, tr
 let formWarning: { target: 'cloud' | 'media' | 'rules'; message: string } | null = null;
 const folderRefreshTimers = new Map<string, number>();
 let embeddingUpdateTimer: number | null = null;
+let fontScale = Number(localStorage.getItem('file-terminal.font-scale') ?? '100');
 
 const icon = (name: string) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${name}"/></svg>`;
 const icons = {
@@ -118,6 +120,8 @@ const icons = {
   download: icon('M12 3.5v10m0 0 3.5-3.5M12 13.5 8.5 10M5 17.5v1.25A1.75 1.75 0 0 0 6.75 20.5h10.5A1.75 1.75 0 0 0 19 18.75V17.5'),
   check: icon('m5 12.5 4.25 4.25L19.5 6.5'),
   file: icon('M6 3.5h7L18 8v12.5H6zM13 3.5V8h5'),
+  settings: icon('M12 8.25A3.75 3.75 0 1 0 12 15.75 3.75 3.75 0 0 0 12 8.25Zm0-5.25 1.05 2.1 2.3.35 1.65-1.65 2.2 2.2-1.65 1.65.35 2.3L21 12l-2.1 1.05-.35 2.3 1.65 1.65-2.2 2.2-1.65-1.65-2.3.35L12 21l-1.05-2.1-2.3-.35-1.65 1.65-2.2-2.2 1.65-1.65-.35-2.3L3 12l2.1-1.05.35-2.3L3.8 7 6 4.8l1.65 1.65 2.3-.35L12 3Z'),
+  upload: icon('M12 16V4m0 0L7.75 8.25M12 4l4.25 4.25M4.5 16.5v2A2.5 2.5 0 0 0 7 21h10a2.5 2.5 0 0 0 2.5-2.5v-2'),
 };
 
 function bytes(value = 0) { return value ? `${(value / 1024 / 1024).toFixed(value > 1024 * 1024 * 1024 ? 0 : 1)} MB` : '等待下载'; }
@@ -231,7 +235,7 @@ function workspacePanel() {
   const runtimeState = stateChip(status.runtimeInstalled, '待下载', '已就绪');
   const models = localModels.map(model => `<div class="model-row"><button class="model-item ${model.active ? 'active' : ''}" data-local-model-id="${escapeHtml(model.id)}"><b>${escapeHtml(model.displayName)}</b><small>${escapeHtml(displayPath(model.path))}</small>${model.active ? '<em>当前使用</em>' : ''}</button><button class="quiet danger delete-local-model" data-delete-local-model-id="${escapeHtml(model.id)}">移除记录</button></div>`).join('');
   const folderActions = folderRefs.length ? `<div class="folder-index-actions">${folderRefs.map(folder => `<button class="quiet" data-refresh-folder-id="${escapeHtml(folder.id)}">刷新：${escapeHtml(folder.name)}</button>`).join('')}</div>` : '';
-  return `<section class="workspace-view"><div class="workspace-head"><div><p>本地资料管理</p><h1>把文件夹交给一个真正本地的助手。</h1><span>拖入或选择文件夹，添加备注和标签。AI 只根据本地索引给出可验证的结果。</span></div><div class="privacy"><b>${icons.check} 数据边界</b><span>不上传原始文件，不移动或删除资料。</span></div></div><section class="desk-grid"><section class="file-panel panel drop-target"><header><div><small>FOLDER TERMINAL</small><h2>已接入的资料</h2></div><button class="quiet" id="refresh">刷新状态</button></header><div class="drop-hint">拖入一个文件夹即可原位接入，或使用右上角“接入文件夹”。</div>${folderList()}${folderActions}</section><section class="assistant panel"><header><div><small>LOCAL AI</small><h2>助手快捷入口</h2></div><span class="local-chip">${icons.check} 本机</span></header><div class="assistant-body"><div class="question">现在想要玩游戏</div><p class="assistant-copy">它会检索名称、路径、备注、标签及已提取的安全文本正文，结果始终附带真实路径。</p><button class="primary" data-view="assistant">${icons.spark} 打开 AI 助手</button></div></section></section><section class="setup panel"><div class="setup-heading"><div><small>AI INITIALIZATION</small><h2>应用内完成本地模型准备</h2><p>默认下载轻量模型；也可以选择你电脑中已存在的 GGUF 模型。当前模型：${escapeHtml(status.activeModelName)}。</p></div><div class="ready-summary">${status.runtimeInstalled && status.modelInstalled ? `${icons.check} 助手已可用` : '还差一步即可启用'}</div></div><div class="setup-grid"><article><div class="setup-icon">${icons.download}</div><div class="setup-copy"><b>1. 本地推理运行时</b><span>llama.cpp Windows CPU 引擎</span></div>${runtimeState}<button class="quiet setup-button" id="download-runtime" ${isWorking || status.runtimeInstalled ? 'disabled' : ''}>下载</button></article><article><div class="setup-icon">${icons.spark}</div><div class="setup-copy"><b>2. 默认中文模型</b><span>Qwen2.5 1.5B Instruct · Q4_K_M</span></div>${modelState}<button class="primary setup-button" id="download-model" ${isWorking || status.modelInstalled ? 'disabled' : ''}>下载并启用</button></article></div><section class="local-models"><header><b>本地模型</b><button class="quiet" id="register-local-model">选择本地 GGUF 模型</button></header>${models || '<p>尚未登记额外模型；默认模型下载后可直接使用。</p>'}</section>${progress ? `<div class="progress"><div><b>${progress.kind === 'model' ? `正在从 ${escapeHtml(progress.source ?? '模型源')} 下载 Qwen2.5 1.5B 模型` : '正在下载本地推理运行时'}</b><span>${percent ? `${percent}% · ${bytes(progress.completed)} / ${bytes(progress.total)}` : bytes(progress.completed)}</span></div><i><span style="width:${percent}%"></span></i></div>` : ''}</section></section>`;
+  return `<section class="workspace-view"><div class="workspace-head"><div><p>本地资料管理</p><h1>把文件夹交给一个真正本地的助手。</h1><span>拖入或选择文件夹，添加备注和标签。AI 只根据本地索引给出可验证的结果。</span></div><div class="privacy"><b>${icons.check} 数据边界</b><span>不上传原始文件，不移动或删除资料。</span></div></div><section class="desk-grid"><section class="file-panel panel drop-target"><header><div><small>FOLDER TERMINAL</small><h2>已接入的资料</h2></div><button class="quiet" id="refresh">刷新状态</button></header><div class="drop-hint">拖入一个文件夹即可原位接入，或使用右上角“接入文件夹”。</div>${folderList()}${folderActions}</section><section class="file-upload-card panel" id="file-upload-drop" tabindex="0"><header><div><small>QUICK IMPORT</small><h2>上传文件</h2></div><span class="local-chip">${icons.check} 本机副本</span></header><div class="upload-body"><div class="upload-icon">${icons.upload}</div><strong>拖入文件到此处</strong><p>或点击按钮选择文件。软件会复制到受管理的本地资料区，原文件不会被移动或删除。</p><button class="primary" data-import-files>${icons.upload} 选择文件上传</button><small>文件夹请继续使用“接入文件夹”。</small></div></section></section><section class="setup panel"><div class="setup-heading"><div><small>AI INITIALIZATION</small><h2>应用内完成本地模型准备</h2><p>默认下载轻量模型；也可以选择你电脑中已存在的 GGUF 模型。当前模型：${escapeHtml(status.activeModelName)}。</p></div><div class="ready-summary">${status.runtimeInstalled && status.modelInstalled ? `${icons.check} 助手已可用` : '还差一步即可启用'}</div></div><div class="setup-grid"><article><div class="setup-icon">${icons.download}</div><div class="setup-copy"><b>1. 本地推理运行时</b><span>llama.cpp Windows CPU 引擎</span></div>${runtimeState}<button class="quiet setup-button" id="download-runtime" ${isWorking || status.runtimeInstalled ? 'disabled' : ''}>下载</button></article><article><div class="setup-icon">${icons.spark}</div><div class="setup-copy"><b>2. 默认中文模型</b><span>Qwen2.5 1.5B Instruct · Q4_K_M</span></div>${modelState}<button class="primary setup-button" id="download-model" ${isWorking || status.modelInstalled ? 'disabled' : ''}>下载并启用</button></article></div><section class="local-models"><header><b>本地模型</b><button class="quiet" id="register-local-model">选择本地 GGUF 模型</button></header>${models || '<p>尚未登记额外模型；默认模型下载后可直接使用。</p>'}</section>${progress ? `<div class="progress"><div><b>${progress.kind === 'model' ? `正在从 ${escapeHtml(progress.source ?? '模型源')} 下载 Qwen2.5 1.5B 模型` : '正在下载本地推理运行时'}</b><span>${percent ? `${percent}% · ${bytes(progress.completed)} / ${bytes(progress.total)}` : bytes(progress.completed)}</span></div><i><span style="width:${percent}%"></span></i></div>` : ''}</section></section>`;
 }
 
 function workspaceExtras() {
@@ -244,16 +248,23 @@ function workspaceExtras() {
   return `<section class="workspace-extras">${recovery}${privacy}<form id="runtime-settings" class="runtime-settings"><b>本地模型运行设置</b><label>模式 <select id="runtime-mode"><option value="auto" ${runtimeSettings.executionMode === 'auto' ? 'selected' : ''}>自动</option><option value="cpu" ${runtimeSettings.executionMode === 'cpu' ? 'selected' : ''}>CPU</option><option value="gpu" ${runtimeSettings.executionMode === 'gpu' ? 'selected' : ''}>GPU</option></select></label><label>线程 <input id="runtime-threads" type="number" min="1" max="64" value="${runtimeSettings.threads}"></label><label>上下文 <input id="runtime-context" type="number" min="512" max="32768" value="${runtimeSettings.contextSize}"></label><button class="quiet" type="submit">保存运行设置</button></form><button class="quiet" id="run-environment-acceptance">运行环境验收</button>${acceptance}<label class="agent-preference"><input id="auto-apply-low-risk" type="checkbox" ${agentPreferences.autoApplyLowRisk ? 'checked' : ''}> 自动执行低风险工作区步骤（不覆盖、不删除、不联网、不发布）</label>${watching}${indexing}${queue}</section>`;
 }
 
+function settingsPage() {
+  const versionText = updateVersion ? `发现可用版本 ${escapeHtml(updateVersion)}` : escapeHtml(updateStatus);
+  return `<section class="single-panel panel"><header><div><small>PREFERENCES</small><h2>设置</h2></div><span class="local-chip">${icons.check} 保存在本机</span></header><div class="settings-page"><section class="settings-section"><div><b>界面文字大小</b><span>调整资料终端的阅读密度；设置仅保存在当前 Windows 用户的本机浏览器存储中。</span></div><div class="font-scale-control"><input id="font-scale" type="range" min="90" max="125" step="5" value="${fontScale}" aria-label="界面文字大小"><output id="font-scale-value">${fontScale}%</output></div></section><section class="settings-section"><div><b>软件更新</b><span>${versionText}</span></div><div class="settings-actions"><button class="quiet" id="check-update" ${isWorking ? 'disabled' : ''}>检查更新</button>${updateVersion ? '<button class="primary" id="install-update">下载并安装</button>' : ''}</div></section><section class="settings-section settings-note"><div><b>隐私与数据位置</b><span>文件上传副本保存在资料终端的本地应用数据目录；文件夹接入保持原位置引用。云端权限仅决定 Agent 可否按规则发送经过筛选的资料。</span></div></section></div></section>`;
+}
+
 function render() {
   const pages: Record<View, { title: string; subtitle: string; content: string }> = {
     workspace: { title: '资料空间', subtitle: '原文件留在原位置 · 索引存于本机', content: `${workspaceExtras()}${workspacePanel()}` },
     search: { title: '本地搜索', subtitle: '按名称、路径、备注和标签查询', content: searchPanel() },
     assistant: { title: 'AI 助手', subtitle: '理解问题后，以本地索引给出结果', content: assistantPanel() },
     conversations: { title: 'AI 对话', subtitle: '本机保存的问答记录与结构化步骤', content: conversationPage() },
+    settings: { title: '设置', subtitle: '界面与更新偏好', content: settingsPage() },
   };
   const page = pages[activeView];
   const menu = contextTarget ? `<div class="context-menu" style="left:${contextPosition.x}px;top:${contextPosition.y}px" role="menu"><b>${escapeHtml(contextTarget.name)}</b><button data-metadata-action="note">编辑备注</button><button data-metadata-action="tags">编辑标签</button><button data-metadata-action="local_only">云端：禁止上传</button><button data-metadata-action="cloud_allowed">云端：允许上传</button><button data-metadata-action="ask_each_time">云端：每次询问</button></div>` : '';
-  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-view="assistant">${icons.spark}<span>AI 助手</span></button><button class="nav ${activeView === 'conversations' ? 'active' : ''}" data-view="conversations">${icons.file}<span>AI 对话</span></button></nav><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${folderBrowser()}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>${menu}`;
+  app.style.setProperty('--user-font-scale', `${fontScale / 100}`);
+  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-view="assistant">${icons.spark}<span>AI 助手</span></button><button class="nav ${activeView === 'conversations' ? 'active' : ''}" data-view="conversations">${icons.file}<span>AI 对话</span></button></nav><div class="sidebar-bottom"><button class="nav ${activeView === 'settings' ? 'active' : ''}" data-view="settings">${icons.settings}<span>设置</span></button><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${folderBrowser()}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>${menu}`;
   bind();
 }
 
@@ -274,6 +285,16 @@ async function selectFolder() {
   const tagText = window.prompt('添加标签，用逗号分隔（可留空）：') ?? '';
   isWorking = true; error = ''; render();
   try { const indexed = await invoke<number>('import_folder', { input: { path: selected, note, tags: tagText.split(',').map(tag => tag.trim()).filter(Boolean) } }); await loadFolderRefs(); window.alert(`已在原位置接入文件夹，并建立 ${indexed} 项本地索引。`); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); }
+}
+async function importFilesToLibrary(paths: string[]) {
+  if (!paths.length) return;
+  isWorking = true; error = ''; render();
+  try { const copied = await invoke<number>('import_files_to_library', { input: { paths } }); await loadFolderRefs(); window.alert(`已复制 ${copied} 个文件到资料终端的本地上传区，原文件未被移动或删除。`); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); }
+}
+async function chooseFilesForImport() {
+  const selected = await open({ directory: false, multiple: true, title: '选择要上传到资料终端的文件' });
+  if (!selected) return;
+  await importFilesToLibrary(Array.isArray(selected) ? selected : [selected]);
 }
 function metadataTarget(element: HTMLElement): MetadataTarget | null {
   const targetType = element.dataset.targetType;
@@ -298,10 +319,27 @@ async function editMetadata(action: string) {
   } else {
     const policy = action as CloudPolicy;
     if (policy !== 'local_only' && target.cloudPolicy === 'local_only' && !window.confirm('允许云端后，AI 可能在任务需要时发送经过筛选和脱敏的资料。确定继续吗？')) { render(); return; }
-    await invoke('update_metadata', { input: { targetType: target.targetType, targetId: target.targetId, cloudPolicy: policy } });
+    applyMetadataPolicyOptimistically(target, policy);
+    return;
   }
   await refreshStatus();
   if (activeFolder) await openFolder(activeFolder.id, browserPath ?? activeFolder.path);
+}
+function applyMetadataPolicyOptimistically(target: MetadataTarget, policy: CloudPolicy) {
+  const previousPolicy = target.cloudPolicy;
+  const apply = <T extends { id: string; cloudPolicy: CloudPolicy }>(items: T[]) => items.map(item => item.id === target.targetId ? { ...item, cloudPolicy: policy } : item);
+  if (target.targetType === 'folder') folderRefs = apply(folderRefs);
+  else { results = apply(results); folderEntries = apply(folderEntries); }
+  if (activeFolder?.id === target.targetId && target.targetType === 'folder') activeFolder = { ...activeFolder, cloudPolicy: policy };
+  render();
+  invoke('update_metadata', { input: { targetType: target.targetType, targetId: target.targetId, cloudPolicy: policy } }).catch(reason => {
+    const revert = <T extends { id: string; cloudPolicy: CloudPolicy }>(items: T[]) => items.map(item => item.id === target.targetId ? { ...item, cloudPolicy: previousPolicy } : item);
+    if (target.targetType === 'folder') folderRefs = revert(folderRefs);
+    else { results = revert(results); folderEntries = revert(folderEntries); }
+    if (activeFolder?.id === target.targetId && target.targetType === 'folder') activeFolder = { ...activeFolder, cloudPolicy: previousPolicy };
+    error = `云端权限未保存：${String(reason)}`;
+    render();
+  });
 }
 async function chooseAiOutputFolder() {
   const selected = await open({ directory: true, multiple: false, title: '选择 AI 写入文件夹' });
@@ -418,12 +456,16 @@ async function clearLocalData(scope: string) { if (!window.confirm('此操作只
 async function loadPreview(path: string) { if (!path) return; isWorking = true; error = ''; render(); try { preview = await invoke<FilePreview>('preview_file', { path }); } catch (reason) { error = `无法预览文件：${String(reason)}`; } finally { isWorking = false; render(); } }
 async function convertOfficePreview() { if (!preview) return; isWorking = true; error = ''; render(); try { preview = await invoke<FilePreview>('convert_office_preview', { path: preview.path }); } catch (reason) { error = `无法生成高保真预览：${String(reason)}`; } finally { isWorking = false; render(); } }
 async function revealPreview() { if (!preview) return; try { await invoke('reveal_in_explorer', { path: preview.path }); } catch (reason) { error = `无法打开资源管理器：${String(reason)}`; render(); } }
-async function checkForUpdate() {
+async function checkForUpdate(showResult = false) {
   try {
     const update = await check();
     updateVersion = update?.version ?? '';
-    if (updateVersion && window.confirm(`发现 ${updateVersion} 新版本。现在下载并自动安装吗？`)) await installUpdate();
+    updateStatus = updateVersion ? `发现可用版本 ${updateVersion}` : '当前已是最新版本';
+    if (showResult) render();
+    if (updateVersion && !showResult && window.confirm(`发现 ${updateVersion} 新版本。现在下载并自动安装吗？`)) await installUpdate();
   } catch (reason) {
+    updateStatus = `暂时无法检查更新：${String(reason)}`;
+    if (showResult) render();
     console.warn('Update check skipped:', reason);
   }
 }
@@ -473,6 +515,13 @@ function bind() {
   document.querySelector('#high-fidelity-office-preview')?.addEventListener('click', convertOfficePreview);
   document.querySelectorAll<HTMLElement>('[data-view]').forEach(button => button.addEventListener('click', () => { activeView = button.dataset.view as View; render(); }));
   document.querySelector('#import-folder')?.addEventListener('click', selectFolder); document.querySelector('#choose-folder')?.addEventListener('click', selectFolder); document.querySelector('#refresh')?.addEventListener('click', refreshStatus); document.querySelector('#download-runtime')?.addEventListener('click', () => provision('runtime')); document.querySelector('#download-model')?.addEventListener('click', () => provision('model'));
+  document.querySelectorAll<HTMLElement>('[data-import-files]').forEach(button => button.addEventListener('click', chooseFilesForImport));
+  const uploadDrop = document.querySelector<HTMLElement>('#file-upload-drop');
+  uploadDrop?.addEventListener('dragover', event => { event.preventDefault(); uploadDrop.classList.add('dragging'); });
+  uploadDrop?.addEventListener('dragleave', () => uploadDrop.classList.remove('dragging'));
+  uploadDrop?.addEventListener('drop', event => { event.preventDefault(); uploadDrop.classList.remove('dragging'); const paths = Array.from(event.dataTransfer?.files ?? []).map(file => (file as File & { path?: string }).path).filter((path): path is string => Boolean(path)); if (paths.length) importFilesToLibrary(paths); else { error = '未能读取拖入文件路径，请点击“选择文件上传”。'; render(); } });
+  document.querySelector<HTMLInputElement>('#font-scale')?.addEventListener('input', event => { fontScale = Number((event.target as HTMLInputElement).value); localStorage.setItem('file-terminal.font-scale', String(fontScale)); render(); });
+  document.querySelector('#check-update')?.addEventListener('click', () => checkForUpdate(true));
   document.querySelector('#register-local-model')?.addEventListener('click', registerLocalModel);
   document.querySelector('#register-embedding-model')?.addEventListener('click', registerEmbeddingModel);
   document.querySelector('#build-embedding-index')?.addEventListener('click', buildEmbeddingIndex);
@@ -537,7 +586,14 @@ listen<MediaTask>('media-task-progress', event => { mediaTasks = [event.payload,
 getCurrentWindow().onDragDropEvent(event => {
   if (event.payload.type !== 'drop') return;
   const paths = event.payload.paths;
-  if (paths.length !== 1) { error = '请一次拖入一个文件夹。'; render(); return; }
+  const uploadDrop = document.querySelector<HTMLElement>('#file-upload-drop');
+  const rect = uploadDrop?.getBoundingClientRect();
+  const scale = window.devicePixelRatio || 1;
+  const dropX = event.payload.position.x / scale;
+  const dropY = event.payload.position.y / scale;
+  const droppedOnUpload = rect && dropX >= rect.left && dropX <= rect.right && dropY >= rect.top && dropY <= rect.bottom;
+  if (droppedOnUpload) { importFilesToLibrary(paths); return; }
+  if (paths.length !== 1) { error = '请一次拖入一个文件夹，或拖入文件到“上传文件”区域。'; render(); return; }
   importFolderPath(paths[0]);
 }).catch(reason => { error = `无法启用文件夹拖入：${String(reason)}`; render(); });
 refreshStatus().catch(reason => { error = `无法连接桌面端：${String(reason)}`; render(); });

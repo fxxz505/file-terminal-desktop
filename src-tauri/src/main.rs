@@ -185,6 +185,12 @@ struct FolderImport {
     tags: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileImport {
+    paths: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchDocumentsInput {
@@ -1560,6 +1566,19 @@ fn preview_mime(extension: &str) -> Option<(&'static str, &'static str)> {
 
 fn command_available(command: &str) -> bool {
     Command::new(command).arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+}
+
+fn unique_library_file_path(library: &Path, original_name: &std::ffi::OsStr) -> PathBuf {
+    let original = PathBuf::from(original_name);
+    let stem = original.file_stem().unwrap_or(original_name).to_string_lossy();
+    let extension = original.extension().map(|value| format!(".{}", value.to_string_lossy())).unwrap_or_default();
+    let mut candidate = library.join(original_name);
+    let mut number = 2usize;
+    while candidate.exists() {
+        candidate = library.join(format!("{stem} ({number}){extension}"));
+        number += 1;
+    }
+    candidate
 }
 
 fn pdf_renderer_available() -> bool {
@@ -2982,6 +3001,42 @@ fn import_folder(
         },
     );
     Ok(count)
+}
+
+#[tauri::command]
+fn import_files_to_library(
+    input: FileImport,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    if input.paths.is_empty() || input.paths.len() > 100 {
+        return Err("请一次选择 1 至 100 个普通文件。".to_string());
+    }
+    let library = state.data_dir.join("uploaded-files");
+    fs::create_dir_all(&library).map_err(|error| error.to_string())?;
+    let library = fs::canonicalize(&library).map_err(|error| error.to_string())?;
+    let mut copied = 0;
+    for value in input.paths {
+        let source = fs::canonicalize(&value).map_err(|_| "选择的文件不存在或无法访问。".to_string())?;
+        if !source.is_file() {
+            return Err("上传入口仅接受文件；文件夹请使用“接入文件夹”。".to_string());
+        }
+        let file_name = source.file_name().ok_or_else(|| "无法确定上传文件名。".to_string())?;
+        let target = unique_library_file_path(&library, file_name);
+        fs::copy(&source, &target).map_err(|error| format!("无法复制 {}：{error}", display_path(&source)))?;
+        copied += 1;
+    }
+    // The managed upload folder is indexed as one reference, preserving imported file copies.
+    import_folder(
+        FolderImport {
+            path: library.display().to_string(),
+            note: "由文件上传入口管理；原文件不会被移动或删除。".to_string(),
+            tags: vec!["已上传".to_string()],
+        },
+        app,
+        state,
+    )?;
+    Ok(copied)
 }
 
 #[tauri::command]
@@ -5781,6 +5836,7 @@ fn main() {
             register_embedding_model,
             build_embedding_index,
             import_folder,
+            import_files_to_library,
             refresh_folder_index,
             enqueue_index_job,
             list_index_jobs,
@@ -5852,7 +5908,7 @@ mod preview_tests {
         cosine_similarity, display_path, effective_cloud_policy, incremental_index_folder_inner,
         initialize_database, migrate_plaintext_database, open_encrypted_database, preview_mime,
         quarantine_unreadable_database, restore_quarantined_database,
-        safe_relative_path, CloudPolicy,
+        safe_relative_path, unique_library_file_path, CloudPolicy,
     };
     use rusqlite::{params, Connection};
     use std::{fs, path::Path, time::Instant};
@@ -5964,6 +6020,19 @@ mod preview_tests {
         assert_eq!(target.query_row("SELECT note FROM folder_refs WHERE id = 'old'", [], |row| row.get::<_, String>(0)).unwrap(), "来自旧库");
         assert_eq!(target.query_row("SELECT threads FROM runtime_settings WHERE id = 1", [], |row| row.get::<_, i64>(0)).unwrap(), 7);
         assert!(source_path.is_file());
+    }
+
+    #[test]
+    fn managed_file_upload_uses_a_distinct_name_without_replacing_an_existing_copy() {
+        let temp = tempdir().unwrap();
+        let library = temp.path().join("uploaded-files");
+        fs::create_dir_all(&library).unwrap();
+        fs::write(library.join("notes.txt"), "first copy").unwrap();
+
+        let target = unique_library_file_path(&library, std::ffi::OsStr::new("notes.txt"));
+
+        assert_eq!(target.file_name().unwrap(), "notes (2).txt");
+        assert_eq!(fs::read_to_string(library.join("notes.txt")).unwrap(), "first copy");
     }
 
     #[test]

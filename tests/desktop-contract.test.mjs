@@ -637,7 +637,7 @@ test('desktop updates cloud permission optimistically, imports files into manage
   const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
   assert.match(shell, /applyMetadataPolicyOptimistically/);
   assert.match(shell, /update_metadata/);
-  assert.doesNotMatch(shell, /await refreshStatus\(\);\s*\n\s*if \(activeFolder\)/);
+  assert.match(shell, /applyMetadataPolicyOptimistically\(target, policy\);\s*\n\s*return;/);
   assert.match(shell, /importFilesToLibrary/);
   assert.match(shell, /data-import-files/);
   assert.match(shell, /data-view="settings"/);
@@ -648,4 +648,5 @@ test('desktop updates cloud permission optimistically, imports files into manage
   assert.match(backend, /fs::copy/);
   assert.match(styles, /\.file-upload-card/);
   assert.match(styles, /\.settings-page/);
+  assert.match(styles, /#app\{zoom:var\(--user-font-scale\)\}/);
 });
