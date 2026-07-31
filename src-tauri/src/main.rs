@@ -64,6 +64,9 @@ const MODEL_FILE: &str = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
 const MAX_PREVIEW_BYTES: u64 = 1_048_576;
 const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_THUMBNAIL_BYTES: usize = 256 * 1024;
+const MAX_MEDIA_OUTPUT_CHARS: usize = 120_000;
+const MAX_MEDIA_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+const MEDIA_TASK_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CLOUD_REQUEST_BYTES: usize = 48 * 1024;
 const CLOUD_KEYRING_SERVICE: &str = "file-terminal-desktop.cloud-provider";
 const BACKUP_KEYRING_SERVICE: &str = "file-terminal-desktop.encrypted-backup";
@@ -726,6 +729,39 @@ struct ThumbnailCacheClearResult {
     removed: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaTaskInput {
+    item_id: String,
+    kind: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaTask {
+    id: String,
+    item_id: String,
+    name: String,
+    kind: String,
+    status: String,
+    error: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaTaskIdInput {
+    id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaSettings {
+    whisper_model_path: String,
+    ocr_language: String,
+}
+
 fn database_key_entry() -> Result<Entry, String> {
     Entry::new(DATABASE_KEYRING_SERVICE, "database-key")
         .map_err(|_| "无法访问 Windows 凭据库。".to_string())
@@ -869,6 +905,32 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(item_id) REFERENCES index_items(id)
             );
             CREATE INDEX IF NOT EXISTS thumbnail_cache_item_idx ON thumbnail_cache(item_id);
+            CREATE TABLE IF NOT EXISTS media_tasks (
+                id TEXT PRIMARY KEY,
+                item_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('ocr', 'transcription')),
+                status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(item_id) REFERENCES index_items(id)
+            );
+            CREATE INDEX IF NOT EXISTS media_tasks_status_idx ON media_tasks(status, created_at);
+            CREATE TABLE IF NOT EXISTS media_extractions (
+                item_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                source_signature TEXT NOT NULL,
+                content TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (item_id, kind),
+                FOREIGN KEY(item_id) REFERENCES index_items(id)
+            );
+            CREATE TABLE IF NOT EXISTS media_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                whisper_model_path TEXT NOT NULL DEFAULT '',
+                ocr_language TEXT NOT NULL DEFAULT 'chi_sim+eng'
+            );
+            INSERT OR IGNORE INTO media_settings (id, whisper_model_path, ocr_language) VALUES (1, '', 'chi_sim+eng');
             CREATE TABLE IF NOT EXISTS metadata_audit (
                 id TEXT PRIMARY KEY,
                 target_type TEXT NOT NULL,
@@ -1393,11 +1455,28 @@ fn index_content(connection: &Connection, item_id: &str, path: &Path) -> Result<
             params![item_id],
         )
         .map_err(|error| error.to_string())?;
-    if let Some(content) = text_content_for_index(path) {
+    let mut content = text_content_for_index(path).unwrap_or_default();
+    let extracted = {
+        let mut statement = connection
+            .prepare("SELECT content FROM media_extractions WHERE item_id = ?1")
+            .map_err(|error| error.to_string())?;
+        let values = statement
+            .query_map(params![item_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        values
+    };
+    for value in extracted {
+        if !content.is_empty() { content.push('\n'); }
+        content.push_str(&value);
+        if content.chars().count() >= MAX_MEDIA_OUTPUT_CHARS { break; }
+    }
+    if !content.trim().is_empty() {
         connection
             .execute(
                 "INSERT INTO index_content_fts (item_id, content) VALUES (?1, ?2)",
-                params![item_id, content],
+                params![item_id, content.chars().take(MAX_MEDIA_OUTPUT_CHARS).collect::<String>()],
             )
             .map_err(|error| error.to_string())?;
     }
@@ -4919,6 +4998,126 @@ fn preview_file(path: String, state: State<'_, AppState>) -> Result<FilePreview,
     })
 }
 
+fn media_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaTask> {
+    Ok(MediaTask {
+        id: row.get(0)?,
+        item_id: row.get(1)?,
+        name: row.get(2)?,
+        kind: row.get(3)?,
+        status: row.get(4)?,
+        error: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+fn emit_media_task(app: &AppHandle, task: &MediaTask) {
+    let _ = app.emit("media-task-progress", task);
+}
+
+fn media_settings(connection: &Connection) -> Result<MediaSettings, String> {
+    connection.query_row(
+        "SELECT whisper_model_path, ocr_language FROM media_settings WHERE id = 1",
+        [],
+        |row| Ok(MediaSettings { whisper_model_path: row.get(0)?, ocr_language: row.get(1)? }),
+    ).map_err(|error| error.to_string())
+}
+
+fn bounded_command_output(command: &mut Command) -> Result<String, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let started = SystemTime::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            let output = child.wait_with_output().map_err(|error| error.to_string())?;
+            if !status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).chars().take(2_000).collect::<String>());
+            }
+            return Ok(String::from_utf8_lossy(&output.stdout).chars().take(MAX_MEDIA_OUTPUT_CHARS).collect());
+        }
+        if started.elapsed().unwrap_or_default() > MEDIA_TASK_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("本地媒体任务超时，已停止。".to_string());
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+}
+
+fn indexed_media_path(connection: &Connection, item_id: &str) -> Result<PathBuf, String> {
+    let value = connection.query_row(
+        "SELECT path FROM index_items WHERE id = ?1 AND item_type = 'file'",
+        params![item_id],
+        |row| row.get::<_, String>(0),
+    ).map_err(|_| "媒体资料不存在或不是文件。".to_string())?;
+    let path = fs::canonicalize(value).map_err(|_| "媒体文件不存在或无法访问。".to_string())?;
+    let mut statement = connection.prepare("SELECT root_path FROM folder_refs").map_err(|error| error.to_string())?;
+    let permitted = statement.query_map([], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .any(|root| path.starts_with(root));
+    permitted.then_some(path).ok_or_else(|| "媒体文件不在已接入资料夹内。".to_string())
+}
+
+fn run_media_extraction(connection: &Connection, task: &MediaTask, data_dir: &Path) -> Result<(), String> {
+    let path = indexed_media_path(connection, &task.item_id)?;
+    if fs::metadata(&path).map_err(|error| error.to_string())?.len() > MAX_MEDIA_SOURCE_BYTES {
+        return Err("媒体文件超过本地识别安全大小限制。".to_string());
+    }
+    let signature = source_signature(&path)?;
+    let settings = media_settings(connection)?;
+    let content = match task.kind.as_str() {
+        "ocr" => {
+            if !command_available("tesseract") { return Err("未检测到 Tesseract；请安装本地 OCR 和语言包。".to_string()); }
+            let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+            if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp") { return Err("OCR 仅支持本地图片文件。".to_string()); }
+            bounded_command_output(Command::new("tesseract").arg(&path).arg("stdout").arg("-l").arg(settings.ocr_language))?
+        }
+        "transcription" => {
+            let whisper = if command_available("whisper-cli") { "whisper-cli" } else if command_available("whisper") { "whisper" } else { return Err("未检测到本地 Whisper CLI。".to_string()); };
+            if !command_available("ffmpeg") { return Err("未检测到 FFmpeg，无法安全转换音视频。".to_string()); }
+            if settings.whisper_model_path.trim().is_empty() || !Path::new(&settings.whisper_model_path).is_file() { return Err("请先选择本地 Whisper 模型文件。".to_string()); }
+            let task_dir = data_dir.join("media-work").join(&task.id);
+            fs::create_dir_all(&task_dir).map_err(|error| error.to_string())?;
+            let wav = task_dir.join("input.wav");
+            let prefix = task_dir.join("transcript");
+            let converted = bounded_command_output(Command::new("ffmpeg").arg("-y").arg("-i").arg(&path).arg("-vn").arg("-ac").arg("1").arg("-ar").arg("16000").arg(&wav));
+            if let Err(error) = converted { let _ = fs::remove_dir_all(&task_dir); return Err(error); }
+            let result = bounded_command_output(Command::new(whisper).arg("-m").arg(settings.whisper_model_path).arg("-f").arg(&wav).arg("-otxt").arg("-of").arg(&prefix));
+            let transcript = fs::read_to_string(prefix.with_extension("txt")).map_err(|_| result.err().unwrap_or_else(|| "Whisper 未生成可读取文本。".to_string()));
+            let _ = fs::remove_dir_all(&task_dir);
+            transcript?
+        }
+        _ => return Err("不支持的媒体任务类型。".to_string()),
+    };
+    let content = content.chars().take(MAX_MEDIA_OUTPUT_CHARS).collect::<String>();
+    if content.trim().is_empty() { return Err("本地工具未识别出可索引文本。".to_string()); }
+    connection.execute(
+        "INSERT OR REPLACE INTO media_extractions (item_id, kind, source_signature, content, updated_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+        params![task.item_id, task.kind, signature, content],
+    ).map_err(|error| error.to_string())?;
+    index_content(connection, &task.item_id, &path)
+}
+
+fn start_media_worker(app: AppHandle, data_dir: PathBuf) {
+    thread::spawn(move || loop {
+        let Ok(connection) = open_app_database(&data_dir) else { thread::sleep(Duration::from_secs(2)); continue; };
+        let task = connection.query_row(
+            "SELECT media_tasks.id, media_tasks.item_id, index_items.name, media_tasks.kind, media_tasks.status, media_tasks.error, media_tasks.created_at, media_tasks.updated_at FROM media_tasks INNER JOIN index_items ON index_items.id = media_tasks.item_id WHERE media_tasks.status = 'queued' ORDER BY media_tasks.created_at ASC LIMIT 1",
+            [], media_task_from_row,
+        ).optional().ok().flatten();
+        let Some(task) = task else { thread::sleep(Duration::from_millis(500)); continue; };
+        let _ = connection.execute("UPDATE media_tasks SET status = 'running', error = NULL, updated_at = datetime('now') WHERE id = ?1 AND status = 'queued'", params![task.id]);
+        let running = MediaTask { status: "running".to_string(), error: None, ..task.clone() };
+        emit_media_task(&app, &running);
+        let outcome = run_media_extraction(&connection, &running, &data_dir);
+        let (status, error) = match outcome { Ok(()) => ("completed", None), Err(error) => ("failed", Some(error)) };
+        let _ = connection.execute("UPDATE media_tasks SET status = ?1, error = ?2, updated_at = datetime('now') WHERE id = ?3 AND status = 'running'", params![status, error, task.id]);
+        let finished = MediaTask { status: status.to_string(), error, ..task };
+        emit_media_task(&app, &finished);
+    });
+}
+
 #[tauri::command]
 fn get_thumbnail(input: ThumbnailInput, state: State<'_, AppState>) -> Result<Thumbnail, String> {
     if input.item_id.trim().is_empty() {
@@ -4981,6 +5180,63 @@ fn clear_thumbnail_cache(state: State<'_, AppState>) -> Result<ThumbnailCacheCle
 }
 
 #[tauri::command]
+fn list_media_tasks(state: State<'_, AppState>) -> Result<Vec<MediaTask>, String> {
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut statement = connection.prepare(
+        "SELECT media_tasks.id, media_tasks.item_id, index_items.name, media_tasks.kind, media_tasks.status, media_tasks.error, media_tasks.created_at, media_tasks.updated_at FROM media_tasks INNER JOIN index_items ON index_items.id = media_tasks.item_id ORDER BY media_tasks.created_at DESC LIMIT 100"
+    ).map_err(|error| error.to_string())?;
+    let tasks = statement
+        .query_map([], media_task_from_row)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    Ok(tasks)
+}
+
+#[tauri::command]
+fn enqueue_media_task(input: MediaTaskInput, state: State<'_, AppState>) -> Result<MediaTask, String> {
+    if !matches!(input.kind.as_str(), "ocr" | "transcription") { return Err("不支持的媒体任务类型。".to_string()); }
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let path = indexed_media_path(&connection, &input.item_id)?;
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+    if input.kind == "ocr" && !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp") { return Err("OCR 只能加入图片文件。".to_string()); }
+    if input.kind == "transcription" && !matches!(extension.as_str(), "wav" | "mp3" | "m4a" | "flac" | "ogg" | "mp4" | "mkv" | "mov" | "webm" | "avi") { return Err("转写只能加入音频或视频文件。".to_string()); }
+    if let Some(task) = connection.query_row(
+        "SELECT media_tasks.id, media_tasks.item_id, index_items.name, media_tasks.kind, media_tasks.status, media_tasks.error, media_tasks.created_at, media_tasks.updated_at FROM media_tasks INNER JOIN index_items ON index_items.id = media_tasks.item_id WHERE media_tasks.item_id = ?1 AND media_tasks.kind = ?2 AND media_tasks.status IN ('queued', 'running') ORDER BY media_tasks.created_at DESC LIMIT 1",
+        params![input.item_id, input.kind], media_task_from_row,
+    ).optional().map_err(|error| error.to_string())? { return Ok(task); }
+    let id = Uuid::new_v4().to_string();
+    connection.execute("INSERT INTO media_tasks (id, item_id, kind, status, created_at, updated_at) VALUES (?1, ?2, ?3, 'queued', datetime('now'), datetime('now'))", params![id, input.item_id, input.kind]).map_err(|error| error.to_string())?;
+    connection.query_row(
+        "SELECT media_tasks.id, media_tasks.item_id, index_items.name, media_tasks.kind, media_tasks.status, media_tasks.error, media_tasks.created_at, media_tasks.updated_at FROM media_tasks INNER JOIN index_items ON index_items.id = media_tasks.item_id WHERE media_tasks.id = ?1",
+        params![id], media_task_from_row,
+    ).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn cancel_media_task(input: MediaTaskIdInput, state: State<'_, AppState>) -> Result<(), String> {
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let changed = connection.execute("UPDATE media_tasks SET status = 'cancelled', error = '用户取消', updated_at = datetime('now') WHERE id = ?1 AND status IN ('queued', 'running')", params![input.id]).map_err(|error| error.to_string())?;
+    if changed == 0 { return Err("媒体任务无法取消或已完成。".to_string()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_media_settings(state: State<'_, AppState>) -> Result<MediaSettings, String> {
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    media_settings(&connection)
+}
+
+#[tauri::command]
+fn save_media_settings(input: MediaSettings, state: State<'_, AppState>) -> Result<MediaSettings, String> {
+    if input.ocr_language.trim().is_empty() || input.ocr_language.len() > 80 || input.whisper_model_path.len() > 1_024 { return Err("媒体工具设置无效。".to_string()); }
+    if !input.whisper_model_path.trim().is_empty() && !Path::new(&input.whisper_model_path).is_file() { return Err("Whisper 模型文件不存在。".to_string()); }
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    connection.execute("UPDATE media_settings SET whisper_model_path = ?1, ocr_language = ?2 WHERE id = 1", params![input.whisper_model_path, input.ocr_language]).map_err(|error| error.to_string())?;
+    Ok(input)
+}
+
+#[tauri::command]
 fn reveal_in_explorer(path: String, state: State<'_, AppState>) -> Result<(), String> {
     let target = indexed_path(Path::new(&path), &state)?;
     let mut command = Command::new("explorer.exe");
@@ -5015,6 +5271,7 @@ fn main() {
         .setup(|app| {
             start_folder_change_watch(app.handle().clone(), app_data_dir()?);
             start_index_worker(app.handle().clone(), app_data_dir()?);
+            start_media_worker(app.handle().clone(), app_data_dir()?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -5082,6 +5339,11 @@ fn main() {
             preview_file,
             get_thumbnail,
             clear_thumbnail_cache,
+            list_media_tasks,
+            enqueue_media_task,
+            cancel_media_task,
+            get_media_settings,
+            save_media_settings,
             reveal_in_explorer
         ])
         .run(tauri::generate_context!())

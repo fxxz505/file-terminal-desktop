@@ -18,6 +18,8 @@ type AiOutputTarget = { workspaceId: string; path: string; displayPath: string; 
 type DownloadProgress = { kind: 'model' | 'runtime'; source?: string; completed: number; total?: number };
 type FilePreview = { kind: 'image' | 'text' | 'pdf' | 'folder' | 'unsupported'; name: string; path: string; displayPath: string; mimeType: string; content: string; message: string; truncated: boolean };
 type Thumbnail = { itemId: string; sourceSignature: string; mimeType: string; content: string; cached: boolean };
+type MediaTask = { id: string; itemId: string; name: string; kind: 'ocr' | 'transcription'; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'; error?: string; createdAt: string; updatedAt: string };
+type MediaSettings = { whisperModelPath: string; ocrLanguage: string };
 type CloudProviderConfig = { providerId: string; displayName: string; baseUrl: string; model: string; autoCollaboration: boolean; reviewEachRequest: boolean; configured: boolean };
 type CloudModel = { id: string };
 type ParsedReply = { answer: string; steps: string[]; codeBlocks: number };
@@ -97,6 +99,8 @@ let acceptanceChecks: AcceptanceCheck[] = [];
 let agentEvidenceReport: AgentEvidenceReport | null = null;
 let mediaGalleryOpen = false;
 let mediaThumbnails = new Map<string, Thumbnail>();
+let mediaTasks: MediaTask[] = [];
+let mediaSettings: MediaSettings = { whisperModelPath: '', ocrLanguage: 'chi_sim+eng' };
 const folderRefreshTimers = new Map<string, number>();
 
 const icon = (name: string) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${name}"/></svg>`;
@@ -138,6 +142,7 @@ function previewPanel() {
 }
 
 function isGalleryImage(item: Result) { return item.itemType === 'file' && /\.(png|jpe?g|gif|webp|bmp)$/i.test(item.name); }
+function mediaKind(item: Result): MediaTask['kind'] | null { if (/\.(png|jpe?g|bmp|tiff?|webp)$/i.test(item.name)) return 'ocr'; if (/\.(wav|mp3|m4a|flac|ogg|mp4|mkv|mov|webm|avi)$/i.test(item.name)) return 'transcription'; return null; }
 function mediaGallery() {
   if (!mediaGalleryOpen) return '';
   const images = results.filter(isGalleryImage);
@@ -149,6 +154,13 @@ function mediaGallery() {
   return `<section class="media-gallery"><header><div><b>图库浏览</b><span>缩略图仅写入应用数据目录，不会改动原图；PDF 首页缩略图需要后续本地渲染器。</span></div><div><button class="quiet" id="build-media-thumbnails" ${isWorking || !images.length ? 'disabled' : ''}>生成当前缩略图</button><button class="quiet" id="clear-thumbnail-cache" ${isWorking ? 'disabled' : ''}>清理缓存</button></div></header>${images.length ? `<div class="media-grid">${cards}</div>` : '<p>当前搜索结果没有可展示的图片。</p>'}</section>`;
 }
 
+function mediaTasksPanel() {
+  const candidates = results.filter(item => mediaKind(item));
+  const candidateRows = candidates.map(item => `<button class="quiet enqueue-media-task" data-item-id="${escapeHtml(item.id)}" data-media-kind="${mediaKind(item)}">${mediaKind(item) === 'ocr' ? 'OCR' : '转写'}：${escapeHtml(item.name)}</button>`).join('');
+  const taskRows = mediaTasks.map(task => `<div><span>${escapeHtml(task.name)} · ${task.kind} · ${task.status}${task.error ? ` · ${escapeHtml(task.error)}` : ''}</span>${['queued', 'running'].includes(task.status) ? `<button class="quiet cancel-media-task" data-task-id="${escapeHtml(task.id)}">取消</button>` : ''}</div>`).join('');
+  return `<section class="media-tasks"><header><div><b>本地 OCR 与音视频转写</b><span>识别文本只进入本机索引；工具未安装、超时或失败时不会生成结果。</span></div><form id="media-settings"><input id="media-ocr-language" maxlength="80" value="${escapeHtml(mediaSettings.ocrLanguage)}" placeholder="Tesseract 语言，例如 chi_sim+eng"><input id="media-whisper-model" maxlength="1024" value="${escapeHtml(mediaSettings.whisperModelPath)}" placeholder="本地 Whisper 模型路径"><button class="quiet" type="submit">保存设置</button></form></header>${candidateRows ? `<div class="media-candidates">${candidateRows}</div>` : '<p>搜索结果中没有可加入 OCR 或转写的媒体文件。</p>'}<div class="media-task-list">${taskRows || '<span>当前没有媒体任务。</span>'}</div></section>`;
+}
+
 function searchPanel() {
   const previousDisabled = searchPage === 0 ? 'disabled' : '';
   const nextDisabled = results.length === 0 || (searchPage + 1) * 30 >= searchTotal ? 'disabled' : '';
@@ -156,7 +168,7 @@ function searchPanel() {
   const semanticNote = appliedSearchMode === 'semantic' ? '语义向量排序（完全本机）' : appliedSearchMode === 'embedding_fallback_fts' ? '未配置 embedding 模型，已回退 FTS' : '关键词 / FTS 搜索';
   const embeddingModel = embeddingModels.find(model => model.active);
   const progressText = embeddingProgress ? `正在建立向量索引：${embeddingProgress.completed}/${embeddingProgress.total}${embeddingProgress.failed ? `，失败 ${embeddingProgress.failed}` : ''}` : embeddingModel ? `当前 embedding：${escapeHtml(embeddingModel.displayName)}${embeddingModel.dimensions ? ` · ${embeddingModel.dimensions} 维` : ''}` : '未配置本地 embedding 模型';
-  return `<section class="single-panel panel"><header><div><small>LOCAL SEARCH</small><h2>本地搜索</h2></div><span class="local-chip">${icons.check} ${semanticNote}</span></header><div class="search-page"><h1>精确查找你的资料。</h1><p>输入名称、路径、备注、标签或已提取正文；不会发送到云端。</p><form id="search-form"><div class="large-search">${icons.search}<input id="search-question" value="${escapeHtml(searchQuery)}" placeholder="例如：游戏、Steam、项目资料"><button type="submit" ${isWorking ? 'disabled' : ''}>搜索</button></div><div class="search-filters"><label>模式 <select id="search-mode"><option value="fts" ${searchMode === 'fts' ? 'selected' : ''}>关键词（FTS）</option><option value="semantic" ${searchMode === 'semantic' ? 'selected' : ''}>语义向量</option></select></label><label>标签 <input class="search-filter" id="search-filter" value="${escapeHtml(searchFilter)}" placeholder="例如：游戏"></label><label>资料夹 <select id="search-folder-filter"><option value="">全部资料夹</option>${folderOptions}</select></label><label>类型 <select id="search-type-filter"><option value="">文件和文件夹</option><option value="file" ${searchTypeFilter === 'file' ? 'selected' : ''}>仅文件</option><option value="folder" ${searchTypeFilter === 'folder' ? 'selected' : ''}>仅文件夹</option></select></label></div></form><section class="semantic-search"><b>本地语义检索</b><span>${progressText}</span><button class="quiet" id="register-embedding-model" ${isWorking ? 'disabled' : ''}>选择 embedding GGUF</button><button class="quiet" id="build-embedding-index" ${isWorking || !embeddingModel ? 'disabled' : ''}>建立 / 更新向量索引</button><button class="quiet" id="toggle-media-gallery">${mediaGalleryOpen ? '收起图库' : '图库浏览'}</button></section>${mediaGallery()}${resultRows('输入检索词后，结果会在这里显示真实路径。')}<div class="search-paging"><button class="quiet" id="search-page-previous" ${previousDisabled}>上一页</button><span>${searchTotal ? `第 ${searchPage + 1} 页，共 ${searchTotal} 项` : '暂无搜索结果'}</span><button class="quiet" id="search-page-next" ${nextDisabled}>下一页</button></div></div></section>`;
+  return `<section class="single-panel panel"><header><div><small>LOCAL SEARCH</small><h2>本地搜索</h2></div><span class="local-chip">${icons.check} ${semanticNote}</span></header><div class="search-page"><h1>精确查找你的资料。</h1><p>输入名称、路径、备注、标签或已提取正文；不会发送到云端。</p><form id="search-form"><div class="large-search">${icons.search}<input id="search-question" value="${escapeHtml(searchQuery)}" placeholder="例如：游戏、Steam、项目资料"><button type="submit" ${isWorking ? 'disabled' : ''}>搜索</button></div><div class="search-filters"><label>模式 <select id="search-mode"><option value="fts" ${searchMode === 'fts' ? 'selected' : ''}>关键词（FTS）</option><option value="semantic" ${searchMode === 'semantic' ? 'selected' : ''}>语义向量</option></select></label><label>标签 <input class="search-filter" id="search-filter" value="${escapeHtml(searchFilter)}" placeholder="例如：游戏"></label><label>资料夹 <select id="search-folder-filter"><option value="">全部资料夹</option>${folderOptions}</select></label><label>类型 <select id="search-type-filter"><option value="">文件和文件夹</option><option value="file" ${searchTypeFilter === 'file' ? 'selected' : ''}>仅文件</option><option value="folder" ${searchTypeFilter === 'folder' ? 'selected' : ''}>仅文件夹</option></select></label></div></form><section class="semantic-search"><b>本地语义检索</b><span>${progressText}</span><button class="quiet" id="register-embedding-model" ${isWorking ? 'disabled' : ''}>选择 embedding GGUF</button><button class="quiet" id="build-embedding-index" ${isWorking || !embeddingModel ? 'disabled' : ''}>建立 / 更新向量索引</button><button class="quiet" id="toggle-media-gallery">${mediaGalleryOpen ? '收起图库' : '图库浏览'}</button></section>${mediaGallery()}${mediaTasksPanel()}${resultRows('输入检索词后，结果会在这里显示真实路径。')}<div class="search-paging"><button class="quiet" id="search-page-previous" ${previousDisabled}>上一页</button><span>${searchTotal ? `第 ${searchPage + 1} 页，共 ${searchTotal} 项` : '暂无搜索结果'}</span><button class="quiet" id="search-page-next" ${nextDisabled}>下一页</button></div></div></section>`;
 }
 
 function assistantPanel() {
@@ -218,7 +230,7 @@ function render() {
   bind();
 }
 
-async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus, indexJobs, runtimeSettings, embeddingModels] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status'), invoke<IndexJob[]>('list_index_jobs'), invoke<RuntimeSettings>('get_runtime_settings'), invoke<EmbeddingModel[]>('list_embedding_models')]); render(); }
+async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus, indexJobs, runtimeSettings, embeddingModels, mediaTasks, mediaSettings] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status'), invoke<IndexJob[]>('list_index_jobs'), invoke<RuntimeSettings>('get_runtime_settings'), invoke<EmbeddingModel[]>('list_embedding_models'), invoke<MediaTask[]>('list_media_tasks'), invoke<MediaSettings>('get_media_settings')]); render(); }
 async function loadFolderRefs() { folderRefs = await invoke<FolderRef[]>('list_folder_refs'); }
 async function openFolder(folderId: string, path?: string) { const folder = folderRefs.find(item => item.id === folderId); if (!folder) return; activeFolder = folder; browserPath = path ?? folder.path; folderEntries = await invoke<FolderEntry[]>('list_folder_children', { folderId, path: browserPath }); render(); }
 async function navigateFolder(path: string) { if (!activeFolder) return; browserHistory.push(browserPath ?? activeFolder.path); await openFolder(activeFolder.id, path); }
@@ -309,6 +321,9 @@ async function clearThumbnailCache() {
   isWorking = true; error = ''; render();
   try { await invoke('clear_thumbnail_cache'); mediaThumbnails = new Map(); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); }
 }
+async function enqueueMediaTask(itemId: string, kind: MediaTask['kind']) { isWorking = true; error = ''; render(); try { await invoke('enqueue_media_task', { input: { itemId, kind } }); mediaTasks = await invoke<MediaTask[]>('list_media_tasks'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
+async function cancelMediaTask(id: string) { isWorking = true; error = ''; render(); try { await invoke('cancel_media_task', { input: { id } }); mediaTasks = await invoke<MediaTask[]>('list_media_tasks'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
+async function saveMediaSettings(event: SubmitEvent) { event.preventDefault(); const ocrLanguage = document.querySelector<HTMLInputElement>('#media-ocr-language')?.value.trim() ?? ''; const whisperModelPath = document.querySelector<HTMLInputElement>('#media-whisper-model')?.value.trim() ?? ''; isWorking = true; error = ''; render(); try { mediaSettings = await invoke<MediaSettings>('save_media_settings', { input: { ocrLanguage, whisperModelPath } }); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function saveAgentPreferences() { const autoApplyLowRisk = document.querySelector<HTMLInputElement>('#auto-apply-low-risk')?.checked ?? false; try { agentPreferences = await invoke<AgentPreferences>('save_agent_preferences', { input: { autoApplyLowRisk } }); } catch (reason) { error = String(reason); } render(); }
 async function saveRuntimeSettings(event: SubmitEvent) { event.preventDefault(); const executionMode = document.querySelector<HTMLSelectElement>('#runtime-mode')?.value as RuntimeSettings['executionMode'] ?? 'auto'; const threads = Number(document.querySelector<HTMLInputElement>('#runtime-threads')?.value ?? 4); const contextSize = Number(document.querySelector<HTMLInputElement>('#runtime-context')?.value ?? 4096); isWorking = true; error = ''; render(); try { runtimeSettings = await invoke<RuntimeSettings>('save_runtime_settings', { input: { executionMode, threads, contextSize } }); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function runEnvironmentAcceptance() { isWorking = true; error = ''; render(); try { acceptanceChecks = await invoke<AcceptanceCheck[]>('run_environment_acceptance'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
@@ -421,6 +436,9 @@ function bind() {
   document.querySelector('#toggle-media-gallery')?.addEventListener('click', () => { mediaGalleryOpen = !mediaGalleryOpen; render(); });
   document.querySelector('#build-media-thumbnails')?.addEventListener('click', buildMediaThumbnails);
   document.querySelector('#clear-thumbnail-cache')?.addEventListener('click', clearThumbnailCache);
+  document.querySelectorAll<HTMLButtonElement>('.enqueue-media-task').forEach(button => button.addEventListener('click', () => enqueueMediaTask(button.dataset.itemId ?? '', (button.dataset.mediaKind as MediaTask['kind']) ?? 'ocr')));
+  document.querySelectorAll<HTMLButtonElement>('.cancel-media-task').forEach(button => button.addEventListener('click', () => cancelMediaTask(button.dataset.taskId ?? '')));
+  document.querySelector<HTMLFormElement>('#media-settings')?.addEventListener('submit', saveMediaSettings);
   document.querySelectorAll<HTMLButtonElement>('[data-local-model-id]').forEach(button => button.addEventListener('click', () => selectLocalModel(button.dataset.localModelId ?? '')));
   document.querySelectorAll<HTMLButtonElement>('.delete-local-model').forEach(button => button.addEventListener('click', () => deleteLocalModel(button.dataset.deleteLocalModelId ?? '')));
   document.querySelectorAll<HTMLButtonElement>('[data-refresh-folder-id]').forEach(button => button.addEventListener('click', () => refreshFolderIndex(button.dataset.refreshFolderId ?? '')));
@@ -469,6 +487,7 @@ listen<IndexProgress>('index-progress', event => { indexProgress = event.payload
 listen<IndexJob>('index-job-progress', event => { const next = event.payload; indexJobs = [...indexJobs.filter(job => job.id !== next.id && job.status !== 'completed'), next].filter(job => job.status !== 'completed'); if (next.status === 'completed') loadFolderRefs().then(render); render(); }).catch(reason => { error = `无法接收索引任务：${String(reason)}`; render(); });
 listen<FolderChangeDetected>('folder-change-detected', event => { scheduleFolderRefresh(event.payload); }).catch(reason => { error = `无法接收文件夹变动：${String(reason)}`; render(); });
 listen<EmbeddingIndexProgress>('embedding-index-progress', event => { embeddingProgress = event.payload; render(); }).catch(reason => { error = `无法接收向量索引进度：${String(reason)}`; render(); });
+listen<MediaTask>('media-task-progress', event => { mediaTasks = [event.payload, ...mediaTasks.filter(task => task.id !== event.payload.id)].slice(0, 100); render(); }).catch(reason => { error = `无法接收媒体任务状态：${String(reason)}`; render(); });
 refreshStatus().catch(reason => { error = `无法连接桌面端：${String(reason)}`; render(); });
 
 checkForUpdate();
