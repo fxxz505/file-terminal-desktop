@@ -619,3 +619,14 @@ test('desktop preserves an unreadable local database and opens a recoverable emp
   assert.match(shell, /recoveryNotice/);
   assert.match(shell, /数据库恢复提示/);
 });
+
+test('desktop automatically retries preserved encrypted databases and merges readable records without replacing newer data', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /fn restore_quarantined_databases/);
+  assert.match(backend, /ATTACH DATABASE/);
+  assert.match(backend, /INSERT OR IGNORE INTO main/);
+  assert.match(backend, /AUTO_RESTORE_STATUS\.txt/);
+  assert.match(backend, /已自动尝试恢复/);
+  assert.match(shell, /recoveryNotice/);
+});

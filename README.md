@@ -12,6 +12,11 @@
 
 适用于 64 位 Windows 10/11。首次启动不需要账号，也不会要求上传资料。之后有新版本时，应用会在启动后检查 GitHub Release，并在你确认后下载、安装和重启。
 
+## v0.1.10 更新内容
+
+- 启动时会自动扫描 `%LOCALAPPDATA%\资料终端\database-recovery\unreadable-*`。若旧数据库能由当前 Windows Credential Manager 密钥解锁，应用会把可恢复的资料夹引用、索引、对话、模型设置和任务记录安全合并到当前数据库；同 ID 的当前记录不会被覆盖。
+- 每个恢复目录会写入 `AUTO_RESTORE_STATUS.txt` 记录结果，但原始数据库及其 WAL/SHM 文件始终保留。若当前凭据无法解锁旧库，应用会在之后的每次启动继续自动尝试；密钥已永久丢失时，SQLCipher 密文无法被应用或 AI 解密。
+
 ## v0.1.9 更新内容
 
 - 修复旧版 SQLCipher 本机凭据无法解锁资料库时，应用会在窗口创建前直接退出的问题。现在应用会把无法解锁的数据库及其 WAL/SHM 恢复文件完整移动到 `%LOCALAPPDATA%\资料终端\database-recovery\unreadable-<编号>`，然后创建一个新的空加密资料库并正常打开。

@@ -894,6 +894,216 @@ fn quarantine_unreadable_database(data_dir: &Path, database: &Path) -> Result<Pa
     Ok(recovery)
 }
 
+const AUTO_RESTORE_STATUS_FILE: &str = "AUTO_RESTORE_STATUS.txt";
+const RECOVERABLE_TABLES: &[&str] = &[
+    "folder_refs",
+    "embedding_models",
+    "index_items",
+    "item_embeddings",
+    "thumbnail_cache",
+    "media_tasks",
+    "media_extractions",
+    "metadata_audit",
+    "agent_workspaces",
+    "cloud_provider_config",
+    "conversations",
+    "conversation_messages",
+    "sensitive_rules",
+    "agent_runs",
+    "agent_events",
+    "agent_source_bindings",
+    "local_models",
+    "index_jobs",
+];
+
+fn database_table_columns(connection: &Connection, schema: &str, table: &str) -> Result<Vec<String>, String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA {schema}.table_info('{table}')"))
+        .map_err(|error| error.to_string())?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(columns)
+}
+
+fn restore_table_without_overwrite(connection: &Connection, table: &str) -> Result<usize, String> {
+    let source_columns = database_table_columns(connection, "recovery", table)?;
+    if source_columns.is_empty() {
+        return Ok(0);
+    }
+    let target_columns = database_table_columns(connection, "main", table)?;
+    let columns = target_columns
+        .into_iter()
+        .filter(|column| source_columns.contains(column))
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        return Ok(0);
+    }
+    let quoted = columns
+        .iter()
+        .map(|column| format!("\"{column}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    connection
+        .execute(
+            &format!("INSERT OR IGNORE INTO main.\"{table}\" ({quoted}) SELECT {quoted} FROM recovery.\"{table}\""),
+            [],
+        )
+        .map_err(|error| format!("无法合并 {table}：{error}"))?;
+    Ok(connection.changes() as usize)
+}
+
+fn restore_fts_without_duplicates(connection: &Connection) -> Result<usize, String> {
+    if database_table_columns(connection, "recovery", "index_content_fts")?.is_empty() {
+        return Ok(0);
+    }
+    connection
+        .execute(
+            "INSERT INTO main.index_content_fts (item_id, content) \
+             SELECT source.item_id, source.content FROM recovery.index_content_fts AS source \
+             WHERE EXISTS (SELECT 1 FROM main.index_items AS item WHERE item.id = source.item_id) \
+             AND NOT EXISTS (SELECT 1 FROM main.index_content_fts AS existing WHERE existing.item_id = source.item_id)",
+            [],
+        )
+        .map_err(|error| format!("无法合并全文索引：{error}"))?;
+    Ok(connection.changes() as usize)
+}
+
+fn restore_default_singleton_setting(connection: &Connection, table: &str, default_predicate: &str) -> Result<usize, String> {
+    if database_table_columns(connection, "recovery", table)?.is_empty() {
+        return Ok(0);
+    }
+    let has_only_default = connection
+        .query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM main.\"{table}\" WHERE id = 1 AND {default_predicate})"),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?
+        != 0;
+    if !has_only_default {
+        return Ok(0);
+    }
+    let source_columns = database_table_columns(connection, "recovery", table)?;
+    let target_columns = database_table_columns(connection, "main", table)?;
+    let columns = target_columns
+        .into_iter()
+        .filter(|column| source_columns.contains(column))
+        .collect::<Vec<_>>();
+    let quoted = columns.iter().map(|column| format!("\"{column}\"")).collect::<Vec<_>>().join(", ");
+    connection
+        .execute(
+            &format!("INSERT OR REPLACE INTO main.\"{table}\" ({quoted}) SELECT {quoted} FROM recovery.\"{table}\" WHERE id = 1"),
+            [],
+        )
+        .map_err(|error| format!("无法合并 {table}：{error}"))?;
+    Ok(connection.changes() as usize)
+}
+
+fn restore_quarantined_database(connection: &Connection, recovery: &Path, key: &str) -> Result<usize, String> {
+    let database = recovery.join("file-terminal.db");
+    if !database.is_file() {
+        return Err("恢复目录中没有 file-terminal.db。".to_string());
+    }
+    let database_path = database.display().to_string().replace('\'', "''");
+    let escaped_key = key.replace('\'', "''");
+    connection
+        .execute_batch(&format!("ATTACH DATABASE '{database_path}' AS recovery KEY '{escaped_key}';"))
+        .map_err(|_| "当前 Windows 凭据无法解锁旧数据库。".to_string())?;
+    if connection
+        .query_row("PRAGMA recovery.schema_version", [], |row| row.get::<_, i64>(0))
+        .is_err()
+    {
+        let _ = connection.execute_batch("DETACH DATABASE recovery;");
+        return Err("当前 Windows 凭据无法解锁旧数据库。".to_string());
+    }
+
+    let restored = (|| -> Result<usize, String> {
+        connection.execute_batch("BEGIN IMMEDIATE;").map_err(|error| error.to_string())?;
+        let result = (|| -> Result<usize, String> {
+            // Parent records are deliberately restored first so foreign-key relationships stay valid.
+            let mut restored = 0;
+            for table in RECOVERABLE_TABLES {
+                restored += restore_table_without_overwrite(connection, table)?;
+            }
+            restored += restore_fts_without_duplicates(connection)?;
+            // New empty databases contain these defaults. Restore an older user setting only while it is untouched.
+            restored += restore_default_singleton_setting(connection, "media_settings", "whisper_model_path = '' AND ocr_language = 'chi_sim+eng'")?;
+            restored += restore_default_singleton_setting(connection, "agent_preferences", "auto_apply_low_risk = 0")?;
+            restored += restore_default_singleton_setting(connection, "runtime_settings", "execution_mode = 'auto' AND threads = 4 AND context_size = 4096")?;
+            connection.execute_batch("COMMIT;").map_err(|error| error.to_string())?;
+            Ok(restored)
+        })();
+        if result.is_err() {
+            let _ = connection.execute_batch("ROLLBACK;");
+        }
+        result
+    })();
+    let _ = connection.execute_batch("DETACH DATABASE recovery;");
+    restored
+}
+
+fn restore_quarantined_databases(connection: &Connection, data_dir: &Path) -> Option<String> {
+    let recovery_root = data_dir.join("database-recovery");
+    let entries = fs::read_dir(&recovery_root).ok()?;
+    let key = match database_key() {
+        Ok(key) => key,
+        Err(_) => return Some("已自动尝试恢复旧数据库，但 Windows 凭据库不可用；恢复副本仍被保留，未上传或修改任何旧数据。".to_string()),
+    };
+    let mut restored_records = 0;
+    let mut restored_directories = 0;
+    let mut unreadable_directories = 0;
+
+    for entry in entries.flatten() {
+        let recovery = entry.path();
+        if !recovery.is_dir() || !entry.file_name().to_string_lossy().starts_with("unreadable-") {
+            continue;
+        }
+        let status_file = recovery.join(AUTO_RESTORE_STATUS_FILE);
+        if fs::read_to_string(&status_file)
+            .map(|status| status.starts_with("status=restored"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        match restore_quarantined_database(connection, &recovery, &key) {
+            Ok(records) => {
+                let _ = fs::write(
+                    recovery.join(AUTO_RESTORE_STATUS_FILE),
+                    format!("status=restored\nrecords={records}\noriginal_database_retained=true\n"),
+                );
+                restored_records += records;
+                restored_directories += 1;
+            }
+            Err(error) => {
+                let status = if error == "当前 Windows 凭据无法解锁旧数据库。" {
+                    "status=unreadable\nreason=current_windows_credential_cannot_unlock\n"
+                } else {
+                    "status=failed\nreason=automatic_restore_failed_without_modifying_original\n"
+                };
+                let _ = fs::write(status_file, status);
+                unreadable_directories += 1;
+            }
+        }
+    }
+
+    if restored_directories > 0 {
+        Some(format!(
+            "已自动恢复 {restored_records} 条本地资料记录（来自 {restored_directories} 个旧数据库副本）；同 ID 的新数据未被覆盖，原数据库副本仍保留在 {}。",
+            display_path(&recovery_root)
+        ))
+    } else if unreadable_directories > 0 {
+        Some(format!(
+            "已自动尝试恢复 {unreadable_directories} 个旧数据库副本，但当前 Windows 凭据仍无法解锁它们；原文件和 WAL/SHM 恢复文件继续保留在 {}。",
+            display_path(&recovery_root)
+        ))
+    } else {
+        None
+    }
+}
+
 fn open_app_database_with_recovery(data_dir: &Path) -> Result<(Connection, Option<String>), String> {
     match open_app_database(data_dir) {
         Ok(connection) => Ok((connection, None)),
@@ -5536,6 +5746,8 @@ fn main() {
     let (connection, startup_recovery_notice) = open_app_database_with_recovery(&data_dir)
         .expect("unable to open encrypted database");
     initialize_database(&connection).expect("unable to initialize database");
+    let startup_recovery_notice = restore_quarantined_databases(&connection, &data_dir)
+        .or(startup_recovery_notice);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -5639,7 +5851,7 @@ mod preview_tests {
     use super::{
         cosine_similarity, display_path, effective_cloud_policy, incremental_index_folder_inner,
         initialize_database, migrate_plaintext_database, open_encrypted_database, preview_mime,
-        quarantine_unreadable_database,
+        quarantine_unreadable_database, restore_quarantined_database,
         safe_relative_path, CloudPolicy,
     };
     use rusqlite::{params, Connection};
@@ -5721,6 +5933,37 @@ mod preview_tests {
         assert_eq!(fs::read(recovery.join("file-terminal.db")).unwrap(), b"unreadable database");
         assert_eq!(fs::read(recovery.join("file-terminal.db-wal")).unwrap(), b"wal");
         assert_eq!(fs::read(recovery.join("file-terminal.db-shm")).unwrap(), b"shm");
+    }
+
+    #[test]
+    fn restores_readable_quarantined_records_without_overwriting_newer_records() {
+        let temp = tempdir().unwrap();
+        let recovery = temp.path().join("unreadable-fixture");
+        fs::create_dir_all(&recovery).unwrap();
+        let source_path = recovery.join("file-terminal.db");
+        let target_path = temp.path().join("current.db");
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let source = open_encrypted_database(&source_path, key).unwrap();
+        initialize_database(&source).unwrap();
+        source.execute(
+            "INSERT INTO folder_refs (id, root_path, name, note, tags_json, cloud_policy, imported_at) VALUES ('old', 'C:/old', '旧资料', '来自旧库', '[]', 'local_only', '2026-01-01')",
+            [],
+        ).unwrap();
+        source.execute("UPDATE runtime_settings SET execution_mode = 'cpu', threads = 7, context_size = 8192 WHERE id = 1", []).unwrap();
+        drop(source);
+
+        let target = open_encrypted_database(&target_path, key).unwrap();
+        initialize_database(&target).unwrap();
+        target.execute(
+            "INSERT INTO folder_refs (id, root_path, name, note, tags_json, cloud_policy, imported_at) VALUES ('new', 'C:/new', '新资料', '', '[]', 'local_only', '2026-01-02')",
+            [],
+        ).unwrap();
+
+        assert!(restore_quarantined_database(&target, &recovery, key).unwrap() >= 1);
+        assert_eq!(target.query_row("SELECT COUNT(*) FROM folder_refs", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(target.query_row("SELECT note FROM folder_refs WHERE id = 'old'", [], |row| row.get::<_, String>(0)).unwrap(), "来自旧库");
+        assert_eq!(target.query_row("SELECT threads FROM runtime_settings WHERE id = 1", [], |row| row.get::<_, i64>(0)).unwrap(), 7);
+        assert!(source_path.is_file());
     }
 
     #[test]
