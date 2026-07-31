@@ -554,3 +554,57 @@ test('agent repair uses a maximum two-attempt diagnostic to cloud advice loop wi
   assert.match(shell, /auto_repair_agent_run/);
   assert.match(shell, /自动最小修复/);
 });
+
+test('desktop accepts a dropped folder and keeps native selection as a fallback', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(shell, /getCurrentWindow/);
+  assert.match(shell, /onDragDropEvent/);
+  assert.match(shell, /event\.payload\.paths/);
+  assert.match(shell, /importFolderPath/);
+  assert.match(shell, /拖入文件夹/);
+});
+
+test('changed folder indexes automatically schedule an incremental embedding update', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  assert.match(shell, /scheduleEmbeddingUpdate/);
+  assert.match(shell, /index-job-progress/);
+  assert.match(shell, /build_embedding_index/);
+  assert.match(backend, /source_signature/);
+  assert.match(backend, /current\.as_deref\(\) != Some\(signature\.as_str\(\)\)/);
+});
+
+test('local tool manager installs only fixed winget packages and reports each tool state', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  assert.match(backend, /enum ManagedTool/);
+  assert.match(backend, /fn install_local_tool/);
+  assert.match(backend, /UB-Mannheim\.TesseractOCR/);
+  assert.match(backend, /Gyan\.FFmpeg/);
+  assert.match(backend, /TheDocumentFoundation\.LibreOffice/);
+  assert.match(backend, /accept-package-agreements/);
+  assert.match(shell, /本机工具管理/);
+  assert.match(shell, /install_local_tool/);
+});
+
+test('agent can modify an existing workspace file only after an explicit recoverable approval', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  assert.match(backend, /allow_existing_edits/);
+  assert.match(backend, /agent-edit-backups/);
+  assert.match(backend, /拒绝修改已有工作区文件/);
+  assert.match(backend, /已创建可恢复备份/);
+  assert.match(shell, /批准后修改已有文件/);
+  assert.match(shell, /allowExistingEdits: true/);
+});
+
+test('sidebar separates AI conversation history from assistant configuration and places warnings above forms', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(shell, /data-view="conversations"/);
+  assert.match(shell, /AI 对话/);
+  assert.match(shell, /conversationPage\(/);
+  assert.match(shell, /form-warning/);
+  assert.match(styles, /\.form-warning/);
+  assert.match(styles, /\.control-cluster/);
+});
