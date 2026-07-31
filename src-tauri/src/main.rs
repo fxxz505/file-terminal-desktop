@@ -31,7 +31,30 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 const APP_FOLDER: &str = "资料终端";
-const RUNTIME_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b10107/llama-b10107-bin-win-cpu-x64.zip";
+struct RuntimeManifest {
+    id: &'static str,
+    url: &'static str,
+    archive_sha256: &'static str,
+    executable: &'static str,
+    gpu: bool,
+}
+
+const RUNTIME_MANIFEST: &[RuntimeManifest] = &[
+    RuntimeManifest {
+        id: "cpu-x64-b10107",
+        url: "https://github.com/ggml-org/llama.cpp/releases/download/b10107/llama-b10107-bin-win-cpu-x64.zip",
+        archive_sha256: "52133a0a5a8f6035b1bdd2f89c3425ea8b742413d9bdb9a2dee30e3a1681b18c",
+        executable: "llama-cli.exe",
+        gpu: false,
+    },
+    RuntimeManifest {
+        id: "cuda-12.4-x64-b10107",
+        url: "https://github.com/ggml-org/llama.cpp/releases/download/b10107/llama-b10107-bin-win-cuda-12.4-x64.zip",
+        archive_sha256: "1e43bbec9691cd0bc636603c366769148fa6265fd261c5f7c67050b450bbc237",
+        executable: "llama-cli.exe",
+        gpu: true,
+    },
+];
 const MODEL_URLS: &[(&str, &str)] = &[
     ("官方 Hugging Face", "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"),
     ("HF 镜像", "https://hf-mirror.com/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"),
@@ -1187,14 +1210,6 @@ fn office_preview_text(path: &Path) -> Option<String> {
     extract_document_text(path)
 }
 
-fn safe_file_name(url: &str, default_name: &str) -> String {
-    url.rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty() && !name.contains('?'))
-        .unwrap_or(default_name)
-        .to_string()
-}
-
 fn extract_document_text(path: &Path) -> Option<String> {
     const MAX_INDEX_CONTENT_BYTES: u64 = 512 * 1024;
     const MAX_INDEX_CHARS: usize = 80_000;
@@ -1281,6 +1296,30 @@ fn runtime_settings(state: &AppState) -> RuntimeSettings {
     state.database.lock().ok().and_then(|connection| connection.query_row("SELECT execution_mode, threads, context_size FROM runtime_settings WHERE id = 1", [], |row| Ok(RuntimeSettings { execution_mode: row.get(0)?, threads: row.get::<_, usize>(1)?, context_size: row.get::<_, usize>(2)? })).ok()).unwrap_or(RuntimeSettings { execution_mode: "auto".into(), threads: 4, context_size: 4096 })
 }
 
+fn detect_gpu_compatibility() -> bool {
+    Command::new("nvidia-smi")
+        .args(["--query-gpu=name,driver_version", "--format=csv,noheader"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| String::from_utf8_lossy(&output.stdout).to_ascii_lowercase().contains("nvidia"))
+}
+
+fn runtime_variant_for_settings(settings: &RuntimeSettings) -> Result<&'static RuntimeManifest, String> {
+    let wants_gpu = settings.execution_mode == "gpu" || (settings.execution_mode == "auto" && detect_gpu_compatibility());
+    if wants_gpu && detect_gpu_compatibility() {
+        return RUNTIME_MANIFEST.iter().find(|manifest| manifest.gpu)
+            .ok_or_else(|| "未找到受支持的 GPU 运行时清单。".to_string());
+    }
+    if settings.execution_mode == "gpu" {
+        return Err("未检测到兼容的 NVIDIA GPU / 驱动，已拒绝下载 GPU 运行时。请切换到自动或 CPU 模式。".to_string());
+    }
+    RUNTIME_MANIFEST.iter().find(|manifest| !manifest.gpu)
+        .ok_or_else(|| "未找到 CPU 运行时清单。".to_string())
+}
+
 #[tauri::command]
 fn get_runtime_settings(state: State<'_, AppState>) -> RuntimeSettings { runtime_settings(&state) }
 
@@ -1297,7 +1336,8 @@ fn run_environment_acceptance(state: State<'_, AppState>) -> Vec<AcceptanceCheck
     let model = active_model_path(&state);
     let tools = get_local_tool_status();
     vec![
-        AcceptanceCheck { id: "runtime".into(), label: "llama.cpp 运行时".into(), status: if runtime.is_file() { "passed" } else { "failed" }.into(), detail: "检查本机已下载运行时。".into() },
+        AcceptanceCheck { id: "runtime".into(), label: "llama.cpp 运行时".into(), status: if runtime.is_file() { "passed" } else { "failed" }.into(), detail: "运行时包通过版本固定清单与 SHA-256 校验后安装。".into() },
+        AcceptanceCheck { id: "gpu".into(), label: "GPU 推理兼容性".into(), status: if detect_gpu_compatibility() { "manual" } else { "skipped" }.into(), detail: if detect_gpu_compatibility() { "已发现 NVIDIA GPU；仍需以实际 llama.cpp GPU 推理完成验收。".into() } else { "未发现可用 NVIDIA 驱动，应用将使用 CPU 运行时。".into() } },
         AcceptanceCheck { id: "model".into(), label: "本地 GGUF 模型".into(), status: if model.is_file() { "passed" } else { "failed" }.into(), detail: "检查当前模型文件可读。".into() },
         AcceptanceCheck { id: "pdf".into(), label: "PDF 正文解析".into(), status: if tools.pdf_text { "passed" } else { "failed" }.into(), detail: "内置本地 PDF 文本解析器。".into() },
         AcceptanceCheck { id: "office".into(), label: "Office 文本提取".into(), status: "manual".into(), detail: "需要在用户含复杂 Office 文件的设备上实测。".into() },
@@ -2229,18 +2269,18 @@ async fn download_runtime(
 ) -> Result<RuntimeStatus, String> {
     let runtime_dir = state.data_dir.join("runtime");
     fs::create_dir_all(&runtime_dir).map_err(|error| error.to_string())?;
-    let archive = state
-        .data_dir
-        .join(safe_file_name(RUNTIME_URL, "llama-runtime.zip"));
+    let manifest = runtime_variant_for_settings(&runtime_settings(&state))?;
+    let archive = state.data_dir.join(format!("{}.zip", manifest.id));
     download_to(
         app.clone(),
         "runtime",
-        "GitHub",
-        RUNTIME_URL,
+        manifest.id,
+        manifest.url,
         &archive,
-        None,
+        Some(manifest.archive_sha256),
     )
     .await?;
+    verify_sha256(&archive, manifest.archive_sha256)?;
     let file = File::open(&archive).map_err(|error| error.to_string())?;
     let mut zip = zip::ZipArchive::new(file).map_err(|error| error.to_string())?;
     for index in 0..zip.len() {
@@ -2257,6 +2297,9 @@ async fn download_runtime(
         let output = runtime_dir.join(file_name);
         let mut writer = File::create(output).map_err(|error| error.to_string())?;
         std::io::copy(&mut entry, &mut writer).map_err(|error| error.to_string())?;
+    }
+    if !runtime_dir.join(manifest.executable).is_file() {
+        return Err("已校验的运行时压缩包缺少预期可执行文件。".to_string());
     }
     let _ = fs::remove_file(archive);
     Ok(get_runtime_status(state))
@@ -4915,6 +4958,14 @@ mod preview_tests {
         let distant = cosine_similarity(&query, &[0.0, 1.0, 0.0]).unwrap();
         assert!(close > distant);
         assert!(cosine_similarity(&query, &[1.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn chooses_cpu_runtime_when_gpu_is_not_explicitly_available() {
+        let settings = super::RuntimeSettings { execution_mode: "cpu".into(), threads: 4, context_size: 4096 };
+        let runtime = super::runtime_variant_for_settings(&settings).unwrap();
+        assert!(!runtime.gpu);
+        assert_eq!(runtime.executable, "llama-cli.exe");
     }
 
     #[test]
