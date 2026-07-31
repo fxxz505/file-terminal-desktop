@@ -138,7 +138,8 @@ function previewPanel() {
   const body = preview.kind === 'image' ? `<img src="data:${preview.mimeType};base64,${preview.content}" alt="${escapeHtml(preview.name)}">`
     : preview.kind === 'pdf' ? `<iframe title="${escapeHtml(preview.name)}" src="data:application/pdf;base64,${preview.content}"></iframe>`
       : preview.kind === 'text' ? `<pre>${escapeHtml(preview.content)}</pre>` : `<p>${escapeHtml(preview.message)}</p>`;
-  return `<section class="file-preview"><header><div><small>LOCAL PREVIEW</small><h2>${escapeHtml(preview.name)}</h2><span>${escapeHtml(preview.displayPath)}</span></div><div><button class="quiet" id="reveal-file">在资源管理器中打开</button><button class="quiet" id="close-preview">关闭</button></div></header><div class="preview-body">${body}</div></section>`;
+  const office = /\.(docx?|pptx?|xlsx?|od[stp])$/i.test(preview.name);
+  return `<section class="file-preview"><header><div><small>LOCAL PREVIEW</small><h2>${escapeHtml(preview.name)}</h2><span>${escapeHtml(preview.displayPath)}</span></div><div>${office ? '<button class="quiet" id="high-fidelity-office-preview">高保真预览</button>' : ''}<button class="quiet" id="reveal-file">在资源管理器中打开</button><button class="quiet" id="close-preview">关闭</button></div></header><div class="preview-body">${body}</div></section>`;
 }
 
 function isGalleryImage(item: Result) { return item.itemType === 'file' && /\.(png|jpe?g|gif|webp|bmp)$/i.test(item.name); }
@@ -375,6 +376,7 @@ async function scanSensitiveIndex() { isWorking = true; error = ''; render(); tr
 async function loadMetadataAudit() { isWorking = true; error = ''; render(); try { auditEntries = await invoke<MetadataAuditEntry[]>('list_metadata_audit', { input: { limit: 100 } }); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function clearLocalData(scope: string) { if (!window.confirm('此操作只清理选定的本地记录，不能撤销。确定继续吗？')) return; isWorking = true; error = ''; render(); try { await invoke('clear_local_data', { input: { scope } }); await refreshStatus(); governanceExport = null; if (scope === 'conversations') { activeConversationId = null; conversationMessages = []; } } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function loadPreview(path: string) { if (!path) return; isWorking = true; error = ''; render(); try { preview = await invoke<FilePreview>('preview_file', { path }); } catch (reason) { error = `无法预览文件：${String(reason)}`; } finally { isWorking = false; render(); } }
+async function convertOfficePreview() { if (!preview) return; isWorking = true; error = ''; render(); try { preview = await invoke<FilePreview>('convert_office_preview', { path: preview.path }); } catch (reason) { error = `无法生成高保真预览：${String(reason)}`; } finally { isWorking = false; render(); } }
 async function revealPreview() { if (!preview) return; try { await invoke('reveal_in_explorer', { path: preview.path }); } catch (reason) { error = `无法打开资源管理器：${String(reason)}`; render(); } }
 async function checkForUpdate() {
   try {
@@ -428,6 +430,7 @@ function bind() {
   document.querySelectorAll<HTMLElement>('.preview-file').forEach(button => button.addEventListener('click', () => loadPreview(button.dataset.path ?? '')));
   document.querySelector('#close-preview')?.addEventListener('click', () => { preview = null; render(); });
   document.querySelector('#reveal-file')?.addEventListener('click', revealPreview);
+  document.querySelector('#high-fidelity-office-preview')?.addEventListener('click', convertOfficePreview);
   document.querySelectorAll<HTMLElement>('[data-view]').forEach(button => button.addEventListener('click', () => { activeView = button.dataset.view as View; render(); }));
   document.querySelector('#import-folder')?.addEventListener('click', selectFolder); document.querySelector('#choose-folder')?.addEventListener('click', selectFolder); document.querySelector('#refresh')?.addEventListener('click', refreshStatus); document.querySelector('#download-runtime')?.addEventListener('click', () => provision('runtime')); document.querySelector('#download-model')?.addEventListener('click', () => provision('model'));
   document.querySelector('#register-local-model')?.addEventListener('click', registerLocalModel);

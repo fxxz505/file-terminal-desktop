@@ -67,6 +67,8 @@ const MAX_THUMBNAIL_BYTES: usize = 256 * 1024;
 const MAX_MEDIA_OUTPUT_CHARS: usize = 120_000;
 const MAX_MEDIA_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 const MEDIA_TASK_TIMEOUT: Duration = Duration::from_secs(120);
+const OFFICE_PREVIEW_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_OFFICE_PREVIEW_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_CLOUD_REQUEST_BYTES: usize = 48 * 1024;
 const CLOUD_KEYRING_SERVICE: &str = "file-terminal-desktop.cloud-provider";
 const BACKUP_KEYRING_SERVICE: &str = "file-terminal-desktop.encrypted-backup";
@@ -5044,6 +5046,23 @@ fn bounded_command_output(command: &mut Command) -> Result<String, String> {
     }
 }
 
+fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<std::process::Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let started = SystemTime::now();
+    loop {
+        if child.try_wait().map_err(|error| error.to_string())?.is_some() {
+            return child.wait_with_output().map_err(|error| error.to_string());
+        }
+        if started.elapsed().unwrap_or_default() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("本地 Office 转换超时，已停止。".to_string());
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+}
+
 fn indexed_media_path(connection: &Connection, item_id: &str) -> Result<PathBuf, String> {
     let value = connection.query_row(
         "SELECT path FROM index_items WHERE id = ?1 AND item_type = 'file'",
@@ -5116,6 +5135,55 @@ fn start_media_worker(app: AppHandle, data_dir: PathBuf) {
         let finished = MediaTask { status: status.to_string(), error, ..task };
         emit_media_task(&app, &finished);
     });
+}
+
+#[tauri::command]
+fn convert_office_preview(path: String, state: State<'_, AppState>) -> Result<FilePreview, String> {
+    let target = indexed_path(Path::new(&path), &state)?;
+    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !matches!(extension.as_str(), "doc" | "docx" | "ppt" | "pptx" | "xls" | "xlsx" | "odt" | "odp" | "ods") {
+        return Err("高保真预览仅支持 Office 文档。".to_string());
+    }
+    if !command_available("soffice") { return Err("未检测到 LibreOffice；请安装后再使用高保真预览。".to_string()); }
+    let metadata = fs::metadata(&target).map_err(|error| error.to_string())?;
+    if metadata.len() > MAX_OFFICE_PREVIEW_SOURCE_BYTES { return Err("Office 文件超过隔离预览安全大小限制。".to_string()); }
+    let signature = source_signature(&target)?;
+    let cache_dir = state.data_dir.join("office-preview-cache").join(signature);
+    fs::create_dir_all(&cache_dir).map_err(|error| error.to_string())?;
+    let pdf = cache_dir.join(format!("{}.pdf", target.file_stem().and_then(|value| value.to_str()).unwrap_or("preview")));
+    if !pdf.is_file() {
+        let profile_dir = cache_dir.join("profile");
+        fs::create_dir_all(&profile_dir).map_err(|error| error.to_string())?;
+        let profile_url = url::Url::from_directory_path(&profile_dir).map_err(|_| "无法创建 LibreOffice 隔离配置目录。".to_string())?;
+        let output = command_output_with_timeout(
+            Command::new("soffice")
+                .arg("--headless")
+                .arg("--nologo")
+                .arg("--nodefault")
+                .arg(format!("-env:UserInstallation={profile_url}"))
+                .arg("--convert-to")
+                .arg("pdf")
+                .arg("--outdir")
+                .arg(&cache_dir)
+                .arg(&target),
+            OFFICE_PREVIEW_TIMEOUT,
+        )?;
+        if !output.status.success() || !pdf.is_file() {
+            return Err(format!("LibreOffice 转换失败：{}", String::from_utf8_lossy(&output.stderr).chars().take(2_000).collect::<String>()));
+        }
+    }
+    let bytes = fs::read(&pdf).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_PREVIEW_BYTES * 20 { return Err("转换后的 PDF 过大；请在资源管理器中打开原文件。".to_string()); }
+    Ok(FilePreview {
+        kind: "pdf".to_string(),
+        name: target.file_name().and_then(|value| value.to_str()).unwrap_or("Office 文档").to_string(),
+        path: target.display().to_string(),
+        mime_type: "application/pdf".to_string(),
+        content: BASE64.encode(bytes),
+        message: "由本机 LibreOffice 在隔离缓存目录转换；原始文档未被改写。嵌入对象、宏和部分公式可能仍与原应用显示不同。".to_string(),
+        truncated: false,
+        display_path: display_path(&target),
+    })
 }
 
 #[tauri::command]
@@ -5337,6 +5405,7 @@ fn main() {
             search_documents,
             semantic_search,
             preview_file,
+            convert_office_preview,
             get_thumbnail,
             clear_thumbnail_cache,
             list_media_tasks,
