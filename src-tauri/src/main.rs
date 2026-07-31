@@ -69,6 +69,7 @@ const MAX_MEDIA_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 const MEDIA_TASK_TIMEOUT: Duration = Duration::from_secs(120);
 const OFFICE_PREVIEW_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_OFFICE_PREVIEW_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_AGENT_REPAIR_ATTEMPTS: usize = 2;
 const MAX_CLOUD_REQUEST_BYTES: usize = 48 * 1024;
 const CLOUD_KEYRING_SERVICE: &str = "file-terminal-desktop.cloud-provider";
 const BACKUP_KEYRING_SERVICE: &str = "file-terminal-desktop.encrypted-backup";
@@ -691,6 +692,7 @@ struct PreparedCloudRun {
     run: AgentRun,
     request_body: String,
     last_diagnostic: Option<String>,
+    repair_attempts: usize,
 }
 
 fn display_path(path: &Path) -> String {
@@ -706,6 +708,14 @@ fn app_data_dir() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|path| path.join(APP_FOLDER))
         .ok_or_else(|| "无法定位 Windows 本地应用数据目录。".to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoRepairAgentInput {
+    run_id: String,
+    workspace_id: String,
+    command: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -4357,6 +4367,61 @@ fn retry_agent_run(input: AgentRunIdInput, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
+async fn auto_repair_agent_run(
+    input: AutoRepairAgentInput,
+    state: State<'_, AppState>,
+) -> Result<WorkspaceActionResult, String> {
+    if !ALLOWED_WORKSPACE_CHECKS.contains(&input.command.as_str()) {
+        return Err("自动最小修复仅支持固定构建/测试检查。".to_string());
+    }
+    let prepared = state.prepared_runs.lock().map_err(|_| "任务状态被占用。".to_string())?
+        .get(&input.run_id).cloned().ok_or_else(|| "任务已失效；请重新发起。".to_string())?;
+    if prepared.run.route != "cloud_auto" || prepared.run.status != "check_failed" {
+        return Err("自动最小修复仅适用于已失败的自动云端协作任务。".to_string());
+    }
+    if prepared.repair_attempts >= MAX_AGENT_REPAIR_ATTEMPTS {
+        return Err("已达到自动最小修复次数上限；请人工审阅最终证据报告。".to_string());
+    }
+    let diagnostic = prepared.last_diagnostic.clone().ok_or_else(|| "未找到经过脱敏的失败摘要，不能请求修复。".to_string())?;
+    let config = cloud_config(&state)?.filter(|config| config.configured)
+        .ok_or_else(|| "未配置可用的云端提供商或密钥。".to_string())?;
+    let api_key = cloud_key_entry(&config.provider_id)?.get_password()
+        .map_err(|_| "无法从 Windows 凭据库读取云端密钥。".to_string())?;
+    let request_body = serde_json::json!({
+        "task": "根据以下经过脱敏的本地检查摘要，提供最小修复建议。",
+        "diagnostic": diagnostic,
+        "constraints": ["只返回新增相对路径文件", "不得修改或覆盖已有文件", "不得请求受限资料", "不得调用命令、网络或发布"],
+    });
+    let request_text = serde_json::to_string(&request_body).map_err(|error| error.to_string())?;
+    if request_text.len() > MAX_CLOUD_REQUEST_BYTES { return Err("最小修复请求超过安全大小限制。".to_string()); }
+    update_agent_run_status(&input.run_id, "repairing_cloud", "正在请求自动最小修复；仅发送脱敏失败摘要。", &state)?;
+    let endpoint = chat_endpoint(&config.base_url);
+    let response = reqwest::Client::builder().timeout(Duration::from_secs(45)).build()
+        .map_err(|_| "无法建立安全云端连接。".to_string())?
+        .post(endpoint).bearer_auth(api_key)
+        .json(&serde_json::json!({"model": config.model, "messages":[{"role":"system","content":"你是受限修复助手。仅返回 JSON，包含 answer、assumptions、files、steps、uncertainties。files 只能是新建的相对路径；严禁覆盖、删除、命令、联网或敏感资料。"},{"role":"user","content":request_text}]}))
+        .send().await.map_err(|_| "云端最小修复请求失败；未记录请求内容。".to_string())?;
+    if !response.status().is_success() { update_agent_run_status(&input.run_id, "check_failed", "云端最小修复请求失败；工作区未被改写。", &state)?; return Err("云端服务返回错误；工作区未被改写。".to_string()); }
+    let value = response.json::<serde_json::Value>().await.map_err(|_| "云端修复响应格式无效。".to_string())?;
+    let raw_advice = value.pointer("/choices/0/message/content").and_then(|value| value.as_str()).unwrap_or("");
+    let (safe_advice, _) = redact_sensitive_text(raw_advice);
+    {
+        let mut runs = state.prepared_runs.lock().map_err(|_| "任务状态被占用。".to_string())?;
+        let run = runs.get_mut(&input.run_id).ok_or_else(|| "任务已失效；请重新发起。".to_string())?;
+        run.repair_attempts += 1;
+        run.run.status = "approved".to_string();
+        run.run.advice = Some(safe_advice);
+        run.run.feedback = format!("云端最小修复建议已返回，开始第 {} 次受控写入。", run.repair_attempts);
+    }
+    add_agent_event(&input.run_id, "repair_advice_received", "已收到最小修复建议；仅验证新建相对路径文件。", &state)?;
+    let write = apply_agent_advice_inner(WorkspaceAdviceInput { run_id: input.run_id.clone(), workspace_id: input.workspace_id.clone() }, false, &state)?;
+    let check = run_workspace_check(WorkspaceCheckInput { workspace_id: input.workspace_id, command: input.command, run_id: Some(input.run_id.clone()) }, state.clone())?;
+    let status = if check.status == "check_complete" { "repair_complete" } else { "check_failed" };
+    update_agent_run_status(&input.run_id, status, if status == "repair_complete" { "自动最小修复已通过固定检查。" } else { "自动最小修复写入后检查仍失败；未继续覆盖或删除任何文件。" }, &state)?;
+    Ok(WorkspaceActionResult { status: status.to_string(), written_files: write.written_files, output: format!("{}\n\n修复检查：\n{}", write.output, check.output) })
+}
+
+#[tauri::command]
 fn prepare_agent_run(
     input: AgentRunRequest,
     state: State<'_, AppState>,
@@ -4496,6 +4561,7 @@ fn prepare_agent_run(
                 run: run.clone(),
                 request_body: serialized,
                 last_diagnostic: None,
+                repair_attempts: 0,
             },
         );
     add_agent_event(&run.id, &run.status, &run.feedback, &state)?;
@@ -4629,6 +4695,7 @@ async fn run_cloud_collaboration(
                 run: run.clone(),
                 request_body: prepared.request_body,
                 last_diagnostic: prepared.last_diagnostic,
+                repair_attempts: prepared.repair_attempts,
             },
         );
     Ok(run)
@@ -5394,6 +5461,7 @@ fn main() {
             cancel_agent_run,
             approve_agent_step,
             retry_agent_run,
+            auto_repair_agent_run,
             list_agent_events,
             get_agent_evidence_report,
             prepare_ai_output,
