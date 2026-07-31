@@ -810,6 +810,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 cloud_policy TEXT NOT NULL DEFAULT 'inherit',
                 source_size INTEGER,
                 source_modified_ms INTEGER,
+                source_sha256 TEXT,
                 FOREIGN KEY(folder_id) REFERENCES folder_refs(id)
             );
             CREATE INDEX IF NOT EXISTS index_items_folder_idx ON index_items(folder_id);
@@ -959,6 +960,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     )?;
     ensure_column(connection, "index_items", "source_size", "INTEGER")?;
     ensure_column(connection, "index_items", "source_modified_ms", "INTEGER")?;
+    ensure_column(connection, "index_items", "source_sha256", "TEXT")?;
     ensure_column(
         connection,
         "index_items",
@@ -1379,6 +1381,23 @@ fn source_state(path: &Path) -> (Option<i64>, Option<i64>) {
     (Some(metadata.len().min(i64::MAX as u64) as i64), modified_ms)
 }
 
+fn source_content_hash(path: &Path) -> Option<String> {
+    const MAX_HASH_BYTES: u64 = 32 * 1024 * 1024;
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_HASH_BYTES {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 { break; }
+        hasher.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 fn embedding_source_signature(
     item_id: &str,
     name: &str,
@@ -1595,13 +1614,13 @@ where
         return Err("接入文件夹原位置不可用。".to_string());
     }
     let existing = connection
-        .prepare("SELECT id, path, item_type, note, tags_json, cloud_policy, source_size, source_modified_ms FROM index_items WHERE folder_id = ?1")
+        .prepare("SELECT id, path, item_type, note, tags_json, cloud_policy, source_size, source_modified_ms, source_sha256 FROM index_items WHERE folder_id = ?1")
         .map_err(|error| error.to_string())?
         .query_map(params![folder_id], |row| {
             Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
-                row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, Option<String>>(8)?,
             ))
         })
         .map_err(|error| error.to_string())?
@@ -1638,13 +1657,14 @@ where
             entry.file_name().to_string_lossy().to_string()
         };
         let (source_size, source_modified_ms) = source_state(path);
+        let source_sha256 = source_content_hash(path);
         match existing.get(&item_path) {
-            Some((id, _, previous_type, _, _, _, previous_size, previous_modified))
-                if previous_type == item_type && previous_size == &source_size && previous_modified == &source_modified_ms => {}
-            Some((id, _, _, _, _, _, _, _)) => {
+            Some((id, _, previous_type, _, _, _, previous_size, previous_modified, previous_hash))
+                if previous_type == item_type && previous_size == &source_size && previous_modified == &source_modified_ms && previous_hash == &source_sha256 => {}
+            Some((id, _, _, _, _, _, _, _, _)) => {
                 connection.execute(
-                    "UPDATE index_items SET item_type = ?1, name = ?2, source_size = ?3, source_modified_ms = ?4 WHERE id = ?5",
-                    params![item_type, name, source_size, source_modified_ms, id],
+                    "UPDATE index_items SET item_type = ?1, name = ?2, source_size = ?3, source_modified_ms = ?4, source_sha256 = ?5 WHERE id = ?6",
+                    params![item_type, name, source_size, source_modified_ms, source_sha256, id],
                 ).map_err(|error| error.to_string())?;
                 if item_type == "file" { index_content(connection, id, path)?; }
                 changed += 1;
@@ -1657,8 +1677,8 @@ where
                     (String::new(), folder_tags.clone(), "inherit".to_string())
                 };
                 connection.execute(
-                    "INSERT INTO index_items (id, folder_id, item_type, name, path, note, tags_json, cloud_policy, source_size, source_modified_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![id, folder_id, item_type, name, item_path, note, tags, policy, source_size, source_modified_ms],
+                    "INSERT INTO index_items (id, folder_id, item_type, name, path, note, tags_json, cloud_policy, source_size, source_modified_ms, source_sha256) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![id, folder_id, item_type, name, item_path, note, tags, policy, source_size, source_modified_ms, source_sha256],
                 ).map_err(|error| error.to_string())?;
                 if item_type == "file" { index_content(connection, &id, path)?; }
                 changed += 1;
@@ -1674,7 +1694,7 @@ where
             }
         }
     }
-    for (path, (id, _, _, _, _, _, _, _)) in existing {
+    for (path, (id, _, _, _, _, _, _, _, _)) in existing {
         if !seen.contains(&path) {
             connection.execute("DELETE FROM index_content_fts WHERE item_id = ?1", params![id]).map_err(|error| error.to_string())?;
             connection.execute("DELETE FROM index_items WHERE id = ?1", params![id]).map_err(|error| error.to_string())?;
@@ -4980,6 +5000,21 @@ mod preview_tests {
         let encrypted = open_encrypted_database(&database, key).unwrap();
         assert_eq!(encrypted.query_row("SELECT value FROM proof", [], |row| row.get::<_, String>(0)).unwrap(), "kept");
         assert!(!fs::read(&database).unwrap().starts_with(b"SQLite format 3\0"));
+    }
+
+    #[test]
+    fn indexing_handles_renames_deletes_and_unavailable_roots() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("source");
+        fs::create_dir_all(&root).unwrap();
+        let original = root.join("original.txt");
+        fs::write(&original, "stable").unwrap();
+        assert!(super::source_content_hash(&original).is_some());
+        let renamed = root.join("renamed.txt");
+        fs::rename(&original, &renamed).unwrap();
+        assert_eq!(super::source_content_hash(&renamed).unwrap().len(), 64);
+        fs::remove_file(renamed).unwrap();
+        assert!(super::source_content_hash(&root.join("missing.txt")).is_none());
     }
 
     #[test]
