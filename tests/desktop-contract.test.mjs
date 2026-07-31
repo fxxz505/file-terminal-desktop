@@ -497,3 +497,16 @@ test('incremental indexing stores bounded content hashes and keeps metadata thro
   assert.match(backend, /source_content_hash\(path\)/);
   assert.match(backend, /indexing_handles_renames_deletes_and_unavailable_roots/);
 });
+
+test('media gallery persists source-signature thumbnail cache entries outside referenced folders', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /CREATE TABLE IF NOT EXISTS thumbnail_cache/);
+  assert.match(backend, /fn get_thumbnail/);
+  assert.match(backend, /fn clear_thumbnail_cache/);
+  assert.match(backend, /thumbnail_cache_dir/);
+  assert.match(backend, /source_signature/);
+  assert.match(shell, /media-gallery/);
+  assert.match(shell, /get_thumbnail/);
+  assert.match(shell, /clear_thumbnail_cache/);
+});
