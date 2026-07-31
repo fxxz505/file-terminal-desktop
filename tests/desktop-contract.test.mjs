@@ -454,3 +454,17 @@ test('agent run reports bind restricted sources locally and retain final build e
   assert.match(shell, /get_agent_evidence_report/);
   assert.match(shell, /agent-evidence-report/);
 });
+
+test('semantic retrieval persists real local embedding vectors and only falls back to FTS when no embedding runtime is configured', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /CREATE TABLE IF NOT EXISTS embedding_models/);
+  assert.match(backend, /CREATE TABLE IF NOT EXISTS item_embeddings/);
+  assert.match(backend, /fn register_embedding_model/);
+  assert.match(backend, /async fn embed_text/);
+  assert.match(backend, /fn cosine_similarity/);
+  assert.match(backend, /semantic_search/);
+  assert.match(backend, /embedding_fallback_fts/);
+  assert.match(shell, /semantic-search/);
+  assert.match(shell, /register_embedding_model/);
+});
