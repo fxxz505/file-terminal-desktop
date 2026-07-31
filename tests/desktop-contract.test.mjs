@@ -630,3 +630,22 @@ test('desktop automatically retries preserved encrypted databases and merges rea
   assert.match(backend, /已自动尝试恢复/);
   assert.match(shell, /recoveryNotice/);
 });
+
+test('desktop updates cloud permission optimistically, imports files into managed storage, and exposes accessible settings', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(shell, /applyMetadataPolicyOptimistically/);
+  assert.match(shell, /update_metadata/);
+  assert.doesNotMatch(shell, /await refreshStatus\(\);\s*\n\s*if \(activeFolder\)/);
+  assert.match(shell, /importFilesToLibrary/);
+  assert.match(shell, /data-import-files/);
+  assert.match(shell, /data-view="settings"/);
+  assert.match(shell, /fontScale/);
+  assert.match(shell, /checkForUpdate\(true\)/);
+  assert.match(backend, /fn import_files_to_library/);
+  assert.match(backend, /uploaded-files/);
+  assert.match(backend, /fs::copy/);
+  assert.match(styles, /\.file-upload-card/);
+  assert.match(styles, /\.settings-page/);
+});
