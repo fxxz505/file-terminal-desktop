@@ -506,6 +506,7 @@ test('media gallery persists source-signature thumbnail cache entries outside re
   assert.match(backend, /fn clear_thumbnail_cache/);
   assert.match(backend, /thumbnail_cache_dir/);
   assert.match(backend, /source_signature/);
+  assert.match(backend, /pdftoppm/);
   assert.match(shell, /media-gallery/);
   assert.match(shell, /get_thumbnail/);
   assert.match(shell, /clear_thumbnail_cache/);

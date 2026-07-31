@@ -142,7 +142,7 @@ function previewPanel() {
   return `<section class="file-preview"><header><div><small>LOCAL PREVIEW</small><h2>${escapeHtml(preview.name)}</h2><span>${escapeHtml(preview.displayPath)}</span></div><div>${office ? '<button class="quiet" id="high-fidelity-office-preview">高保真预览</button>' : ''}<button class="quiet" id="reveal-file">在资源管理器中打开</button><button class="quiet" id="close-preview">关闭</button></div></header><div class="preview-body">${body}</div></section>`;
 }
 
-function isGalleryImage(item: Result) { return item.itemType === 'file' && /\.(png|jpe?g|gif|webp|bmp)$/i.test(item.name); }
+function isGalleryImage(item: Result) { return item.itemType === 'file' && /\.(png|jpe?g|gif|webp|bmp|pdf)$/i.test(item.name); }
 function mediaKind(item: Result): MediaTask['kind'] | null { if (/\.(png|jpe?g|bmp|tiff?|webp)$/i.test(item.name)) return 'ocr'; if (/\.(wav|mp3|m4a|flac|ogg|mp4|mkv|mov|webm|avi)$/i.test(item.name)) return 'transcription'; return null; }
 function mediaGallery() {
   if (!mediaGalleryOpen) return '';
@@ -152,7 +152,7 @@ function mediaGallery() {
     const image = thumbnail ? `<img src="data:${thumbnail.mimeType};base64,${thumbnail.content}" alt="${escapeHtml(item.name)}">` : '<span class="gallery-placeholder">未生成</span>';
     return `<button class="media-card preview-file" data-path="${escapeHtml(item.path)}">${image}<b>${escapeHtml(item.name)}</b><small>${thumbnail?.cached ? '来自本地缓存' : '仅本机缓存'}</small></button>`;
   }).join('');
-  return `<section class="media-gallery"><header><div><b>图库浏览</b><span>缩略图仅写入应用数据目录，不会改动原图；PDF 首页缩略图需要后续本地渲染器。</span></div><div><button class="quiet" id="build-media-thumbnails" ${isWorking || !images.length ? 'disabled' : ''}>生成当前缩略图</button><button class="quiet" id="clear-thumbnail-cache" ${isWorking ? 'disabled' : ''}>清理缓存</button></div></header>${images.length ? `<div class="media-grid">${cards}</div>` : '<p>当前搜索结果没有可展示的图片。</p>'}</section>`;
+  return `<section class="media-gallery"><header><div><b>图库浏览</b><span>缩略图仅写入应用数据目录，不会改动原文件；PDF 首页缩略图需要本机 pdftoppm 渲染器。</span></div><div><button class="quiet" id="build-media-thumbnails" ${isWorking || !images.length ? 'disabled' : ''}>生成当前缩略图</button><button class="quiet" id="clear-thumbnail-cache" ${isWorking ? 'disabled' : ''}>清理缓存</button></div></header>${images.length ? `<div class="media-grid">${cards}</div>` : '<p>当前搜索结果没有可展示的图片或 PDF。</p>'}</section>`;
 }
 
 function mediaTasksPanel() {

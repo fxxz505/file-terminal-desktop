@@ -1297,6 +1297,10 @@ fn command_available(command: &str) -> bool {
     Command::new(command).arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
 }
 
+fn pdf_renderer_available() -> bool {
+    Command::new("pdftoppm").arg("-v").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+}
+
 #[tauri::command]
 fn get_local_tool_status() -> LocalToolStatus {
     LocalToolStatus {
@@ -1579,6 +1583,31 @@ fn image_thumbnail_bytes(path: &Path) -> Result<(&'static str, Vec<u8>), String>
         return Err("生成的缩略图超过安全大小限制。".to_string());
     }
     let _ = mime_type;
+    Ok(("image/png", bytes))
+}
+
+fn pdf_thumbnail_bytes(path: &Path, cache_dir: &Path) -> Result<(&'static str, Vec<u8>), String> {
+    if !pdf_renderer_available() {
+        return Err("未检测到本地 PDF 渲染器 pdftoppm。".to_string());
+    }
+    let work_dir = cache_dir.join(format!("pdf-work-{}", Uuid::new_v4()));
+    fs::create_dir_all(&work_dir).map_err(|error| error.to_string())?;
+    let prefix = work_dir.join("page");
+    let result = command_output_with_timeout(
+        Command::new("pdftoppm")
+            .arg("-f").arg("1").arg("-l").arg("1")
+            .arg("-png").arg("-scale-to-x").arg("320").arg("-scale-to-y").arg("-1")
+            .arg(path).arg(&prefix),
+        Duration::from_secs(30),
+    );
+    let output = prefix.with_file_name("page-1.png");
+    let bytes = result.and_then(|result| {
+        if !result.status.success() { return Err("本地 PDF 渲染失败。".to_string()); }
+        fs::read(&output).map_err(|error| error.to_string())
+    });
+    let _ = fs::remove_dir_all(&work_dir);
+    let bytes = bytes?;
+    if bytes.len() > MAX_THUMBNAIL_BYTES { return Err("生成的 PDF 缩略图超过安全大小限制。".to_string()); }
     Ok(("image/png", bytes))
 }
 
@@ -3345,7 +3374,12 @@ fn run_workspace_check(
                 .get_mut(run_id)
             {
                 prepared.last_diagnostic = Some(diagnostic);
+                prepared.run.status = "check_failed".to_string();
+                prepared.run.feedback = "本地检查失败；可重试或请求受限的自动最小修复。".to_string();
             }
+        } else if let Some(prepared) = state.prepared_runs.lock().map_err(|_| "任务状态被占用。".to_string())?.get_mut(run_id) {
+            prepared.run.status = "check_complete".to_string();
+            prepared.run.feedback = "本地检查成功完成。".to_string();
         }
     }
     Ok(WorkspaceActionResult {
@@ -5276,8 +5310,10 @@ fn get_thumbnail(input: ThumbnailInput, state: State<'_, AppState>) -> Result<Th
             return Ok(Thumbnail { item_id: input.item_id, source_signature: signature, mime_type, content: BASE64.encode(bytes), cached: true });
         }
     }
-    let (mime_type, bytes) = image_thumbnail_bytes(&target)?;
-    let cache_path = thumbnail_cache_dir(&state.data_dir)?.join(format!("{}-{}.png", input.item_id, signature));
+    let cache_dir = thumbnail_cache_dir(&state.data_dir)?;
+    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+    let (mime_type, bytes) = if extension == "pdf" { pdf_thumbnail_bytes(&target, &cache_dir)? } else { image_thumbnail_bytes(&target)? };
+    let cache_path = cache_dir.join(format!("{}-{}.png", input.item_id, signature));
     fs::write(&cache_path, &bytes).map_err(|error| error.to_string())?;
     let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
     connection.execute(
