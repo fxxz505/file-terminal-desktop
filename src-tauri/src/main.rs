@@ -9,7 +9,7 @@ use lopdf::Document;
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use rand::RngCore;
-use rusqlite::{params, params_from_iter, types::Value, Connection};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -152,7 +152,7 @@ struct FolderImport {
     tags: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchDocumentsInput {
     query: String,
@@ -170,6 +170,32 @@ struct SearchDocumentsResult {
     total: usize,
     page: usize,
     page_size: usize,
+    search_mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EmbeddingModelInput {
+    path: String,
+    display_name: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmbeddingModel {
+    id: String,
+    display_name: String,
+    path: String,
+    active: bool,
+    dimensions: Option<usize>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmbeddingIndexProgress {
+    completed: usize,
+    total: usize,
+    failed: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -680,6 +706,25 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             );
             CREATE INDEX IF NOT EXISTS index_items_folder_idx ON index_items(folder_id);
             CREATE VIRTUAL TABLE IF NOT EXISTS index_content_fts USING fts5(item_id UNINDEXED, content);
+            CREATE TABLE IF NOT EXISTS embedding_models (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                active INTEGER NOT NULL DEFAULT 0,
+                dimensions INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS item_embeddings (
+                item_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                source_signature TEXT NOT NULL,
+                vector_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (item_id, model_id),
+                FOREIGN KEY(item_id) REFERENCES index_items(id),
+                FOREIGN KEY(model_id) REFERENCES embedding_models(id)
+            );
+            CREATE INDEX IF NOT EXISTS item_embeddings_model_idx ON item_embeddings(model_id);
             CREATE TABLE IF NOT EXISTS metadata_audit (
                 id TEXT PRIMARY KEY,
                 target_type TEXT NOT NULL,
@@ -1207,6 +1252,149 @@ fn source_state(path: &Path) -> (Option<i64>, Option<i64>) {
         .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|value| value.as_millis().min(i64::MAX as u128) as i64);
     (Some(metadata.len().min(i64::MAX as u64) as i64), modified_ms)
+}
+
+fn embedding_source_signature(
+    item_id: &str,
+    name: &str,
+    note: &str,
+    tags_json: &str,
+    source_size: Option<i64>,
+    source_modified_ms: Option<i64>,
+    content: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(item_id.as_bytes());
+    hasher.update(name.as_bytes());
+    hasher.update(note.as_bytes());
+    hasher.update(tags_json.as_bytes());
+    hasher.update(source_size.unwrap_or_default().to_le_bytes());
+    hasher.update(source_modified_ms.unwrap_or_default().to_le_bytes());
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn embedding_text(name: &str, path: &str, note: &str, tags_json: &str, content: &str) -> String {
+    let tags = serde_json::from_str::<Vec<String>>(tags_json)
+        .unwrap_or_default()
+        .join(" ");
+    format!(
+        "名称：{name}\n路径：{path}\n备注：{note}\n标签：{tags}\n正文：{}",
+        content.chars().take(6_000).collect::<String>()
+    )
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.is_empty() || left.len() != right.len() {
+        return None;
+    }
+    let mut dot = 0.0f32;
+    let mut left_norm = 0.0f32;
+    let mut right_norm = 0.0f32;
+    for (&a, &b) in left.iter().zip(right.iter()) {
+        if !a.is_finite() || !b.is_finite() {
+            return None;
+        }
+        dot += a * b;
+        left_norm += a * a;
+        right_norm += b * b;
+    }
+    let magnitude = left_norm.sqrt() * right_norm.sqrt();
+    (magnitude > f32::EPSILON).then_some(dot / magnitude)
+}
+
+fn active_embedding_model(connection: &Connection) -> Result<Option<EmbeddingModel>, String> {
+    connection
+        .query_row(
+            "SELECT id, display_name, path, active, dimensions FROM embedding_models WHERE active = 1 LIMIT 1",
+            [],
+            |row| Ok(EmbeddingModel {
+                id: row.get(0)?,
+                display_name: row.get(1)?,
+                path: row.get(2)?,
+                active: row.get::<_, i64>(3)? != 0,
+                dimensions: row.get::<_, Option<i64>>(4)?.map(|value| value as usize),
+            }),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+fn llama_server_path(state: &AppState) -> PathBuf {
+    state.data_dir.join("runtime").join("llama-server.exe")
+}
+
+async fn start_embedding_server(state: &AppState, model: &EmbeddingModel) -> Result<(std::process::Child, reqwest::Client, String), String> {
+    const EMBEDDING_PORT: u16 = 18081;
+    let runtime = llama_server_path(state);
+    if !runtime.is_file() || !Path::new(&model.path).is_file() {
+        return Err("本地 embedding 运行时或模型文件不可用。".to_string());
+    }
+    let mut child = Command::new(runtime)
+        .arg("-m")
+        .arg(&model.path)
+        .arg("--embedding")
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(EMBEDDING_PORT.to_string())
+        .arg("--ctx-size")
+        .arg("8192")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("无法启动本地 embedding 服务：{error}"))?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let url = format!("http://127.0.0.1:{EMBEDDING_PORT}/embedding");
+    for _ in 0..30 {
+        if client.get(format!("http://127.0.0.1:{EMBEDDING_PORT}/health")).send().await.is_ok() {
+            return Ok((child, client, url));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err("本地 embedding 服务启动超时。".to_string())
+}
+
+async fn request_embedding(client: &reqwest::Client, url: &str, text: &str) -> Result<Vec<f32>, String> {
+    const MAX_EMBEDDING_CHARS: usize = 7_000;
+    let payload = serde_json::json!({ "content": text.chars().take(MAX_EMBEDDING_CHARS).collect::<String>() });
+    let body = client
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| format!("本地 embedding 请求失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("本地 embedding 服务拒绝请求：{error}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("读取 embedding 响应失败：{error}"))?;
+    let values = body
+        .get("embedding")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| body.get("data").and_then(serde_json::Value::as_array).and_then(|items| items.first()).and_then(|item| item.get("embedding")).and_then(serde_json::Value::as_array))
+        .ok_or_else(|| "本地 embedding 服务返回了不受支持的响应。".to_string())?;
+    let vector = values
+        .iter()
+        .map(|value| value.as_f64().map(|item| item as f32).filter(|item| item.is_finite()).ok_or_else(|| "本地 embedding 向量包含无效数值。".to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if vector.is_empty() || vector.len() > 16_384 {
+        return Err("本地 embedding 向量维度无效。".to_string());
+    }
+    Ok(vector)
+}
+
+async fn embed_text(state: &AppState, model: &EmbeddingModel, text: &str) -> Result<Vec<f32>, String> {
+    let (mut child, client, url) = start_embedding_server(state, model).await?;
+    let result = request_embedding(&client, &url, text).await;
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 fn index_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexJob> {
@@ -1864,6 +2052,89 @@ fn delete_local_model(input: IdInput, state: State<'_, AppState>) -> Result<(), 
     }
     // Only the registry entry is removed. The user-owned GGUF file stays untouched.
     Ok(())
+}
+
+#[tauri::command]
+fn list_embedding_models(state: State<'_, AppState>) -> Result<Vec<EmbeddingModel>, String> {
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut statement = connection
+        .prepare("SELECT id, display_name, path, active, dimensions FROM embedding_models ORDER BY active DESC, created_at DESC")
+        .map_err(|error| error.to_string())?;
+    let models = statement
+        .query_map([], |row| Ok(EmbeddingModel {
+            id: row.get(0)?, display_name: row.get(1)?, path: row.get(2)?,
+            active: row.get::<_, i64>(3)? != 0,
+            dimensions: row.get::<_, Option<i64>>(4)?.map(|value| value as usize),
+        }))
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .filter(|model| Path::new(&model.path).is_file())
+        .collect();
+    Ok(models)
+}
+
+#[tauri::command]
+fn register_embedding_model(input: EmbeddingModelInput, state: State<'_, AppState>) -> Result<EmbeddingModel, String> {
+    let path = fs::canonicalize(input.path.trim()).map_err(|_| "找不到本地 embedding GGUF 文件。".to_string())?;
+    if !path.is_file() || !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf")) {
+        return Err("仅支持已存在的 embedding GGUF 模型文件。".to_string());
+    }
+    let model = EmbeddingModel {
+        id: Uuid::new_v4().to_string(),
+        display_name: input.display_name.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| path.file_stem().and_then(|name| name.to_str()).unwrap_or("本地 embedding 模型").chars().take(100).collect()),
+        path: path.display().to_string(), active: true, dimensions: None,
+    };
+    let mut connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    transaction.execute("UPDATE embedding_models SET active = 0", []).map_err(|error| error.to_string())?;
+    transaction.execute("INSERT INTO embedding_models (id, display_name, path, active, created_at) VALUES (?1, ?2, ?3, 1, datetime('now')) ON CONFLICT(path) DO UPDATE SET display_name = excluded.display_name, active = 1", params![model.id, model.display_name, model.path]).map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(model)
+}
+
+#[tauri::command]
+async fn build_embedding_index(app: AppHandle, state: State<'_, AppState>) -> Result<EmbeddingIndexProgress, String> {
+    let model = {
+        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+        active_embedding_model(&connection)?.ok_or_else(|| "请先选择本地 embedding GGUF 模型。".to_string())?
+    };
+    let rows = {
+        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+        let mut statement = connection.prepare(
+            "SELECT index_items.id, index_items.name, index_items.path, index_items.note, index_items.tags_json, index_items.source_size, index_items.source_modified_ms, COALESCE(index_content_fts.content, '') FROM index_items LEFT JOIN index_content_fts ON index_items.id = index_content_fts.item_id ORDER BY index_items.name COLLATE NOCASE"
+        ).map_err(|error| error.to_string())?;
+        let rows = statement.query_map([], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<i64>>(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, String>(7)?
+        ))).map_err(|error| error.to_string())?.filter_map(Result::ok).collect::<Vec<_>>();
+        rows
+    };
+    let total = rows.len();
+    let (mut child, client, url) = start_embedding_server(&state, &model).await?;
+    let mut completed = 0;
+    let mut failed = 0;
+    for (item_id, name, path, note, tags_json, source_size, source_modified_ms, content) in rows {
+        let signature = embedding_source_signature(&item_id, &name, &note, &tags_json, source_size, source_modified_ms, &content);
+        let current = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?.query_row(
+            "SELECT source_signature FROM item_embeddings WHERE item_id = ?1 AND model_id = ?2", params![item_id, model.id], |row| row.get::<_, String>(0)
+        ).optional().map_err(|error| error.to_string())?;
+        if current.as_deref() != Some(signature.as_str()) {
+            match request_embedding(&client, &url, &embedding_text(&name, &path, &note, &tags_json, &content)).await {
+                Ok(vector) => {
+                    let vector_json = serde_json::to_string(&vector).map_err(|error| error.to_string())?;
+                    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+                    connection.execute("INSERT INTO item_embeddings (item_id, model_id, source_signature, vector_json, updated_at) VALUES (?1, ?2, ?3, ?4, datetime('now')) ON CONFLICT(item_id, model_id) DO UPDATE SET source_signature = excluded.source_signature, vector_json = excluded.vector_json, updated_at = excluded.updated_at", params![item_id, model.id, signature, vector_json]).map_err(|error| error.to_string())?;
+                    connection.execute("UPDATE embedding_models SET dimensions = ?1 WHERE id = ?2", params![vector.len() as i64, model.id]).map_err(|error| error.to_string())?;
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        completed += 1;
+        let progress = EmbeddingIndexProgress { completed, total, failed };
+        let _ = app.emit("embedding-index-progress", &progress);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(EmbeddingIndexProgress { completed, total, failed })
 }
 
 #[tauri::command]
@@ -4164,6 +4435,53 @@ fn build_source_citations(sources: &[IndexItem]) -> Vec<SourceCitation> {
         .collect()
 }
 
+fn embedding_fallback_fts(input: SearchDocumentsInput, state: State<'_, AppState>) -> Result<SearchDocumentsResult, String> {
+    search_documents(input, state)
+}
+
+#[tauri::command]
+async fn semantic_search(input: SearchDocumentsInput, state: State<'_, AppState>) -> Result<SearchDocumentsResult, String> {
+    let query = input.query.trim();
+    if query.is_empty() || query.chars().count() > 500 {
+        return Err("搜索内容不能为空且不能超过 500 个字符。".to_string());
+    }
+    let model = {
+        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+        active_embedding_model(&connection)?
+    };
+    let Some(model) = model else {
+        let mut result = embedding_fallback_fts(input, state)?;
+        result.search_mode = "embedding_fallback_fts".to_string();
+        return Ok(result);
+    };
+    let query_vector = embed_text(&state, &model, query).await?;
+    let page_size = input.page_size.unwrap_or(30).clamp(1, 100);
+    let page = input.page.unwrap_or(0);
+    let tag = input.tag.filter(|value| !value.trim().is_empty()).map(|value| value.to_ascii_lowercase());
+    let folder_id = input.folder_id.filter(|value| !value.trim().is_empty());
+    let item_type = input.item_type.filter(|value| matches!(value.as_str(), "file" | "folder"));
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut statement = connection.prepare(
+        "SELECT index_items.id, index_items.folder_id, index_items.item_type, index_items.name, index_items.path, index_items.note, index_items.tags_json, folder_refs.cloud_policy, index_items.cloud_policy, item_embeddings.vector_json FROM item_embeddings INNER JOIN index_items ON index_items.id = item_embeddings.item_id INNER JOIN folder_refs ON folder_refs.id = index_items.folder_id WHERE item_embeddings.model_id = ?1"
+    ).map_err(|error| error.to_string())?;
+    let mut ranked = statement.query_map(params![model.id], |row| Ok((
+        row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?, row.get::<_, String>(9)?
+    ))).map_err(|error| error.to_string())?.filter_map(Result::ok).filter_map(|(id, actual_folder_id, kind, name, path, note, tags_json, folder_policy, item_policy, vector_json)| {
+        if folder_id.as_deref().is_some_and(|requested| requested != actual_folder_id) { return None; }
+        if item_type.as_deref().is_some_and(|requested| requested != kind) { return None; }
+        let tags = serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default();
+        if tag.as_ref().is_some_and(|requested| !tags.iter().any(|value| value.to_ascii_lowercase() == *requested)) { return None; }
+        let vector = serde_json::from_str::<Vec<f32>>(&vector_json).ok()?;
+        let similarity = cosine_similarity(&query_vector, &vector)?;
+        Some((similarity, IndexItem { id, item_type: kind, name, display_path: display_path(Path::new(&path)), path, note, tags, cloud_policy: effective_cloud_policy(CloudPolicy::from_database(&folder_policy), CloudPolicy::from_database(&item_policy)), score: (similarity.max(0.0) * 1000.0).round() as usize }))
+    }).collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.0.total_cmp(&left.0).then_with(|| left.1.name.cmp(&right.1.name)));
+    let total = ranked.len();
+    let offset = page.saturating_mul(page_size);
+    let items = ranked.into_iter().skip(offset).take(page_size).map(|(_, item)| item).collect();
+    Ok(SearchDocumentsResult { items, total, page, page_size, search_mode: "semantic".to_string() })
+}
+
 #[tauri::command]
 fn search_documents(
     input: SearchDocumentsInput,
@@ -4183,6 +4501,7 @@ fn search_documents(
             total: 0,
             page,
             page_size,
+            search_mode: "fts".to_string(),
         });
     }
     let pattern = terms
@@ -4280,6 +4599,7 @@ fn search_documents(
         total,
         page,
         page_size,
+        search_mode: "fts".to_string(),
     })
 }
 
@@ -4407,6 +4727,9 @@ fn main() {
             register_local_model,
             select_local_model,
             delete_local_model,
+            list_embedding_models,
+            register_embedding_model,
+            build_embedding_index,
             import_folder,
             refresh_folder_index,
             enqueue_index_job,
@@ -4454,6 +4777,7 @@ fn main() {
             run_workspace_check,
             ask_assistant,
             search_documents,
+            semantic_search,
             preview_file,
             reveal_in_explorer
         ])
@@ -4464,8 +4788,8 @@ fn main() {
 #[cfg(test)]
 mod preview_tests {
     use super::{
-        display_path, effective_cloud_policy, incremental_index_folder_inner, initialize_database,
-        preview_mime, safe_relative_path, CloudPolicy,
+        cosine_similarity, display_path, effective_cloud_policy, incremental_index_folder_inner,
+        initialize_database, preview_mime, safe_relative_path, CloudPolicy,
     };
     use rusqlite::{params, Connection};
     use std::{fs, path::Path, time::Instant};
@@ -4497,6 +4821,15 @@ mod preview_tests {
             effective_cloud_policy(CloudPolicy::CloudAllowed, CloudPolicy::AskEachTime),
             CloudPolicy::AskEachTime
         );
+    }
+
+    #[test]
+    fn cosine_similarity_orders_local_embedding_vectors_and_rejects_bad_dimensions() {
+        let query = [1.0, 0.0, 0.0];
+        let close = cosine_similarity(&query, &[0.9, 0.1, 0.0]).unwrap();
+        let distant = cosine_similarity(&query, &[0.0, 1.0, 0.0]).unwrap();
+        assert!(close > distant);
+        assert!(cosine_similarity(&query, &[1.0, 0.0]).is_none());
     }
 
     #[test]
