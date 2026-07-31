@@ -42,6 +42,7 @@ const MAX_PREVIEW_BYTES: u64 = 1_048_576;
 const MAX_CLOUD_REQUEST_BYTES: usize = 48 * 1024;
 const CLOUD_KEYRING_SERVICE: &str = "file-terminal-desktop.cloud-provider";
 const BACKUP_KEYRING_SERVICE: &str = "file-terminal-desktop.encrypted-backup";
+const DATABASE_KEYRING_SERVICE: &str = "file-terminal-desktop.sqlcipher";
 const BACKUP_MAGIC: &[u8] = b"FTBK1";
 const MAX_GENERATED_FILES: usize = 40;
 const MAX_GENERATED_FILE_BYTES: usize = 256 * 1024;
@@ -677,6 +678,90 @@ fn app_data_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "无法定位 Windows 本地应用数据目录。".to_string())
 }
 
+fn database_key_entry() -> Result<Entry, String> {
+    Entry::new(DATABASE_KEYRING_SERVICE, "database-key")
+        .map_err(|_| "无法访问 Windows 凭据库。".to_string())
+}
+
+fn database_key() -> Result<String, String> {
+    let entry = database_key_entry()?;
+    match entry.get_password() {
+        Ok(key) if key.len() >= 32 && key.chars().all(|value| value.is_ascii_alphanumeric() || matches!(value, '+' | '/' | '=')) => Ok(key),
+        Ok(_) => Err("本地数据库密钥无效；应用拒绝打开数据库。".to_string()),
+        Err(keyring::Error::NoEntry) => {
+            let mut raw = [0u8; 32];
+            rand::rng().fill_bytes(&mut raw);
+            let key = BASE64.encode(raw);
+            entry.set_password(&key).map_err(|_| "无法将数据库密钥保存到 Windows 凭据库。".to_string())?;
+            Ok(key)
+        }
+        Err(_) => Err("无法读取 Windows 凭据库中的数据库密钥；应用拒绝打开数据库。".to_string()),
+    }
+}
+
+fn apply_database_key(connection: &Connection, key: &str) -> Result<(), String> {
+    connection.execute_batch(&format!("PRAGMA key = '{key}';"))
+        .map_err(|_| "无法应用本地数据库密钥。".to_string())?;
+    let cipher_version = connection.query_row("PRAGMA cipher_version", [], |row| row.get::<_, String>(0))
+        .map_err(|_| "当前运行时未包含 SQLCipher；应用拒绝打开数据库。".to_string())?;
+    if cipher_version.trim().is_empty() {
+        return Err("当前运行时未启用 SQLCipher；应用拒绝打开数据库。".to_string());
+    }
+    Ok(())
+}
+
+fn open_encrypted_database(path: &Path, key: &str) -> Result<Connection, String> {
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
+    apply_database_key(&connection, key)?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;").map_err(|error| error.to_string())?;
+    connection.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+        .map_err(|_| "无法使用本机凭据解锁数据库；数据未被修改。".to_string())?;
+    Ok(connection)
+}
+
+fn migrate_plaintext_database(database: &Path, key: &str) -> Result<(), String> {
+    let migrated = database.with_extension("sqlcipher-migrating");
+    let preserved = database.with_extension("plaintext-migration-backup");
+    let _ = fs::remove_file(&migrated);
+    let _ = fs::remove_file(&preserved);
+    let source = Connection::open(database).map_err(|error| error.to_string())?;
+    source.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").map_err(|error| error.to_string())?;
+    let target_path = migrated.display().to_string().replace('\'', "''");
+    let escaped_key = key.replace('\'', "''");
+    source.execute_batch(&format!("ATTACH DATABASE '{target_path}' AS encrypted KEY '{escaped_key}';"))
+        .map_err(|error| format!("无法创建加密迁移数据库；原始数据库未被修改：{error}"))?;
+    let exported = source.query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok::<(), rusqlite::Error>(()))
+        .map_err(|error| format!("无法导出加密数据库；原始数据库未被修改：{error}"));
+    let _ = source.execute_batch("DETACH DATABASE encrypted;");
+    drop(source);
+    if let Err(error) = exported {
+        let _ = fs::remove_file(&migrated);
+        return Err(format!("数据库加密导出失败；原始数据库未被修改：{error}"));
+    }
+    if let Err(error) = open_encrypted_database(&migrated, key) {
+        let _ = fs::remove_file(&migrated);
+        return Err(format!("数据库加密迁移校验失败；原始数据库未被修改：{error}"));
+    }
+    fs::rename(database, &preserved).map_err(|error| error.to_string())?;
+    if let Err(error) = fs::rename(&migrated, database) {
+        let _ = fs::rename(&preserved, database);
+        return Err(format!("数据库加密迁移未完成；原始数据库已保留：{error}"));
+    }
+    let _ = fs::remove_file(&preserved);
+    let _ = fs::remove_file(database.with_extension("db-wal"));
+    let _ = fs::remove_file(database.with_extension("db-shm"));
+    Ok(())
+}
+
+fn open_app_database(data_dir: &Path) -> Result<Connection, String> {
+    let database = data_dir.join("file-terminal.db");
+    let key = database_key()?;
+    if database.is_file() && fs::read(&database).map_err(|error| error.to_string())?.starts_with(b"SQLite format 3\0") {
+        migrate_plaintext_database(&database, &key)?;
+    }
+    open_encrypted_database(&database, &key)
+}
+
 fn initialize_database(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(
@@ -896,7 +981,7 @@ fn start_folder_change_watch(app: AppHandle, data_dir: PathBuf) {
         };
         let mut watched_roots = HashMap::<PathBuf, String>::new();
         loop {
-            let Ok(connection) = Connection::open(data_dir.join("file-terminal.db")) else {
+            let Ok(connection) = open_app_database(&data_dir) else {
                 thread::sleep(Duration::from_secs(5));
                 continue;
             };
@@ -1565,7 +1650,7 @@ where
 
 fn start_index_worker(app: AppHandle, data_dir: PathBuf) {
     thread::spawn(move || loop {
-        let Ok(connection) = Connection::open(data_dir.join("file-terminal.db")) else {
+        let Ok(connection) = open_app_database(&data_dir) else {
             thread::sleep(Duration::from_secs(1));
             continue;
         };
@@ -3576,7 +3661,7 @@ fn parse_cloud_advice(content: &str) -> CloudAdvice {
 fn get_privacy_status() -> PrivacyStatus {
     // 磁盘加密 remains the at-rest protection boundary until an application-level encryption design is approved.
     PrivacyStatus {
-        database_encrypted: false,
+        database_encrypted: true,
         message: "资料终端不会在 SQLite 中保存云端 API Key；索引和对话数据库尚未应用级加密。"
             .to_string(),
         recommendation: "请启用 Windows 设备加密或 BitLocker 保护本机磁盘。".to_string(),
@@ -3645,7 +3730,7 @@ fn stage_encrypted_restore(input: BackupPathInput, state: State<'_, AppState>) -
     if !source.is_file() || source.extension().and_then(|value| value.to_str()) != Some("ftbackup") { return Err("请选择 .ftbackup 加密备份文件。".to_string()); }
     let staged = state.data_dir.join("pending-restore.db");
     fs::write(&staged, decrypt_backup(&fs::read(source).map_err(|error| error.to_string())?)?).map_err(|error| error.to_string())?;
-    if Connection::open(&staged).and_then(|connection| connection.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))).is_err() {
+    if database_key().and_then(|key| open_encrypted_database(&staged, &key)).is_err() {
         let _ = fs::remove_file(staged);
         return Err("备份数据库校验失败，未替换任何本地数据。".to_string());
     }
@@ -4697,8 +4782,7 @@ fn main() {
     let data_dir = app_data_dir().expect("unable to locate app data directory");
     fs::create_dir_all(&data_dir).expect("unable to create app data directory");
     apply_pending_restore(&data_dir).expect("unable to apply pending restore");
-    let connection =
-        Connection::open(data_dir.join("file-terminal.db")).expect("unable to open database");
+    let connection = open_app_database(&data_dir).expect("unable to open encrypted database");
     initialize_database(&connection).expect("unable to initialize database");
 
     tauri::Builder::default()
@@ -4789,7 +4873,8 @@ fn main() {
 mod preview_tests {
     use super::{
         cosine_similarity, display_path, effective_cloud_policy, incremental_index_folder_inner,
-        initialize_database, preview_mime, safe_relative_path, CloudPolicy,
+        initialize_database, migrate_plaintext_database, open_encrypted_database, preview_mime,
+        safe_relative_path, CloudPolicy,
     };
     use rusqlite::{params, Connection};
     use std::{fs, path::Path, time::Instant};
@@ -4830,6 +4915,20 @@ mod preview_tests {
         let distant = cosine_similarity(&query, &[0.0, 1.0, 0.0]).unwrap();
         assert!(close > distant);
         assert!(cosine_similarity(&query, &[1.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn migrates_plaintext_sqlite_to_a_keyed_sqlcipher_database() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("migration.db");
+        let plain = Connection::open(&database).unwrap();
+        plain.execute_batch("CREATE TABLE proof (value TEXT); INSERT INTO proof VALUES ('kept');").unwrap();
+        drop(plain);
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        migrate_plaintext_database(&database, key).unwrap();
+        let encrypted = open_encrypted_database(&database, key).unwrap();
+        assert_eq!(encrypted.query_row("SELECT value FROM proof", [], |row| row.get::<_, String>(0)).unwrap(), "kept");
+        assert!(!fs::read(&database).unwrap().starts_with(b"SQLite format 3\0"));
     }
 
     #[test]
