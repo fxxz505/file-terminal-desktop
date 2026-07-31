@@ -489,3 +489,11 @@ test('runtime provisioning uses a versioned manifest with archive hashes and exp
   assert.match(backend, /runtime_variant_for_settings/);
   assert.match(backend, /verify_sha256\(&archive/);
 });
+
+test('incremental indexing stores bounded content hashes and keeps metadata through rename, delete, and unavailable roots', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  assert.match(backend, /source_sha256/);
+  assert.match(backend, /fn source_content_hash/);
+  assert.match(backend, /source_content_hash\(path\)/);
+  assert.match(backend, /indexing_handles_renames_deletes_and_unavailable_roots/);
+});
