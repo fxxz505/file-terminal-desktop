@@ -510,3 +510,20 @@ test('media gallery persists source-signature thumbnail cache entries outside re
   assert.match(shell, /get_thumbnail/);
   assert.match(shell, /clear_thumbnail_cache/);
 });
+
+test('OCR and whisper transcription use a bounded persistent local media queue and write only indexed text', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /CREATE TABLE IF NOT EXISTS media_tasks/);
+  assert.match(backend, /CREATE TABLE IF NOT EXISTS media_extractions/);
+  assert.match(backend, /fn enqueue_media_task/);
+  assert.match(backend, /fn cancel_media_task/);
+  assert.match(backend, /fn start_media_worker/);
+  assert.match(backend, /tesseract/);
+  assert.match(backend, /whisper-cli/);
+  assert.match(backend, /ffmpeg/);
+  assert.match(backend, /MAX_MEDIA_OUTPUT_CHARS/);
+  assert.match(shell, /enqueue_media_task/);
+  assert.match(shell, /media-tasks/);
+  assert.match(shell, /cancel_media_task/);
+});
