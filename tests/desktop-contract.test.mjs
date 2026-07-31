@@ -468,3 +468,14 @@ test('semantic retrieval persists real local embedding vectors and only falls ba
   assert.match(shell, /semantic-search/);
   assert.match(shell, /register_embedding_model/);
 });
+
+test('application database uses SQLCipher with a Windows-credential key and migrates an existing plaintext database safely', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const cargo = await readFile(new URL('../src-tauri/Cargo.toml', import.meta.url), 'utf8');
+  assert.match(cargo, /bundled-sqlcipher/);
+  assert.match(backend, /DATABASE_KEYRING_SERVICE/);
+  assert.match(backend, /PRAGMA key/);
+  assert.match(backend, /PRAGMA cipher_version/);
+  assert.match(backend, /sqlcipher_export/);
+  assert.match(backend, /fn open_app_database/);
+});
