@@ -33,6 +33,7 @@ sha2 = "0.10"
 keyring = "3.6"
 regex = "1.11"
 lopdf = "0.34"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 notify = "8.2"
 tokio = { version = "1", features = ["macros", "time"] }
 tauri-plugin-updater = "2"

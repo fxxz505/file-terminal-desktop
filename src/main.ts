@@ -17,6 +17,7 @@ type MetadataTarget = { targetType: 'folder' | 'item'; targetId: string; name: s
 type AiOutputTarget = { workspaceId: string; path: string; displayPath: string; isAppWorkspace: boolean };
 type DownloadProgress = { kind: 'model' | 'runtime'; source?: string; completed: number; total?: number };
 type FilePreview = { kind: 'image' | 'text' | 'pdf' | 'folder' | 'unsupported'; name: string; path: string; displayPath: string; mimeType: string; content: string; message: string; truncated: boolean };
+type Thumbnail = { itemId: string; sourceSignature: string; mimeType: string; content: string; cached: boolean };
 type CloudProviderConfig = { providerId: string; displayName: string; baseUrl: string; model: string; autoCollaboration: boolean; reviewEachRequest: boolean; configured: boolean };
 type CloudModel = { id: string };
 type ParsedReply = { answer: string; steps: string[]; codeBlocks: number };
@@ -94,6 +95,8 @@ let auditEntries: MetadataAuditEntry[] = [];
 let runtimeSettings: RuntimeSettings = { executionMode: 'auto', threads: 4, contextSize: 4096 };
 let acceptanceChecks: AcceptanceCheck[] = [];
 let agentEvidenceReport: AgentEvidenceReport | null = null;
+let mediaGalleryOpen = false;
+let mediaThumbnails = new Map<string, Thumbnail>();
 const folderRefreshTimers = new Map<string, number>();
 
 const icon = (name: string) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${name}"/></svg>`;
@@ -134,6 +137,18 @@ function previewPanel() {
   return `<section class="file-preview"><header><div><small>LOCAL PREVIEW</small><h2>${escapeHtml(preview.name)}</h2><span>${escapeHtml(preview.displayPath)}</span></div><div><button class="quiet" id="reveal-file">在资源管理器中打开</button><button class="quiet" id="close-preview">关闭</button></div></header><div class="preview-body">${body}</div></section>`;
 }
 
+function isGalleryImage(item: Result) { return item.itemType === 'file' && /\.(png|jpe?g|gif|webp|bmp)$/i.test(item.name); }
+function mediaGallery() {
+  if (!mediaGalleryOpen) return '';
+  const images = results.filter(isGalleryImage);
+  const cards = images.map(item => {
+    const thumbnail = mediaThumbnails.get(item.id);
+    const image = thumbnail ? `<img src="data:${thumbnail.mimeType};base64,${thumbnail.content}" alt="${escapeHtml(item.name)}">` : '<span class="gallery-placeholder">未生成</span>';
+    return `<button class="media-card preview-file" data-path="${escapeHtml(item.path)}">${image}<b>${escapeHtml(item.name)}</b><small>${thumbnail?.cached ? '来自本地缓存' : '仅本机缓存'}</small></button>`;
+  }).join('');
+  return `<section class="media-gallery"><header><div><b>图库浏览</b><span>缩略图仅写入应用数据目录，不会改动原图；PDF 首页缩略图需要后续本地渲染器。</span></div><div><button class="quiet" id="build-media-thumbnails" ${isWorking || !images.length ? 'disabled' : ''}>生成当前缩略图</button><button class="quiet" id="clear-thumbnail-cache" ${isWorking ? 'disabled' : ''}>清理缓存</button></div></header>${images.length ? `<div class="media-grid">${cards}</div>` : '<p>当前搜索结果没有可展示的图片。</p>'}</section>`;
+}
+
 function searchPanel() {
   const previousDisabled = searchPage === 0 ? 'disabled' : '';
   const nextDisabled = results.length === 0 || (searchPage + 1) * 30 >= searchTotal ? 'disabled' : '';
@@ -141,7 +156,7 @@ function searchPanel() {
   const semanticNote = appliedSearchMode === 'semantic' ? '语义向量排序（完全本机）' : appliedSearchMode === 'embedding_fallback_fts' ? '未配置 embedding 模型，已回退 FTS' : '关键词 / FTS 搜索';
   const embeddingModel = embeddingModels.find(model => model.active);
   const progressText = embeddingProgress ? `正在建立向量索引：${embeddingProgress.completed}/${embeddingProgress.total}${embeddingProgress.failed ? `，失败 ${embeddingProgress.failed}` : ''}` : embeddingModel ? `当前 embedding：${escapeHtml(embeddingModel.displayName)}${embeddingModel.dimensions ? ` · ${embeddingModel.dimensions} 维` : ''}` : '未配置本地 embedding 模型';
-  return `<section class="single-panel panel"><header><div><small>LOCAL SEARCH</small><h2>本地搜索</h2></div><span class="local-chip">${icons.check} ${semanticNote}</span></header><div class="search-page"><h1>精确查找你的资料。</h1><p>输入名称、路径、备注、标签或已提取正文；不会发送到云端。</p><form id="search-form"><div class="large-search">${icons.search}<input id="search-question" value="${escapeHtml(searchQuery)}" placeholder="例如：游戏、Steam、项目资料"><button type="submit" ${isWorking ? 'disabled' : ''}>搜索</button></div><div class="search-filters"><label>模式 <select id="search-mode"><option value="fts" ${searchMode === 'fts' ? 'selected' : ''}>关键词（FTS）</option><option value="semantic" ${searchMode === 'semantic' ? 'selected' : ''}>语义向量</option></select></label><label>标签 <input class="search-filter" id="search-filter" value="${escapeHtml(searchFilter)}" placeholder="例如：游戏"></label><label>资料夹 <select id="search-folder-filter"><option value="">全部资料夹</option>${folderOptions}</select></label><label>类型 <select id="search-type-filter"><option value="">文件和文件夹</option><option value="file" ${searchTypeFilter === 'file' ? 'selected' : ''}>仅文件</option><option value="folder" ${searchTypeFilter === 'folder' ? 'selected' : ''}>仅文件夹</option></select></label></div></form><section class="semantic-search"><b>本地语义检索</b><span>${progressText}</span><button class="quiet" id="register-embedding-model" ${isWorking ? 'disabled' : ''}>选择 embedding GGUF</button><button class="quiet" id="build-embedding-index" ${isWorking || !embeddingModel ? 'disabled' : ''}>建立 / 更新向量索引</button></section>${resultRows('输入检索词后，结果会在这里显示真实路径。')}<div class="search-paging"><button class="quiet" id="search-page-previous" ${previousDisabled}>上一页</button><span>${searchTotal ? `第 ${searchPage + 1} 页，共 ${searchTotal} 项` : '暂无搜索结果'}</span><button class="quiet" id="search-page-next" ${nextDisabled}>下一页</button></div></div></section>`;
+  return `<section class="single-panel panel"><header><div><small>LOCAL SEARCH</small><h2>本地搜索</h2></div><span class="local-chip">${icons.check} ${semanticNote}</span></header><div class="search-page"><h1>精确查找你的资料。</h1><p>输入名称、路径、备注、标签或已提取正文；不会发送到云端。</p><form id="search-form"><div class="large-search">${icons.search}<input id="search-question" value="${escapeHtml(searchQuery)}" placeholder="例如：游戏、Steam、项目资料"><button type="submit" ${isWorking ? 'disabled' : ''}>搜索</button></div><div class="search-filters"><label>模式 <select id="search-mode"><option value="fts" ${searchMode === 'fts' ? 'selected' : ''}>关键词（FTS）</option><option value="semantic" ${searchMode === 'semantic' ? 'selected' : ''}>语义向量</option></select></label><label>标签 <input class="search-filter" id="search-filter" value="${escapeHtml(searchFilter)}" placeholder="例如：游戏"></label><label>资料夹 <select id="search-folder-filter"><option value="">全部资料夹</option>${folderOptions}</select></label><label>类型 <select id="search-type-filter"><option value="">文件和文件夹</option><option value="file" ${searchTypeFilter === 'file' ? 'selected' : ''}>仅文件</option><option value="folder" ${searchTypeFilter === 'folder' ? 'selected' : ''}>仅文件夹</option></select></label></div></form><section class="semantic-search"><b>本地语义检索</b><span>${progressText}</span><button class="quiet" id="register-embedding-model" ${isWorking ? 'disabled' : ''}>选择 embedding GGUF</button><button class="quiet" id="build-embedding-index" ${isWorking || !embeddingModel ? 'disabled' : ''}>建立 / 更新向量索引</button><button class="quiet" id="toggle-media-gallery">${mediaGalleryOpen ? '收起图库' : '图库浏览'}</button></section>${mediaGallery()}${resultRows('输入检索词后，结果会在这里显示真实路径。')}<div class="search-paging"><button class="quiet" id="search-page-previous" ${previousDisabled}>上一页</button><span>${searchTotal ? `第 ${searchPage + 1} 页，共 ${searchTotal} 项` : '暂无搜索结果'}</span><button class="quiet" id="search-page-next" ${nextDisabled}>下一页</button></div></div></section>`;
 }
 
 function assistantPanel() {
@@ -282,6 +297,18 @@ async function removeFolderReference(folderId: string) { if (!window.confirm('�
 async function searchDocuments(page = 0) { if (!searchQuery) return; isWorking = true; error = ''; render(); try { const result = await invoke<SearchDocumentsResult>(searchMode === 'semantic' ? 'semantic_search' : 'search_documents', { input: { query: searchQuery, tag: searchFilter || undefined, folderId: searchFolderFilter || undefined, itemType: searchTypeFilter || undefined, page } }); results = result.items; searchTotal = result.total; searchPage = result.page; appliedSearchMode = result.searchMode; } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function registerEmbeddingModel() { const selected = await open({ multiple: false, directory: false, filters: [{ name: 'Embedding GGUF 模型', extensions: ['gguf'] }], title: '选择本地 embedding GGUF 模型' }); if (!selected || Array.isArray(selected)) return; isWorking = true; error = ''; render(); try { await invoke<EmbeddingModel>('register_embedding_model', { input: { path: selected } }); embeddingModels = await invoke<EmbeddingModel[]>('list_embedding_models'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function buildEmbeddingIndex() { isWorking = true; error = ''; render(); try { const progress = await invoke<EmbeddingIndexProgress>('build_embedding_index'); embeddingProgress = progress; embeddingModels = await invoke<EmbeddingModel[]>('list_embedding_models'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
+async function buildMediaThumbnails() {
+  isWorking = true; error = ''; render();
+  try {
+    const images = results.filter(isGalleryImage);
+    const built = await Promise.all(images.map(async item => [item.id, await invoke<Thumbnail>('get_thumbnail', { input: { itemId: item.id, path: item.path } })] as const));
+    mediaThumbnails = new Map(built);
+  } catch (reason) { error = String(reason); } finally { isWorking = false; render(); }
+}
+async function clearThumbnailCache() {
+  isWorking = true; error = ''; render();
+  try { await invoke('clear_thumbnail_cache'); mediaThumbnails = new Map(); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); }
+}
 async function saveAgentPreferences() { const autoApplyLowRisk = document.querySelector<HTMLInputElement>('#auto-apply-low-risk')?.checked ?? false; try { agentPreferences = await invoke<AgentPreferences>('save_agent_preferences', { input: { autoApplyLowRisk } }); } catch (reason) { error = String(reason); } render(); }
 async function saveRuntimeSettings(event: SubmitEvent) { event.preventDefault(); const executionMode = document.querySelector<HTMLSelectElement>('#runtime-mode')?.value as RuntimeSettings['executionMode'] ?? 'auto'; const threads = Number(document.querySelector<HTMLInputElement>('#runtime-threads')?.value ?? 4); const contextSize = Number(document.querySelector<HTMLInputElement>('#runtime-context')?.value ?? 4096); isWorking = true; error = ''; render(); try { runtimeSettings = await invoke<RuntimeSettings>('save_runtime_settings', { input: { executionMode, threads, contextSize } }); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function runEnvironmentAcceptance() { isWorking = true; error = ''; render(); try { acceptanceChecks = await invoke<AcceptanceCheck[]>('run_environment_acceptance'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
@@ -391,6 +418,9 @@ function bind() {
   document.querySelector('#register-local-model')?.addEventListener('click', registerLocalModel);
   document.querySelector('#register-embedding-model')?.addEventListener('click', registerEmbeddingModel);
   document.querySelector('#build-embedding-index')?.addEventListener('click', buildEmbeddingIndex);
+  document.querySelector('#toggle-media-gallery')?.addEventListener('click', () => { mediaGalleryOpen = !mediaGalleryOpen; render(); });
+  document.querySelector('#build-media-thumbnails')?.addEventListener('click', buildMediaThumbnails);
+  document.querySelector('#clear-thumbnail-cache')?.addEventListener('click', clearThumbnailCache);
   document.querySelectorAll<HTMLButtonElement>('[data-local-model-id]').forEach(button => button.addEventListener('click', () => selectLocalModel(button.dataset.localModelId ?? '')));
   document.querySelectorAll<HTMLButtonElement>('.delete-local-model').forEach(button => button.addEventListener('click', () => deleteLocalModel(button.dataset.deleteLocalModelId ?? '')));
   document.querySelectorAll<HTMLButtonElement>('[data-refresh-folder-id]').forEach(button => button.addEventListener('click', () => refreshFolderIndex(button.dataset.refreshFolderId ?? '')));

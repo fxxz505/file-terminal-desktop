@@ -62,6 +62,8 @@ const MODEL_URLS: &[(&str, &str)] = &[
 const MODEL_SHA256: &str = "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e";
 const MODEL_FILE: &str = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
 const MAX_PREVIEW_BYTES: u64 = 1_048_576;
+const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_THUMBNAIL_BYTES: usize = 256 * 1024;
 const MAX_CLOUD_REQUEST_BYTES: usize = 48 * 1024;
 const CLOUD_KEYRING_SERVICE: &str = "file-terminal-desktop.cloud-provider";
 const BACKUP_KEYRING_SERVICE: &str = "file-terminal-desktop.encrypted-backup";
@@ -701,6 +703,29 @@ fn app_data_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "无法定位 Windows 本地应用数据目录。".to_string())
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Thumbnail {
+    item_id: String,
+    source_signature: String,
+    mime_type: String,
+    content: String,
+    cached: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailInput {
+    item_id: String,
+    path: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailCacheClearResult {
+    removed: usize,
+}
+
 fn database_key_entry() -> Result<Entry, String> {
     Entry::new(DATABASE_KEYRING_SERVICE, "database-key")
         .map_err(|_| "无法访问 Windows 凭据库。".to_string())
@@ -834,6 +859,16 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(model_id) REFERENCES embedding_models(id)
             );
             CREATE INDEX IF NOT EXISTS item_embeddings_model_idx ON item_embeddings(model_id);
+            CREATE TABLE IF NOT EXISTS thumbnail_cache (
+                item_id TEXT NOT NULL,
+                source_signature TEXT NOT NULL,
+                cache_path TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (item_id, source_signature),
+                FOREIGN KEY(item_id) REFERENCES index_items(id)
+            );
+            CREATE INDEX IF NOT EXISTS thumbnail_cache_item_idx ON thumbnail_cache(item_id);
             CREATE TABLE IF NOT EXISTS metadata_audit (
                 id TEXT PRIMARY KEY,
                 target_type TEXT NOT NULL,
@@ -1396,6 +1431,64 @@ fn source_content_hash(path: &Path) -> Option<String> {
         hasher.update(&buffer[..read]);
     }
     Some(format!("{:x}", hasher.finalize()))
+}
+
+fn source_signature(path: &Path) -> Result<String, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > MAX_THUMBNAIL_SOURCE_BYTES {
+        return Err("图片或 PDF 超过缩略图安全大小限制。".to_string());
+    }
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(modified.to_le_bytes());
+    if let Some(content_hash) = source_content_hash(path) {
+        hasher.update(content_hash.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn thumbnail_cache_dir(data_dir: &Path) -> Result<PathBuf, String> {
+    let directory = data_dir.join("thumbnail-cache");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    Ok(directory)
+}
+
+fn image_thumbnail_bytes(path: &Path) -> Result<(&'static str, Vec<u8>), String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let Some((kind, mime_type)) = preview_mime(&extension) else {
+        return Err("此文件不支持生成缩略图。".to_string());
+    };
+    if kind != "image" {
+        return Err("PDF 缩略图需要本地渲染器，当前不会伪造预览。".to_string());
+    }
+    let image = image::ImageReader::open(path)
+        .map_err(|error| error.to_string())?
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?
+        .decode()
+        .map_err(|_| "无法安全解码该图片。".to_string())?;
+    let thumbnail = image.thumbnail(320, 240);
+    let mut output = Cursor::new(Vec::new());
+    thumbnail
+        .write_to(&mut output, image::ImageFormat::Png)
+        .map_err(|error| error.to_string())?;
+    let bytes = output.into_inner();
+    if bytes.len() > MAX_THUMBNAIL_BYTES {
+        return Err("生成的缩略图超过安全大小限制。".to_string());
+    }
+    let _ = mime_type;
+    Ok(("image/png", bytes))
 }
 
 fn embedding_source_signature(
@@ -4827,6 +4920,67 @@ fn preview_file(path: String, state: State<'_, AppState>) -> Result<FilePreview,
 }
 
 #[tauri::command]
+fn get_thumbnail(input: ThumbnailInput, state: State<'_, AppState>) -> Result<Thumbnail, String> {
+    if input.item_id.trim().is_empty() {
+        return Err("缩略图缺少资料项标识。".to_string());
+    }
+    let target = indexed_path(Path::new(&input.path), &state)?;
+    let signature = source_signature(&target)?;
+    let existing = {
+        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+        connection
+            .query_row(
+                "SELECT cache_path, mime_type FROM thumbnail_cache WHERE item_id = ?1 AND source_signature = ?2",
+                params![input.item_id, signature],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+    };
+    if let Some((cache_path, mime_type)) = existing {
+        if let Ok(bytes) = fs::read(&cache_path) {
+            return Ok(Thumbnail { item_id: input.item_id, source_signature: signature, mime_type, content: BASE64.encode(bytes), cached: true });
+        }
+    }
+    let (mime_type, bytes) = image_thumbnail_bytes(&target)?;
+    let cache_path = thumbnail_cache_dir(&state.data_dir)?.join(format!("{}-{}.png", input.item_id, signature));
+    fs::write(&cache_path, &bytes).map_err(|error| error.to_string())?;
+    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    connection.execute(
+        "DELETE FROM thumbnail_cache WHERE item_id = ?1 AND source_signature != ?2",
+        params![input.item_id, signature],
+    ).map_err(|error| error.to_string())?;
+    connection.execute(
+        "INSERT OR REPLACE INTO thumbnail_cache (item_id, source_signature, cache_path, mime_type, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+        params![input.item_id, signature, cache_path.display().to_string(), mime_type],
+    ).map_err(|error| error.to_string())?;
+    Ok(Thumbnail { item_id: input.item_id, source_signature: signature, mime_type: mime_type.into(), content: BASE64.encode(bytes), cached: false })
+}
+
+#[tauri::command]
+fn clear_thumbnail_cache(state: State<'_, AppState>) -> Result<ThumbnailCacheClearResult, String> {
+    let entries = {
+        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+        let cache_paths = {
+            let mut statement = connection.prepare("SELECT cache_path FROM thumbnail_cache").map_err(|error| error.to_string())?;
+            let paths = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            paths
+        };
+        connection.execute("DELETE FROM thumbnail_cache", []).map_err(|error| error.to_string())?;
+        cache_paths
+    };
+    let mut removed = 0;
+    for path in entries {
+        if fs::remove_file(path).is_ok() { removed += 1; }
+    }
+    Ok(ThumbnailCacheClearResult { removed })
+}
+
+#[tauri::command]
 fn reveal_in_explorer(path: String, state: State<'_, AppState>) -> Result<(), String> {
     let target = indexed_path(Path::new(&path), &state)?;
     let mut command = Command::new("explorer.exe");
@@ -4926,6 +5080,8 @@ fn main() {
             search_documents,
             semantic_search,
             preview_file,
+            get_thumbnail,
+            clear_thumbnail_cache,
             reveal_in_explorer
         ])
         .run(tauri::generate_context!())
