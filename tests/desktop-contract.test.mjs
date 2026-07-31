@@ -608,3 +608,14 @@ test('sidebar separates AI conversation history from assistant configuration and
   assert.match(styles, /\.form-warning/);
   assert.match(styles, /\.control-cluster/);
 });
+
+test('desktop preserves an unreadable local database and opens a recoverable empty database instead of exiting before the window appears', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /fn quarantine_unreadable_database/);
+  assert.match(backend, /database-recovery/);
+  assert.match(backend, /startup_recovery_notice/);
+  assert.match(backend, /无法解锁的本地数据库/);
+  assert.match(shell, /recoveryNotice/);
+  assert.match(shell, /数据库恢复提示/);
+});

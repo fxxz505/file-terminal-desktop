@@ -131,6 +131,7 @@ fn effective_cloud_policy(folder: CloudPolicy, item: CloudPolicy) -> CloudPolicy
 struct AppState {
     database: Mutex<Connection>,
     data_dir: PathBuf,
+    startup_recovery_notice: Option<String>,
     prepared_runs: Mutex<HashMap<String, PreparedCloudRun>>,
     cancelled_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
@@ -872,6 +873,44 @@ fn open_app_database(data_dir: &Path) -> Result<Connection, String> {
         migrate_plaintext_database(&database, &key)?;
     }
     open_encrypted_database(&database, &key)
+}
+
+fn quarantine_unreadable_database(data_dir: &Path, database: &Path) -> Result<PathBuf, String> {
+    let recovery = data_dir
+        .join("database-recovery")
+        .join(format!("unreadable-{}", Uuid::new_v4()));
+    fs::create_dir_all(&recovery).map_err(|error| error.to_string())?;
+    for suffix in ["", "-wal", "-shm"] {
+        let source = PathBuf::from(format!("{}{}", database.display(), suffix));
+        if source.exists() {
+            let file_name = source
+                .file_name()
+                .ok_or_else(|| "无法确定数据库恢复文件名。".to_string())?;
+            fs::rename(&source, recovery.join(file_name)).map_err(|error| {
+                format!("无法保存无法解锁的本地数据库；应用未创建新数据库：{error}")
+            })?;
+        }
+    }
+    Ok(recovery)
+}
+
+fn open_app_database_with_recovery(data_dir: &Path) -> Result<(Connection, Option<String>), String> {
+    match open_app_database(data_dir) {
+        Ok(connection) => Ok((connection, None)),
+        Err(error) if error == "无法使用本机凭据解锁数据库；数据未被修改。" => {
+            let database = data_dir.join("file-terminal.db");
+            let recovery = quarantine_unreadable_database(data_dir, &database)?;
+            let connection = open_app_database(data_dir)?;
+            Ok((
+                connection,
+                Some(format!(
+                    "检测到无法解锁的本地数据库。原文件和 WAL 恢复文件已保留在：{}。资料终端已创建新的空加密数据库；请勿删除恢复目录。",
+                    display_path(&recovery)
+                )),
+            ))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn initialize_database(connection: &Connection) -> Result<(), String> {
@@ -3974,14 +4013,19 @@ fn parse_cloud_advice(content: &str) -> CloudAdvice {
 }
 
 #[tauri::command]
-fn get_privacy_status() -> PrivacyStatus {
-    // 磁盘加密 remains the at-rest protection boundary until an application-level encryption design is approved.
+fn get_privacy_status(state: State<'_, AppState>) -> PrivacyStatus {
     PrivacyStatus {
         database_encrypted: true,
-        message: "资料终端不会在 SQLite 中保存云端 API Key；索引和对话数据库尚未应用级加密。"
-            .to_string(),
-        recommendation: "请启用 Windows 设备加密或 BitLocker 保护本机磁盘。".to_string(),
+        message: state.startup_recovery_notice.clone().unwrap_or_else(|| {
+            "索引和对话数据库使用 SQLCipher 加密；云端 API Key 不写入 SQLite。".to_string()
+        }),
+        recommendation: "请启用 Windows 磁盘加密（BitLocker 或设备加密），并保留 Windows Credential Manager 中的资料终端凭据。".to_string(),
     }
+}
+
+#[tauri::command]
+fn get_startup_recovery_notice(state: State<'_, AppState>) -> Option<String> {
+    state.startup_recovery_notice.clone()
 }
 
 fn backup_key_entry() -> Result<Entry, String> {
@@ -5489,7 +5533,8 @@ fn main() {
     let data_dir = app_data_dir().expect("unable to locate app data directory");
     fs::create_dir_all(&data_dir).expect("unable to create app data directory");
     apply_pending_restore(&data_dir).expect("unable to apply pending restore");
-    let connection = open_app_database(&data_dir).expect("unable to open encrypted database");
+    let (connection, startup_recovery_notice) = open_app_database_with_recovery(&data_dir)
+        .expect("unable to open encrypted database");
     initialize_database(&connection).expect("unable to initialize database");
 
     tauri::Builder::default()
@@ -5499,6 +5544,7 @@ fn main() {
         .manage(AppState {
             database: Mutex::new(connection),
             data_dir,
+            startup_recovery_notice,
             prepared_runs: Mutex::new(HashMap::new()),
             cancelled_runs: Mutex::new(HashMap::new()),
         })
@@ -5548,6 +5594,7 @@ fn main() {
             export_local_governance,
             clear_local_data,
             get_privacy_status,
+            get_startup_recovery_notice,
             get_local_tool_status,
             install_local_tool,
             create_encrypted_backup,
@@ -5592,6 +5639,7 @@ mod preview_tests {
     use super::{
         cosine_similarity, display_path, effective_cloud_policy, incremental_index_folder_inner,
         initialize_database, migrate_plaintext_database, open_encrypted_database, preview_mime,
+        quarantine_unreadable_database,
         safe_relative_path, CloudPolicy,
     };
     use rusqlite::{params, Connection};
@@ -5655,6 +5703,24 @@ mod preview_tests {
         let encrypted = open_encrypted_database(&database, key).unwrap();
         assert_eq!(encrypted.query_row("SELECT value FROM proof", [], |row| row.get::<_, String>(0)).unwrap(), "kept");
         assert!(!fs::read(&database).unwrap().starts_with(b"SQLite format 3\0"));
+    }
+
+    #[test]
+    fn preserves_an_unreadable_database_before_opening_a_new_one() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("file-terminal.db");
+        let wal = temp.path().join("file-terminal.db-wal");
+        let shm = temp.path().join("file-terminal.db-shm");
+        fs::write(&database, b"unreadable database").unwrap();
+        fs::write(&wal, b"wal").unwrap();
+        fs::write(&shm, b"shm").unwrap();
+
+        let recovery = quarantine_unreadable_database(temp.path(), &database).unwrap();
+
+        assert!(!database.exists());
+        assert_eq!(fs::read(recovery.join("file-terminal.db")).unwrap(), b"unreadable database");
+        assert_eq!(fs::read(recovery.join("file-terminal.db-wal")).unwrap(), b"wal");
+        assert_eq!(fs::read(recovery.join("file-terminal.db-shm")).unwrap(), b"shm");
     }
 
     #[test]
