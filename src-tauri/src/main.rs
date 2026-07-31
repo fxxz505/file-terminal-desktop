@@ -345,6 +345,20 @@ struct LocalToolStatus {
     office_converter: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ManagedTool {
+    Tesseract,
+    Ffmpeg,
+    Libreoffice,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedToolInput {
+    tool: ManagedTool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CloudAdvice {
@@ -576,6 +590,8 @@ struct ConversationIdInput {
 struct WorkspaceAdviceInput {
     run_id: String,
     workspace_id: String,
+    #[serde(default)]
+    allow_existing_edits: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3240,8 +3256,14 @@ fn apply_agent_advice_inner(
         {
             return Err("云端建议包含重复文件路径。".to_string());
         }
-        if target.exists() {
-            return Err(format!("拒绝覆盖已有工作区文件：{}", display_path(&target)));
+        if target.exists() && (!input.allow_existing_edits || allow_low_risk_auto_apply) {
+            return Err(format!("拒绝修改已有工作区文件：{}；请在界面中审阅后单独批准。", display_path(&target)));
+        }
+        if target.exists() && (!target.is_file() || fs::metadata(&target).map_err(|error| error.to_string())?.len() > 2 * 1024 * 1024) {
+            return Err(format!("拒绝修改非普通文件或超过 2 MB 的已有文件：{}", display_path(&target)));
+        }
+        if target.exists() && !fs::canonicalize(&target).map_err(|error| error.to_string())?.starts_with(&root) {
+            return Err("拒绝修改指向工作区外部的已有文件。".to_string());
         }
         let parent = target
             .parent()
@@ -3250,23 +3272,36 @@ fn apply_agent_advice_inner(
         targets.push((file, target, parent));
     }
     let mut written = Vec::new();
+    let backup_root = state.data_dir.join("agent-edit-backups").join(&input.run_id);
     for (file, target, parent) in targets {
         fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
         let parent = fs::canonicalize(&parent).map_err(|error| error.to_string())?;
         if !parent.starts_with(&root) {
             return Err("AI 写入被阻止：路径超出工作区。".to_string());
         }
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)
-            .map_err(|_| format!("拒绝覆盖已有工作区文件：{}", display_path(&target)))?;
+        let existed = target.exists();
+        if existed {
+            let relative = safe_relative_path(&file.relative_path)?;
+            let backup = backup_root.join(relative);
+            let backup_parent = backup.parent().ok_or_else(|| "备份路径无效。".to_string())?;
+            fs::create_dir_all(backup_parent).map_err(|error| error.to_string())?;
+            fs::copy(&target, &backup).map_err(|error| format!("无法创建已有文件备份：{error}"))?;
+        }
+        let mut output = if existed {
+            fs::OpenOptions::new().write(true).truncate(true).open(&target)
+                .map_err(|error| format!("无法修改已批准文件：{error}"))?
+        } else {
+            fs::OpenOptions::new().write(true).create_new(true).open(&target)
+                .map_err(|_| format!("拒绝覆盖已有工作区文件：{}", display_path(&target)))?
+        };
         output
             .write_all(file.content.as_bytes())
             .map_err(|error| error.to_string())?;
         written.push(display_path(&target));
     }
-    let feedback = if allow_low_risk_auto_apply {
+    let feedback = if input.allow_existing_edits {
+        "已按本次明确批准修改已有文件；每个原文件已创建可恢复备份，未执行删除、命令或网络操作。"
+    } else if allow_low_risk_auto_apply {
         "已按用户开启的低风险自动执行设置写入受控工作区；未覆盖已有文件、未执行网络或命令。"
     } else {
         "已将经过路径校验的建议写入受控工作区；未覆盖已有文件。"
@@ -3275,7 +3310,7 @@ fn apply_agent_advice_inner(
     Ok(WorkspaceActionResult {
         status: "files_written".to_string(),
         written_files: written,
-        output: "代码已写入；请主动选择只读构建或测试检查。".to_string(),
+        output: if input.allow_existing_edits { "代码已写入；已创建可恢复备份（agent-edit-backups），请主动选择只读构建或测试检查。".to_string() } else { "代码已写入；请主动选择只读构建或测试检查。".to_string() },
     })
 }
 
@@ -4448,7 +4483,7 @@ async fn auto_repair_agent_run(
         run.run.feedback = format!("云端最小修复建议已返回，开始第 {} 次受控写入。", run.repair_attempts);
     }
     add_agent_event(&input.run_id, "repair_advice_received", "已收到最小修复建议；仅验证新建相对路径文件。", &state)?;
-    let write = apply_agent_advice_inner(WorkspaceAdviceInput { run_id: input.run_id.clone(), workspace_id: input.workspace_id.clone() }, false, &state)?;
+    let write = apply_agent_advice_inner(WorkspaceAdviceInput { run_id: input.run_id.clone(), workspace_id: input.workspace_id.clone(), allow_existing_edits: false }, false, &state)?;
     let check = run_workspace_check(WorkspaceCheckInput { workspace_id: input.workspace_id, command: input.command, run_id: Some(input.run_id.clone()) }, state.clone())?;
     let status = if check.status == "check_complete" { "repair_complete" } else { "check_failed" };
     update_agent_run_status(&input.run_id, status, if status == "repair_complete" { "自动最小修复已通过固定检查。" } else { "自动最小修复写入后检查仍失败；未继续覆盖或删除任何文件。" }, &state)?;
@@ -4640,7 +4675,7 @@ async fn run_cloud_collaboration(
         .get_password()
         .map_err(|_| "无法从 Windows 凭据库读取云端密钥。".to_string())?;
     let endpoint = chat_endpoint(&config.base_url);
-    let body = serde_json::json!({"model": config.model, "messages":[{"role":"system","content":"你是受限协作助手。仅返回一个 JSON 对象，字段为 answer、assumptions、files、steps、uncertainties。files 仅可含 pathHint（相对路径）、content、purpose；steps 仅可申请 create_file 或 write_file，risk 只能为 low 或 requires_confirmation。不要调用工具、不要联网、不要要求敏感资料、不要返回绝对路径或命令。"},{"role":"user","content": prepared.request_body}], "temperature":0.2, "max_tokens":1200});
+    let body = serde_json::json!({"model": config.model, "messages":[{"role":"system","content":"你是受限协作助手。仅返回一个 JSON 对象，字段为 answer、assumptions、files、steps、uncertainties。files 仅可含 pathHint（相对路径）、content、purpose；默认只新增文件。若确有必要修改已有文件，必须在 purpose 中明确说明修改原因，并在 steps 中使用 write_file 且 risk=requires_confirmation；本地应用会显示二次确认并建立可恢复备份。不要调用工具、不要联网、不要要求敏感资料、不要返回绝对路径或命令。"},{"role":"user","content": prepared.request_body}], "temperature":0.2, "max_tokens":1200});
     let cancel_token = Arc::new(AtomicBool::new(false));
     state
         .cancelled_runs
@@ -5147,6 +5182,34 @@ fn bounded_command_output(command: &mut Command) -> Result<String, String> {
     }
 }
 
+fn managed_tool_package(tool: &ManagedTool) -> (&'static str, &'static str) {
+    match tool {
+        ManagedTool::Tesseract => ("UB-Mannheim.TesseractOCR", "Tesseract OCR"),
+        ManagedTool::Ffmpeg => ("Gyan.FFmpeg", "FFmpeg"),
+        ManagedTool::Libreoffice => ("TheDocumentFoundation.LibreOffice", "LibreOffice"),
+    }
+}
+
+#[tauri::command]
+fn install_local_tool(input: ManagedToolInput) -> Result<String, String> {
+    let (package_id, label) = managed_tool_package(&input.tool);
+    if !command_available("winget") {
+        return Err("未检测到 Windows 包管理器 winget；请从 Microsoft Store 更新“应用安装程序”后重试。".to_string());
+    }
+    // Only a fixed package allowlist is passed to winget; user input never reaches a shell.
+    let status = Command::new("winget")
+        .args([
+            "install", "--id", package_id, "--exact", "--silent", "--accept-source-agreements",
+            "--accept-package-agreements", "--disable-interactivity",
+        ])
+        .status()
+        .map_err(|_| "无法启动 winget；请确认 Windows 包管理器可用。".to_string())?;
+    if !status.success() {
+        return Err(format!("{label} 安装未完成；winget 未返回成功状态。"));
+    }
+    Ok(format!("{label} 已由 winget 安装。首次使用前请重新打开资料终端，以刷新工具检测。"))
+}
+
 fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<std::process::Output, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| error.to_string())?;
@@ -5486,6 +5549,7 @@ fn main() {
             clear_local_data,
             get_privacy_status,
             get_local_tool_status,
+            install_local_tool,
             create_encrypted_backup,
             stage_encrypted_restore,
             scan_sensitive_index,
