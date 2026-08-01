@@ -135,7 +135,7 @@ test('recovery mode can preserve unreadable data and start a separate empty loca
   assert.match(backend, /fn executable_data_dir/);
   assert.match(backend, /资料终端数据/);
   assert.match(shell, /start_fresh_database/);
-  assert.match(shell, /保留旧数据并新建资料库/);
+  assert.match(shell, /进入软件（新建资料库）/);
   assert.match(workflow, /Package portable bundle/);
 });
 
@@ -718,4 +718,18 @@ test('about page owns signed in-app update actions and restarts after installati
   assert.match(shell, /id="install-update"/);
   assert.match(shell, /update\.downloadAndInstall/);
   assert.match(shell, /await relaunch\(\)/);
+});
+
+test('update checks expose a separate loading state, retry path, and bounded network retries', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(shell, /type UpdateCheckState = 'idle' \| 'checking' \| 'success' \| 'error'/);
+  assert.match(shell, /updateCheckState = 'checking'/);
+  assert.match(shell, /timeout:\s*30000/);
+  assert.match(shell, /attempts < 3/);
+  assert.match(shell, /id="check-update-retry"/);
+  assert.match(shell, /update-check-progress/);
+  assert.match(shell, /GitHub 更新服务/);
+  assert.match(styles, /\.update-check-progress/);
+  assert.match(styles, /\.workspace-extras-grid/);
 });

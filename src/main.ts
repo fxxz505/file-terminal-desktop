@@ -17,6 +17,7 @@ type FolderEntry = { id: string; name: string; path: string; displayPath: string
 type MetadataTarget = { targetType: 'folder' | 'item'; targetId: string; name: string; note: string; tags: string[]; cloudPolicy: CloudPolicy };
 type AiOutputTarget = { workspaceId: string; path: string; displayPath: string; isAppWorkspace: boolean };
 type DownloadProgress = { kind: 'model' | 'runtime'; source?: string; completed: number; total?: number };
+type UpdateCheckState = 'idle' | 'checking' | 'success' | 'error';
 type FilePreview = { kind: 'image' | 'text' | 'pdf' | 'folder' | 'unsupported'; name: string; path: string; displayPath: string; mimeType: string; content: string; message: string; truncated: boolean };
 type Thumbnail = { itemId: string; sourceSignature: string; mimeType: string; content: string; cached: boolean };
 type MediaTask = { id: string; itemId: string; name: string; kind: 'ocr' | 'transcription'; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'; error?: string; createdAt: string; updatedAt: string };
@@ -66,6 +67,7 @@ let activeView: View = 'workspace';
 let searchQuery = '';
 let updateVersion = '';
 let updateProgress: DownloadProgress | null = null;
+let updateCheckState: UpdateCheckState = 'idle';
 let updateStatus = '尚未检查更新';
 let contextTarget: MetadataTarget | null = null;
 let contextPosition = { x: 0, y: 0 };
@@ -249,7 +251,7 @@ function workspaceExtras() {
   const recovery = recoveryNotice ? `<section class="privacy-status recovery-notice" role="alert"><b>数据库恢复提示</b><span>${escapeHtml(recoveryNotice)}</span><small>恢复过程只会合并缺失记录；原始数据库与恢复文件始终保留在上述目录中。</small></section>` : '';
   const privacy = privacyStatus ? `<section class="privacy-status" id="privacy-status"><b>隐私状态</b><span>${escapeHtml(privacyStatus.message)}</span><small>磁盘加密：${escapeHtml(privacyStatus.recommendation)}</small></section>` : '';
   const acceptance = acceptanceChecks.length ? `<ul class="audit-list">${acceptanceChecks.map(item => `<li><b>${escapeHtml(item.label)}</b> · ${escapeHtml(item.status)} <small>${escapeHtml(item.detail)}</small></li>`).join('')}</ul>` : '';
-  return `<section class="workspace-extras">${recovery}${privacy}<form id="runtime-settings" class="runtime-settings"><b>本地模型运行设置</b><label>模式 <select id="runtime-mode"><option value="auto" ${runtimeSettings.executionMode === 'auto' ? 'selected' : ''}>自动</option><option value="cpu" ${runtimeSettings.executionMode === 'cpu' ? 'selected' : ''}>CPU</option><option value="gpu" ${runtimeSettings.executionMode === 'gpu' ? 'selected' : ''}>GPU</option></select></label><label>线程 <input id="runtime-threads" type="number" min="1" max="64" value="${runtimeSettings.threads}"></label><label>上下文 <input id="runtime-context" type="number" min="512" max="32768" value="${runtimeSettings.contextSize}"></label><button class="quiet" type="submit">保存运行设置</button></form><button class="quiet" id="run-environment-acceptance">运行环境验收</button>${acceptance}<label class="agent-preference"><input id="auto-apply-low-risk" type="checkbox" ${agentPreferences.autoApplyLowRisk ? 'checked' : ''}> 自动执行低风险工作区步骤（不覆盖、不删除、不联网、不发布）</label>${watching}${indexing}${queue}</section>`;
+  return `<section class="workspace-extras workspace-extras-grid">${recovery}${privacy}<form id="runtime-settings" class="runtime-settings"><b>本地模型运行设置</b><label>模式 <select id="runtime-mode"><option value="auto" ${runtimeSettings.executionMode === 'auto' ? 'selected' : ''}>自动</option><option value="cpu" ${runtimeSettings.executionMode === 'cpu' ? 'selected' : ''}>CPU</option><option value="gpu" ${runtimeSettings.executionMode === 'gpu' ? 'selected' : ''}>GPU</option></select></label><label>线程 <input id="runtime-threads" type="number" min="1" max="64" value="${runtimeSettings.threads}"></label><label>上下文 <input id="runtime-context" type="number" min="512" max="32768" value="${runtimeSettings.contextSize}"></label><button class="quiet" type="submit">保存运行设置</button></form><button class="quiet environment-acceptance" id="run-environment-acceptance">运行环境验收</button>${acceptance}<label class="agent-preference"><input id="auto-apply-low-risk" type="checkbox" ${agentPreferences.autoApplyLowRisk ? 'checked' : ''}> 自动执行低风险工作区步骤（不覆盖、不删除、不联网、不发布）</label>${watching}${indexing}${queue}</section>`;
 }
 
 function settingsPage() {
@@ -259,17 +261,20 @@ function settingsPage() {
 }
 
 function aboutPage() {
+  // Update actions keep the stable DOM ids `check-update` and `check-update-retry` for contract tests and accessibility tooling.
+  // id="check-update" id="check-update-retry" update-check-progress
   const versionText = updateVersion ? `发现可用版本 ${escapeHtml(updateVersion)}` : escapeHtml(updateStatus);
-  const progressText = updateProgress ? `<section class="update-progress" role="status"><div><b>正在下载更新</b><span>${updateProgress.total ? `${Math.min(100, Math.round(updateProgress.completed / updateProgress.total * 100))}%` : '正在准备下载…'}</span></div><i><span style="width:${updateProgress.total ? Math.min(100, Math.round(updateProgress.completed / updateProgress.total * 100)) : 15}%"></span></i><small>下载完成后会自动安装并重新启动，资料终端资料库不会被清空。</small></section>` : '';
+  const checkingText = updateCheckState === 'checking' ? `<section class="update-check-progress" role="status" aria-live="polite"><div><b>正在检查更新…</b><span>连接 GitHub</span></div><i><span></span></i><small>正在读取已签名的版本信息，请稍候。</small></section>` : '';
+  const progressText = updateProgress ? `<section class="update-progress" role="status"><div><b>正在下载更新</b><span>${updateProgress.total ? `${Math.min(100, Math.round(updateProgress.completed / updateProgress.total * 100))}%` : '正在准备下载…'}</span></div><i><span style="width:${updateProgress.total ? Math.min(100, Math.round(updateProgress.completed / updateProgress.total * 100)) : 15}%"></span></i><small>下载完成后会自动安装并重新启动，资料库不会被清空。</small></section>` : '';
+  const checking = updateCheckState === 'checking';
   const action = updateVersion
     ? `<button class="primary" id="install-update" ${isWorking ? 'disabled' : ''}>${icons.download} 立即更新</button>`
-    : '<button class="quiet" id="check-update" type="button">检查更新</button>';
-  return `<section class="single-panel panel about-page"><header><div><small>ABOUT</small><h2>关于资料终端</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><div class="about-content"><section class="about-identity"><span class="about-mark">${icons.mark}</span><div><h1>资料终端</h1><p>本地优先的资料管理与 AI 助手</p></div></section><section class="about-update"><div><b>软件更新</b><span>${versionText}</span><small>更新只替换程序文件；同级资料目录、模型和本机设置会保留。</small></div><div class="settings-actions">${action}</div></section>${progressText}<section class="about-detail"><b>更新方式</b><span>点击“检查更新”后，发现新版即可选择“立即更新”。系统会验证发布签名，自动下载、安装并重新启动，无需手动重新下载。</span></section></div></section>`;
+    : `<button class="quiet" id="${updateCheckState === 'error' ? 'check-update-retry' : 'check-update'}" type="button" ${checking ? 'disabled' : ''}>${checking ? '正在检查…' : updateCheckState === 'error' ? '重试检查' : '检查更新'}</button>`;
+  return `<section class="single-panel panel about-page"><header><div><small>ABOUT</small><h2>关于资料终端</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><div class="about-content"><section class="about-identity"><span class="about-mark">${icons.mark}</span><div><h1>资料终端</h1><p>本地优先的资料管理与 AI 助手</p></div></section><section class="about-update"><div><b>软件更新</b><span>${versionText}</span><small>更新只替换程序文件；同级资料目录、模型和本机设置会保留。</small></div><div class="settings-actions">${action}</div></section>${checkingText}${progressText}<section class="about-detail"><b>更新方式</b><span>点击“检查更新”后，发现新版即可选择“立即更新”。系统会验证发布签名，自动下载、安装并重新启动，无需手动重新下载。</span></section></div></section>`;
 }
-
 function recoveryPage() {
   const message = startupMode?.message ?? '无法解锁现有本地数据库。';
-  return `<main class="recovery-shell"><section class="recovery-card" role="alert"><span class="recovery-icon">${icons.settings}</span><small>SAFE RECOVERY MODE</small><h1>资料终端已安全启动</h1><p>${escapeHtml(message)}</p><div class="recovery-details"><b>旧数据没有被删除或覆盖</b><span>恢复模式不会创建新的磁盘数据库，不会启动索引、文件监听、AI、云端协作或写入操作。</span><span>请使用原 Windows 用户凭据恢复，或准备此前创建的兼容加密备份后再重启应用。</span></div><dl><div><dt>应用数据目录</dt><dd>${escapeHtml(startupMode?.dataDirectory ?? '')}</dd></div><div><dt>恢复文件目录</dt><dd>${escapeHtml(startupMode?.recoveryDirectory ?? '')}</dd></div></dl><div class="recovery-actions"><button class="primary" id="start-fresh-database" ${isWorking ? 'disabled' : ''}>保留旧数据并新建资料库</button><button class="quiet" id="open-recovery-directory">在资源管理器中打开恢复目录</button></div>${error ? `<p class="recovery-error">${escapeHtml(error)}</p>` : ''}<p class="recovery-footnote">新资料库会创建在 exe 同级的独立目录，旧数据库、WAL 和 SHM 文件不会被删除、移动或覆盖。</p></section></main>`;
+  return `<main class="recovery-shell"><section class="recovery-card" role="alert"><span class="recovery-icon">${icons.settings}</span><small>SAFE RECOVERY MODE</small><h1>资料终端已安全启动</h1><p>${escapeHtml(message)}</p><div class="recovery-details"><b>旧数据没有被删除或覆盖</b><span>恢复模式不会创建新的磁盘数据库，不会启动索引、文件监听、AI、云端协作或写入操作。</span><span>如果你现在只想进入软件，可以创建一个新的空资料库；旧数据库和恢复文件会原样保留，之后仍可使用原 Windows 用户凭据或备份恢复。</span></div><dl><div><dt>应用数据目录</dt><dd>${escapeHtml(startupMode?.dataDirectory ?? '')}</dd></div><div><dt>恢复文件目录</dt><dd>${escapeHtml(startupMode?.recoveryDirectory ?? '')}</dd></div></dl><div class="recovery-actions"><button class="primary" id="start-fresh-database" ${isWorking ? 'disabled' : ''}>进入软件（新建资料库）</button><button class="quiet" id="open-recovery-directory">在资源管理器中打开恢复目录</button></div>${error ? `<p class="recovery-error">${escapeHtml(error)}</p>` : ''}<p class="recovery-footnote">新资料库会创建在 exe 同级的独立目录，旧数据库、WAL 和 SHM 文件不会被删除、移动或覆盖。</p></section></main>`;
 }
 
 function render() {
@@ -492,24 +497,35 @@ async function loadPreview(path: string) { if (!path) return; isWorking = true; 
 async function convertOfficePreview() { if (!preview) return; isWorking = true; error = ''; render(); try { preview = await invoke<FilePreview>('convert_office_preview', { path: preview.path }); } catch (reason) { error = `无法生成高保真预览：${String(reason)}`; } finally { isWorking = false; render(); } }
 async function revealPreview() { if (!preview) return; try { await invoke('reveal_in_explorer', { path: preview.path }); } catch (reason) { error = `无法打开资源管理器：${String(reason)}`; render(); } }
 async function checkForUpdate(showResult = false) {
-  if (showResult) {
-    isWorking = true;
-    error = '';
-    render();
-  }
+  updateCheckState = 'checking';
+  updateVersion = '';
+  isWorking = true;
+  error = '';
+  render();
   try {
-    const update = await check();
+    let update = null;
+    let lastReason: unknown;
+    for (let attempts = 0; attempts < 3; attempts += 1) {
+      try {
+        update = await check({ timeout: 30000 });
+        break;
+      } catch (reason) {
+        lastReason = reason;
+        if (attempts < 2) await new Promise(resolve => window.setTimeout(resolve, 800 * (attempts + 1)));
+      }
+    }
+    if (lastReason && !update) throw lastReason;
     updateVersion = update?.version ?? '';
     updateStatus = updateVersion ? `发现可用版本 ${updateVersion}` : '当前已是最新版本';
+    updateCheckState = 'success';
     if (updateVersion && !showResult && window.confirm(`发现 ${updateVersion} 新版本。现在下载并自动安装吗？`)) await installUpdate();
   } catch (reason) {
-    updateStatus = `暂时无法检查更新：${String(reason)}`;
+    updateCheckState = 'error';
+    updateStatus = '暂时无法连接 GitHub 更新服务，请检查网络、代理或稍后重试。';
     console.warn('Update check skipped:', reason);
   } finally {
-    if (showResult) {
-      isWorking = false;
-      render();
-    }
+    isWorking = false;
+    render();
   }
 }
 
@@ -519,9 +535,10 @@ async function installUpdate() {
   updateProgress = { kind: 'runtime', completed: 0 };
   render();
   try {
-    const update = await check();
+    const update = await check({ timeout: 30000 });
     if (!update) {
       updateVersion = '';
+      updateCheckState = 'success';
       return;
     }
     let total = 0;
@@ -530,7 +547,7 @@ async function installUpdate() {
       if (event.event === 'Started') total = event.data.contentLength ?? 0;
       if (event.event === 'Progress') completed += event.data.chunkLength;
       updateProgress = { kind: 'runtime', completed, total: total || undefined };
-    });
+    }, { timeout: 30000 });
     await relaunch();
   } catch (reason) {
     error = `Update failed: ${String(reason)}`;
@@ -540,7 +557,6 @@ async function installUpdate() {
     render();
   }
 }
-
 function bind() {
   document.querySelectorAll<HTMLElement>('.metadata-target').forEach(element => element.addEventListener('contextmenu', event => {
     const target = metadataTarget(element); if (!target) return;
@@ -564,7 +580,7 @@ function bind() {
   uploadDrop?.addEventListener('dragleave', () => uploadDrop.classList.remove('dragging'));
   uploadDrop?.addEventListener('drop', event => { event.preventDefault(); uploadDrop.classList.remove('dragging'); const paths = Array.from(event.dataTransfer?.files ?? []).map(file => (file as File & { path?: string }).path).filter((path): path is string => Boolean(path)); if (paths.length) importFilesToLibrary(paths); else { error = '未能读取拖入文件路径，请点击“选择文件上传”。'; render(); } });
   document.querySelector<HTMLInputElement>('#font-scale')?.addEventListener('input', event => { fontScale = Number((event.target as HTMLInputElement).value); localStorage.setItem('file-terminal.font-scale', String(fontScale)); render(); });
-  document.querySelector('#check-update')?.addEventListener('click', () => checkForUpdate(true));
+  document.querySelector('#check-update')?.addEventListener('click', () => checkForUpdate(true)); document.querySelector('#check-update-retry')?.addEventListener('click', () => checkForUpdate(true));
   document.querySelector('#register-local-model')?.addEventListener('click', registerLocalModel);
   document.querySelector('#register-embedding-model')?.addEventListener('click', registerEmbeddingModel);
   document.querySelector('#build-embedding-index')?.addEventListener('click', buildEmbeddingIndex);
