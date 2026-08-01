@@ -26,7 +26,7 @@ use std::{
     thread,
     time::{Duration, SystemTime},
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -75,6 +75,10 @@ const CLOUD_KEYRING_SERVICE: &str = "file-terminal-desktop.cloud-provider";
 const BACKUP_KEYRING_SERVICE: &str = "file-terminal-desktop.encrypted-backup";
 const DATABASE_KEYRING_SERVICE: &str = "file-terminal-desktop.sqlcipher";
 const DATABASE_KEY_BACKUP_FILE: &str = "database-key.dpapi";
+const DATA_LOCATION_POINTER_FILE: &str = "data-location.json";
+const PENDING_DATA_MIGRATION_FILE: &str = "pending-data-migration.json";
+const DATA_LOCATION_SETTINGS_FOLDER: &str = "资料终端-bootstrap";
+const PORTABLE_DATA_FOLDER: &str = "资料终端数据";
 const BACKUP_MAGIC: &[u8] = b"FTBK1";
 const MAX_GENERATED_FILES: usize = 40;
 const MAX_GENERATED_FILE_BYTES: usize = 256 * 1024;
@@ -133,6 +137,7 @@ struct AppState {
     database: Mutex<Connection>,
     data_dir: PathBuf,
     startup_recovery_notice: Option<String>,
+    recovery_mode: bool,
     prepared_runs: Mutex<HashMap<String, PreparedCloudRun>>,
     cancelled_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
@@ -290,6 +295,35 @@ struct PrivacyStatus {
     database_encrypted: bool,
     message: String,
     recommendation: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupMode {
+    recovery_required: bool,
+    message: Option<String>,
+    data_directory: String,
+    recovery_directory: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataDirectoryStatus {
+    path: String,
+    source: String,
+    portable_available: bool,
+    restart_required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DataDirectoryInput {
+    path: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DataLocationRecord {
+    path: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -728,10 +762,118 @@ fn display_path(path: &Path) -> String {
         .unwrap_or(value)
 }
 
-fn app_data_dir() -> Result<PathBuf, String> {
+fn default_app_data_dir() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|path| path.join(APP_FOLDER))
         .ok_or_else(|| "无法定位 Windows 本地应用数据目录。".to_string())
+}
+
+fn data_location_settings_dir() -> Result<PathBuf, String> {
+    dirs::data_local_dir()
+        .map(|path| path.join(DATA_LOCATION_SETTINGS_FOLDER))
+        .ok_or_else(|| "无法定位 Windows 本地设置目录。".to_string())
+}
+
+fn data_location_pointer_path() -> Result<PathBuf, String> {
+    Ok(data_location_settings_dir()?.join(DATA_LOCATION_POINTER_FILE))
+}
+
+fn pending_data_migration_path() -> Result<PathBuf, String> {
+    Ok(data_location_settings_dir()?.join(PENDING_DATA_MIGRATION_FILE))
+}
+
+fn executable_directory() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+fn portable_data_dir() -> Option<PathBuf> {
+    executable_directory().and_then(|directory| directory.parent().map(|parent| parent.join(PORTABLE_DATA_FOLDER)))
+}
+
+fn has_application_data(directory: &Path) -> bool {
+    directory.join("file-terminal.db").is_file()
+        || directory.join(DATABASE_KEY_BACKUP_FILE).is_file()
+        || directory.join("models").is_dir()
+        || directory.join("runtime").is_dir()
+        || directory.join("uploaded-files").is_dir()
+}
+
+fn is_writable_directory(directory: &Path) -> bool {
+    if fs::create_dir_all(directory).is_err() {
+        return false;
+    }
+    let probe = directory.join(format!(".write-probe-{}", Uuid::new_v4()));
+    File::create(&probe).and_then(|file| file.sync_all()).is_ok() && fs::remove_file(probe).is_ok()
+}
+
+fn read_data_location_record(path: &Path) -> Option<PathBuf> {
+    let record = fs::read_to_string(path).ok().and_then(|value| serde_json::from_str::<DataLocationRecord>(&value).ok())?;
+    let target = PathBuf::from(record.path);
+    target.is_absolute().then_some(target)
+}
+
+fn write_data_location_record(path: &Path, target: &Path) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| "数据位置设置路径无效。".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension(format!("{}.pending", Uuid::new_v4()));
+    let content = serde_json::to_vec(&DataLocationRecord { path: target.display().to_string() }).map_err(|error| error.to_string())?;
+    fs::write(&temporary, content).map_err(|error| error.to_string())?;
+    fs::rename(&temporary, path).map_err(|error| error.to_string())
+}
+
+fn copy_data_directory(source: &Path, target: &Path) -> Result<(), String> {
+    for entry in WalkDir::new(source).follow_links(false) {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let relative = entry.path().strip_prefix(source).map_err(|error| error.to_string())?;
+        if relative.as_os_str().is_empty() || relative.components().any(|component| !matches!(component, Component::Normal(_))) {
+            continue;
+        }
+        let destination = target.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::copy(entry.path(), &destination).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_pending_data_migration() -> Result<(), String> {
+    let pending = pending_data_migration_path()?;
+    let Some(target) = read_data_location_record(&pending) else { return Ok(()); };
+    if !is_writable_directory(&target) {
+        return Err("新的数据目录不可写入；未迁移或删除任何旧数据。".to_string());
+    }
+    if has_application_data(&target) {
+        return Err("新的数据目录必须为空，避免覆盖已有资料。".to_string());
+    }
+    let source = app_data_dir()?;
+    if source != target && has_application_data(&source) {
+        copy_data_directory(&source, &target)?;
+    }
+    write_data_location_record(&data_location_pointer_path()?, &target)?;
+    fs::remove_file(&pending).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn app_data_dir() -> Result<PathBuf, String> {
+    if let Some(target) = read_data_location_record(&data_location_pointer_path()?) {
+        return Ok(target);
+    }
+    let default = default_app_data_dir()?;
+    // Existing installs keep using their established Windows data folder after an executable update.
+    if has_application_data(&default) {
+        return Ok(default);
+    }
+    if let Some(portable) = portable_data_dir() {
+        if has_application_data(&portable) || is_writable_directory(&portable) {
+            return Ok(portable);
+        }
+    }
+    Ok(default)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1215,9 +1357,24 @@ fn restore_quarantined_databases(connection: &Connection, data_dir: &Path) -> Op
     }
 }
 
-fn open_app_database_with_recovery(data_dir: &Path) -> Result<(Connection, Option<String>), String> {
+fn recovery_mode_connection(error: String) -> Result<(Connection, Option<String>, bool), String> {
+    // The in-memory database exists only to keep the Tauri shell alive. It is never written to disk.
+    let connection = Connection::open_in_memory().map_err(|connection_error| connection_error.to_string())?;
+    initialize_database(&connection)?;
+    Ok((
+        connection,
+        Some(format!(
+            "无法解锁现有本地数据库；应用已进入安全恢复模式，未创建、替换或修改任何数据库文件。{error}"
+        )),
+        true,
+    ))
+}
+
+fn open_app_database_with_recovery(data_dir: &Path) -> Result<(Connection, Option<String>, bool), String> {
     match open_app_database(data_dir) {
-        Ok(connection) => Ok((connection, None)),
+        Ok(connection) => Ok((connection, None, false)),
+        // Any failure against an existing database must preserve it and still show the user a recovery path.
+        Err(error) if data_dir.join("file-terminal.db").is_file() => recovery_mode_connection(error),
         Err(error) => Err(error),
     }
 }
@@ -4386,6 +4543,79 @@ fn get_startup_recovery_notice(state: State<'_, AppState>) -> Option<String> {
     state.startup_recovery_notice.clone()
 }
 
+#[tauri::command]
+fn get_startup_mode(state: State<'_, AppState>) -> StartupMode {
+    StartupMode {
+        recovery_required: state.recovery_mode,
+        message: state.startup_recovery_notice.clone(),
+        data_directory: display_path(&state.data_dir),
+        recovery_directory: display_path(&state.data_dir.join("database-recovery")),
+    }
+}
+
+#[tauri::command]
+fn get_data_directory_status(state: State<'_, AppState>) -> DataDirectoryStatus {
+    let pointer = data_location_pointer_path().ok().and_then(|path| read_data_location_record(&path));
+    let portable = portable_data_dir();
+    let source = if pointer.as_deref() == Some(state.data_dir.as_path()) {
+        "custom"
+    } else if portable.as_deref() == Some(state.data_dir.as_path()) {
+        "portable"
+    } else {
+        "windows_local"
+    };
+    DataDirectoryStatus {
+        path: display_path(&state.data_dir),
+        source: source.to_string(),
+        portable_available: portable.as_deref().is_some_and(is_writable_directory),
+        restart_required: pending_data_migration_path().ok().and_then(|path| read_data_location_record(&path)).is_some(),
+    }
+}
+
+#[tauri::command]
+fn set_data_directory(input: DataDirectoryInput, state: State<'_, AppState>) -> Result<DataDirectoryStatus, String> {
+    if state.recovery_mode {
+        return Err("安全恢复模式下不能迁移数据目录。请先恢复可用数据库。".to_string());
+    }
+    let selected = PathBuf::from(input.path);
+    if !selected.is_absolute() {
+        return Err("请选择绝对路径的数据目录。".to_string());
+    }
+    fs::create_dir_all(&selected).map_err(|error| format!("无法创建数据目录：{error}"))?;
+    let target = fs::canonicalize(&selected).map_err(|error| error.to_string())?;
+    let current = fs::canonicalize(&state.data_dir).unwrap_or_else(|_| state.data_dir.clone());
+    if target == current {
+        return Err("所选目录已经是当前数据目录。".to_string());
+    }
+    if target.starts_with(&current) || current.starts_with(&target) {
+        return Err("不能选择当前数据目录或其父/子目录，避免迁移时递归复制。".to_string());
+    }
+    if fs::read_dir(&target).map_err(|error| error.to_string())?.next().is_some() {
+        return Err("新的数据目录必须为空，避免覆盖已有资料。".to_string());
+    }
+    if !is_writable_directory(&target) {
+        return Err("新的数据目录不可写入。".to_string());
+    }
+    write_data_location_record(&pending_data_migration_path()?, &target)?;
+    Ok(DataDirectoryStatus {
+        path: display_path(&current),
+        source: "pending_migration".to_string(),
+        portable_available: portable_data_dir().as_deref().is_some_and(is_writable_directory),
+        restart_required: true,
+    })
+}
+
+#[tauri::command]
+fn reveal_recovery_data_directory(state: State<'_, AppState>) -> Result<(), String> {
+    let recovery_root = state.data_dir.join("database-recovery");
+    let target = if recovery_root.is_dir() { recovery_root } else { state.data_dir.clone() };
+    Command::new("explorer.exe")
+        .arg(target)
+        .spawn()
+        .map_err(|error| format!("无法打开恢复目录：{error}"))?;
+    Ok(())
+}
+
 fn backup_key_entry() -> Result<Entry, String> {
     Entry::new(BACKUP_KEYRING_SERVICE, "database-backup-key")
         .map_err(|_| "无法访问 Windows 凭据库。".to_string())
@@ -5891,14 +6121,22 @@ fn reveal_in_explorer(path: String, state: State<'_, AppState>) -> Result<(), St
 }
 
 fn main() {
+    let data_migration_notice = apply_pending_data_migration().err().map(|error| {
+        format!("数据目录迁移没有完成；旧目录保持不变，应用继续使用它。{error}")
+    });
     let data_dir = app_data_dir().expect("unable to locate app data directory");
     fs::create_dir_all(&data_dir).expect("unable to create app data directory");
     apply_pending_restore(&data_dir).expect("unable to apply pending restore");
-    let (connection, startup_recovery_notice) = open_app_database_with_recovery(&data_dir)
+    let (connection, startup_recovery_notice, recovery_mode) = open_app_database_with_recovery(&data_dir)
         .expect("unable to open encrypted database");
-    initialize_database(&connection).expect("unable to initialize database");
-    let startup_recovery_notice = restore_quarantined_databases(&connection, &data_dir)
-        .or(startup_recovery_notice);
+    if !recovery_mode {
+        initialize_database(&connection).expect("unable to initialize database");
+    }
+    let startup_recovery_notice = if recovery_mode {
+        startup_recovery_notice
+    } else {
+        restore_quarantined_databases(&connection, &data_dir).or(startup_recovery_notice)
+    }.or(data_migration_notice);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -5908,13 +6146,17 @@ fn main() {
             database: Mutex::new(connection),
             data_dir,
             startup_recovery_notice,
+            recovery_mode,
             prepared_runs: Mutex::new(HashMap::new()),
             cancelled_runs: Mutex::new(HashMap::new()),
         })
         .setup(|app| {
-            start_folder_change_watch(app.handle().clone(), app_data_dir()?);
-            start_index_worker(app.handle().clone(), app_data_dir()?);
-            start_media_worker(app.handle().clone(), app_data_dir()?);
+            let state = app.state::<AppState>();
+            if !state.recovery_mode {
+                start_folder_change_watch(app.handle().clone(), app_data_dir()?);
+                start_index_worker(app.handle().clone(), app_data_dir()?);
+                start_media_worker(app.handle().clone(), app_data_dir()?);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -5959,6 +6201,10 @@ fn main() {
             clear_local_data,
             get_privacy_status,
             get_startup_recovery_notice,
+            get_startup_mode,
+            get_data_directory_status,
+            set_data_directory,
+            reveal_recovery_data_directory,
             get_local_tool_status,
             install_local_tool,
             create_encrypted_backup,
@@ -6003,11 +6249,11 @@ mod preview_tests {
     use super::{
         cosine_similarity, display_path, effective_cloud_policy, incremental_index_folder_inner,
         initialize_database, migrate_plaintext_database, open_encrypted_database, preview_mime,
-        read_database_key_backup, restore_quarantined_database, save_database_key_backup,
+        read_database_key_backup, recovery_mode_connection, restore_quarantined_database, save_database_key_backup,
         safe_relative_path, unique_library_file_path, CloudPolicy,
     };
     use rusqlite::{params, Connection};
-    use std::{fs, path::Path, time::Instant};
+    use std::{fs, path::{Path, PathBuf}, time::Instant};
     use tempfile::tempdir;
 
     #[test]
@@ -6045,6 +6291,46 @@ mod preview_tests {
         let distant = cosine_similarity(&query, &[0.0, 1.0, 0.0]).unwrap();
         assert!(close > distant);
         assert!(cosine_similarity(&query, &[1.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn unreadable_existing_database_uses_an_in_memory_recovery_connection() {
+        let (connection, notice, recovery_mode) = recovery_mode_connection(
+            "已有本地数据库但找不到可用密钥".to_string(),
+        ).unwrap();
+        assert!(recovery_mode);
+        assert!(notice.unwrap().contains("安全恢复模式"));
+        assert_eq!(
+            connection.query_row("SELECT COUNT(*) FROM folder_refs", [], |row| row.get::<_, i64>(0)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn application_data_copy_preserves_database_key_and_models_without_removing_source() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::create_dir_all(source.join("models")).unwrap();
+        fs::write(source.join("file-terminal.db"), "database").unwrap();
+        fs::write(source.join("database-key.dpapi"), "key").unwrap();
+        fs::write(source.join("models").join("model.gguf"), "model").unwrap();
+
+        super::copy_data_directory(&source, &target).unwrap();
+
+        assert!(super::has_application_data(&target));
+        assert_eq!(fs::read(target.join("database-key.dpapi")).unwrap(), b"key");
+        assert_eq!(fs::read(source.join("file-terminal.db")).unwrap(), b"database");
+    }
+
+    #[test]
+    fn data_location_records_require_absolute_paths() {
+        let temp = tempdir().unwrap();
+        let pointer = temp.path().join("location.json");
+        super::write_data_location_record(&pointer, &PathBuf::from(r"C:\\资料终端数据")).unwrap();
+        assert_eq!(super::read_data_location_record(&pointer).unwrap(), PathBuf::from(r"C:\\资料终端数据"));
+        fs::write(&pointer, r#"{"path":"relative"}"#).unwrap();
+        assert!(super::read_data_location_record(&pointer).is_none());
     }
 
     #[test]

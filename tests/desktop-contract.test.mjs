@@ -92,6 +92,36 @@ test('Windows release starts without a console window', async () => {
   assert.match(source, /cfg_attr\(not\(debug_assertions\), windows_subsystem = "windows"\)/);
 });
 
+test('an unreadable encrypted database opens a safe recovery-only shell instead of exiting', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /struct StartupMode/);
+  assert.match(backend, /recovery_mode: bool/);
+  assert.match(backend, /fn recovery_mode_connection/);
+  assert.match(backend, /Connection::open_in_memory\(\)/);
+  assert.match(backend, /fn get_startup_mode/);
+  assert.match(backend, /fn reveal_recovery_data_directory/);
+  assert.match(backend, /if !state\.recovery_mode/);
+  assert.match(shell, /get_startup_mode/);
+  assert.match(shell, /recoveryPage/);
+  assert.match(shell, /reveal_recovery_data_directory/);
+});
+
+test('application data survives executable updates through a portable data root and a user-selected data location', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /const DATA_LOCATION_POINTER_FILE/);
+  assert.match(backend, /fn portable_data_dir/);
+  assert.match(backend, /fn has_application_data/);
+  assert.match(backend, /fn get_data_directory_status/);
+  assert.match(backend, /fn set_data_directory/);
+  assert.match(backend, /copy_data_directory/);
+  assert.match(backend, /数据目录必须为空/);
+  assert.match(shell, /get_data_directory_status/);
+  assert.match(shell, /set_data_directory/);
+  assert.match(shell, /choose-data-directory/);
+});
+
 test('assistant contract includes a deterministic fallback for game intent', async () => {
   const source = await readFile(new URL('../src-tauri/src/assistant.rs', import.meta.url), 'utf8');
   assert.match(source, /normalized\.contains\("游戏"\) \|\| normalized\.contains\("玩"\)/);

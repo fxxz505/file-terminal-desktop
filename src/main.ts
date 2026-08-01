@@ -46,6 +46,8 @@ type AgentEvidenceReport = { runId: string; status: string; finalEvidence: strin
 type EncryptedBackup = { path: string; displayPath: string; createdAt: string; databaseBytes: number };
 type SensitiveFinding = { itemId: string; name: string; displayPath: string; category: string; matchCount: number };
 type MetadataAuditEntry = { id: string; targetType: string; targetId: string; action: string; oldPolicy?: string; newPolicy?: string; createdAt: string };
+type StartupMode = { recoveryRequired: boolean; message?: string; dataDirectory: string; recoveryDirectory: string };
+type DataDirectoryStatus = { path: string; source: 'portable' | 'custom' | 'windows_local' | 'pending_migration'; portableAvailable: boolean; restartRequired: boolean };
 type View = 'workspace' | 'search' | 'assistant' | 'conversations' | 'settings';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -107,6 +109,8 @@ let mediaTasks: MediaTask[] = [];
 let mediaSettings: MediaSettings = { whisperModelPath: '', ocrLanguage: 'chi_sim+eng' };
 let localTools: LocalToolStatus = { pdfText: true, ffmpeg: false, ocr: false, transcription: false, officeConverter: false };
 let formWarning: { target: 'cloud' | 'media' | 'rules'; message: string } | null = null;
+let startupMode: StartupMode | null = null;
+let dataDirectoryStatus: DataDirectoryStatus | null = null;
 const folderRefreshTimers = new Map<string, number>();
 let embeddingUpdateTimer: number | null = null;
 let fontScale = Number(localStorage.getItem('file-terminal.font-scale') ?? '100');
@@ -250,10 +254,24 @@ function workspaceExtras() {
 
 function settingsPage() {
   const versionText = updateVersion ? `发现可用版本 ${escapeHtml(updateVersion)}` : escapeHtml(updateStatus);
-  return `<section class="single-panel panel"><header><div><small>PREFERENCES</small><h2>设置</h2></div><span class="local-chip">${icons.check} 保存在本机</span></header><div class="settings-page"><section class="settings-section"><div><b>界面文字大小</b><span>调整资料终端的阅读密度；设置仅保存在当前 Windows 用户的本机浏览器存储中。</span></div><div class="font-scale-control"><input id="font-scale" type="range" min="90" max="125" step="5" value="${fontScale}" aria-label="界面文字大小"><output id="font-scale-value">${fontScale}%</output></div></section><section class="settings-section"><div><b>软件更新</b><span>${versionText}</span></div><div class="settings-actions"><button class="quiet" id="check-update" ${isWorking ? 'disabled' : ''}>检查更新</button>${updateVersion ? '<button class="primary" id="install-update">下载并安装</button>' : ''}</div></section><section class="settings-section settings-note"><div><b>隐私与数据位置</b><span>文件上传副本保存在资料终端的本地应用数据目录；文件夹接入保持原位置引用。云端权限仅决定 Agent 可否按规则发送经过筛选的资料。</span></div></section></div></section>`;
+  const source = ({ portable: '程序旁数据目录', custom: '自定义数据目录', windows_local: 'Windows 本地数据目录', pending_migration: '等待迁移' } as const)[dataDirectoryStatus?.source ?? 'windows_local'];
+  const dataPath = dataDirectoryStatus?.path ?? '正在读取…';
+  const migrationHint = dataDirectoryStatus?.restartRequired ? '<span class="data-migration-pending">已登记迁移：关闭并重新打开应用后，资料、密钥、模型和设置会复制到新目录；原目录会保留。</span>' : '<span>更新仅替换应用程序，不会删除此目录。选择新目录时必须为空，以免覆盖已有资料。</span>';
+  return `<section class="single-panel panel"><header><div><small>PREFERENCES</small><h2>设置</h2></div><span class="local-chip">${icons.check} 保存在本机</span></header><div class="settings-page"><section class="settings-section"><div><b>界面文字大小</b><span>调整资料终端的阅读密度；设置仅保存在当前 Windows 用户的本机浏览器存储中。</span></div><div class="font-scale-control"><input id="font-scale" type="range" min="90" max="125" step="5" value="${fontScale}" aria-label="界面文字大小"><output id="font-scale-value">${fontScale}%</output></div></section><section class="settings-section data-directory-setting"><div><b>应用数据目录</b><span><strong>${source}</strong><code>${escapeHtml(displayPath(dataPath))}</code>${migrationHint}</span></div><button class="quiet" id="choose-data-directory" ${isWorking || dataDirectoryStatus?.restartRequired ? 'disabled' : ''}>选择新的数据目录</button></section><section class="settings-section"><div><b>软件更新</b><span>${versionText}</span></div><div class="settings-actions"><button class="quiet" id="check-update" ${isWorking ? 'disabled' : ''}>检查更新</button>${updateVersion ? '<button class="primary" id="install-update">下载并安装</button>' : ''}</div></section><section class="settings-section settings-note"><div><b>隐私与数据位置</b><span>文件上传副本保存在资料终端的本地应用数据目录；文件夹接入保持原位置引用。云端权限仅决定 Agent 可否按规则发送经过筛选的资料。</span></div></section></div></section>`;
+}
+
+function recoveryPage() {
+  const message = startupMode?.message ?? '无法解锁现有本地数据库。';
+  return `<main class="recovery-shell"><section class="recovery-card" role="alert"><span class="recovery-icon">${icons.settings}</span><small>SAFE RECOVERY MODE</small><h1>资料终端已安全启动</h1><p>${escapeHtml(message)}</p><div class="recovery-details"><b>旧数据没有被删除或覆盖</b><span>恢复模式不会创建新的磁盘数据库，不会启动索引、文件监听、AI、云端协作或写入操作。</span><span>请使用原 Windows 用户凭据恢复，或准备此前创建的兼容加密备份后再重启应用。</span></div><dl><div><dt>应用数据目录</dt><dd>${escapeHtml(startupMode?.dataDirectory ?? '')}</dd></div><div><dt>恢复文件目录</dt><dd>${escapeHtml(startupMode?.recoveryDirectory ?? '')}</dd></div></dl><button class="primary" id="open-recovery-directory">在资源管理器中打开恢复目录</button><p class="recovery-footnote">请勿删除、移动或覆盖该目录中的 <code>file-terminal.db</code>、WAL 或 SHM 文件。</p></section></main>`;
 }
 
 function render() {
+  if (startupMode?.recoveryRequired) {
+    app.style.setProperty('--user-font-scale', `${fontScale / 100}`);
+    app.innerHTML = recoveryPage();
+    document.querySelector('#open-recovery-directory')?.addEventListener('click', () => invoke('reveal_recovery_data_directory').catch(reason => { error = String(reason); render(); }));
+    return;
+  }
   const pages: Record<View, { title: string; subtitle: string; content: string }> = {
     workspace: { title: '资料空间', subtitle: '原文件留在原位置 · 索引存于本机', content: `${workspaceExtras()}${workspacePanel()}` },
     search: { title: '本地搜索', subtitle: '按名称、路径、备注和标签查询', content: searchPanel() },
@@ -269,6 +287,15 @@ function render() {
 }
 
 async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus, recoveryNotice, indexJobs, runtimeSettings, embeddingModels, mediaTasks, mediaSettings, localTools] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status'), invoke<string | null>('get_startup_recovery_notice'), invoke<IndexJob[]>('list_index_jobs'), invoke<RuntimeSettings>('get_runtime_settings'), invoke<EmbeddingModel[]>('list_embedding_models'), invoke<MediaTask[]>('list_media_tasks'), invoke<MediaSettings>('get_media_settings'), invoke<LocalToolStatus>('get_local_tool_status')]); render(); }
+async function chooseDataDirectory() {
+  const selected = await open({ directory: true, multiple: false, title: '选择新的资料终端数据目录（必须为空）' });
+  if (!selected || Array.isArray(selected)) return;
+  if (!window.confirm('应用会在下次启动时复制资料、数据库密钥、模型和设置到该空目录。原数据目录不会删除。现在登记迁移吗？')) return;
+  isWorking = true; error = ''; render();
+  try {
+    dataDirectoryStatus = await invoke<DataDirectoryStatus>('set_data_directory', { input: { path: selected } });
+  } catch (reason) { error = String(reason); } finally { isWorking = false; render(); }
+}
 async function loadFolderRefs() { folderRefs = await invoke<FolderRef[]>('list_folder_refs'); }
 async function openFolder(folderId: string, path?: string) { const folder = folderRefs.find(item => item.id === folderId); if (!folder) return; activeFolder = folder; browserPath = path ?? folder.path; folderEntries = await invoke<FolderEntry[]>('list_folder_children', { folderId, path: browserPath }); render(); }
 async function navigateFolder(path: string) { if (!activeFolder) return; browserHistory.push(browserPath ?? activeFolder.path); await openFolder(activeFolder.id, path); }
@@ -522,6 +549,7 @@ function bind() {
   uploadDrop?.addEventListener('drop', event => { event.preventDefault(); uploadDrop.classList.remove('dragging'); const paths = Array.from(event.dataTransfer?.files ?? []).map(file => (file as File & { path?: string }).path).filter((path): path is string => Boolean(path)); if (paths.length) importFilesToLibrary(paths); else { error = '未能读取拖入文件路径，请点击“选择文件上传”。'; render(); } });
   document.querySelector<HTMLInputElement>('#font-scale')?.addEventListener('input', event => { fontScale = Number((event.target as HTMLInputElement).value); localStorage.setItem('file-terminal.font-scale', String(fontScale)); render(); });
   document.querySelector('#check-update')?.addEventListener('click', () => checkForUpdate(true));
+  document.querySelector('#choose-data-directory')?.addEventListener('click', chooseDataDirectory);
   document.querySelector('#register-local-model')?.addEventListener('click', registerLocalModel);
   document.querySelector('#register-embedding-model')?.addEventListener('click', registerEmbeddingModel);
   document.querySelector('#build-embedding-index')?.addEventListener('click', buildEmbeddingIndex);
@@ -596,6 +624,20 @@ getCurrentWindow().onDragDropEvent(event => {
   if (paths.length !== 1) { error = '请一次拖入一个文件夹，或拖入文件到“上传文件”区域。'; render(); return; }
   importFolderPath(paths[0]);
 }).catch(reason => { error = `无法启用文件夹拖入：${String(reason)}`; render(); });
-refreshStatus().catch(reason => { error = `无法连接桌面端：${String(reason)}`; render(); });
+async function bootstrap() {
+  try {
+    startupMode = await invoke<StartupMode>('get_startup_mode');
+    if (startupMode.recoveryRequired) {
+      render();
+      return;
+    }
+    [dataDirectoryStatus] = await Promise.all([invoke<DataDirectoryStatus>('get_data_directory_status')]);
+    await refreshStatus();
+    checkForUpdate();
+  } catch (reason) {
+    error = `无法连接桌面端：${String(reason)}`;
+    render();
+  }
+}
 
-checkForUpdate();
+bootstrap();
