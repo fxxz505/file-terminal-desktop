@@ -733,3 +733,14 @@ test('update checks expose a separate loading state, retry path, and bounded net
   assert.match(styles, /\.update-check-progress/);
   assert.match(styles, /\.workspace-extras-grid/);
 });
+
+test('desktop layout keeps wide pages readable and responsive', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(shell, /workspace-extras-grid/);
+  assert.match(styles, /--page-max-width/);
+  assert.match(styles, /\.canvas\{[^}]*max-width:none/);
+  assert.match(styles, /\.search-page,\.assistant-page\{[^}]*max-width:none/);
+  assert.match(styles, /\.about-page\{[^}]*max-width:none/);
+  assert.match(styles, /@media\(max-width:760px\)/);
+});
