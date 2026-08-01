@@ -79,6 +79,7 @@ const DATA_LOCATION_POINTER_FILE: &str = "data-location.json";
 const PENDING_DATA_MIGRATION_FILE: &str = "pending-data-migration.json";
 const DATA_LOCATION_SETTINGS_FOLDER: &str = "资料终端-bootstrap";
 const PORTABLE_DATA_FOLDER: &str = "资料终端数据";
+const FRESH_DATA_FOLDER_PREFIX: &str = "资料终端数据-新建";
 const BACKUP_MAGIC: &[u8] = b"FTBK1";
 const MAX_GENERATED_FILES: usize = 40;
 const MAX_GENERATED_FILE_BYTES: usize = 256 * 1024;
@@ -313,12 +314,6 @@ struct DataDirectoryStatus {
     source: String,
     portable_available: bool,
     restart_required: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DataDirectoryInput {
-    path: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -775,19 +770,35 @@ fn data_location_settings_dir() -> Result<PathBuf, String> {
 }
 
 fn data_location_pointer_path() -> Result<PathBuf, String> {
-    Ok(data_location_settings_dir()?.join(DATA_LOCATION_POINTER_FILE))
+    Ok(executable_directory().ok_or_else(|| "无法定位应用程序所在目录。".to_string())?.join(DATA_LOCATION_POINTER_FILE))
 }
 
 fn pending_data_migration_path() -> Result<PathBuf, String> {
-    Ok(data_location_settings_dir()?.join(PENDING_DATA_MIGRATION_FILE))
+    Ok(executable_directory().ok_or_else(|| "无法定位应用程序所在目录。".to_string())?.join(PENDING_DATA_MIGRATION_FILE))
 }
 
 fn executable_directory() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
-fn portable_data_dir() -> Option<PathBuf> {
-    executable_directory().and_then(|directory| directory.parent().map(|parent| parent.join(PORTABLE_DATA_FOLDER)))
+fn executable_data_dir() -> Option<PathBuf> {
+    executable_directory().map(|directory| directory.join(PORTABLE_DATA_FOLDER))
+}
+
+fn is_executable_sibling_data_directory(directory: &Path, executable_dir: &Path) -> bool {
+    directory.parent() == Some(executable_dir)
+        && directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name == PORTABLE_DATA_FOLDER
+                    || name == FRESH_DATA_FOLDER_PREFIX
+                    || name.starts_with(&format!("{FRESH_DATA_FOLDER_PREFIX}-"))
+            })
+}
+
+fn legacy_data_location_pointer_path() -> Result<PathBuf, String> {
+    Ok(data_location_settings_dir()?.join(DATA_LOCATION_POINTER_FILE))
 }
 
 fn has_application_data(directory: &Path) -> bool {
@@ -796,6 +807,10 @@ fn has_application_data(directory: &Path) -> bool {
         || directory.join("models").is_dir()
         || directory.join("runtime").is_dir()
         || directory.join("uploaded-files").is_dir()
+}
+
+fn directory_is_empty(directory: &Path) -> bool {
+    fs::read_dir(directory).map(|mut entries| entries.next().is_none()).unwrap_or(false)
 }
 
 fn is_writable_directory(directory: &Path) -> bool {
@@ -841,39 +856,81 @@ fn copy_data_directory(source: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_pending_data_migration() -> Result<(), String> {
-    let pending = pending_data_migration_path()?;
-    let Some(target) = read_data_location_record(&pending) else { return Ok(()); };
-    if !is_writable_directory(&target) {
-        return Err("新的数据目录不可写入；未迁移或删除任何旧数据。".to_string());
+fn create_fresh_data_directory_at(parent: &Path) -> Result<PathBuf, String> {
+    if !is_writable_directory(&parent) {
+        return Err("应用程序所在目录不可写入。请将便携版解压到可写入的下载目录后再启动。".to_string());
     }
-    if has_application_data(&target) {
-        return Err("新的数据目录必须为空，避免覆盖已有资料。".to_string());
+    for suffix in 1..=1000 {
+        let name = if suffix == 1 {
+            FRESH_DATA_FOLDER_PREFIX.to_string()
+        } else {
+            format!("{FRESH_DATA_FOLDER_PREFIX}-{suffix}")
+        };
+        let target = parent.join(name);
+        if !target.exists() {
+            fs::create_dir(&target).map_err(|error| format!("无法创建新的数据目录：{error}"))?;
+            return Ok(target);
+        }
     }
-    let source = app_data_dir()?;
-    if source != target && has_application_data(&source) {
-        copy_data_directory(&source, &target)?;
+    Err("无法创建新的数据目录：同名目录过多。".to_string())
+}
+
+fn create_fresh_data_directory() -> Result<PathBuf, String> {
+    let parent = executable_directory().ok_or_else(|| "无法定位应用程序所在目录。".to_string())?;
+    create_fresh_data_directory_at(&parent)
+}
+
+fn prepare_executable_data_dir(executable_dir: &Path, legacy_data_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let target = executable_dir.join(PORTABLE_DATA_FOLDER);
+    if target.is_dir() && has_application_data(&target) {
+        return Some(target);
     }
-    write_data_location_record(&data_location_pointer_path()?, &target)?;
-    fs::remove_file(&pending).map_err(|error| error.to_string())?;
-    Ok(())
+    if target.exists() && !directory_is_empty(&target) {
+        return None;
+    }
+    let parent = target.parent()?;
+    if !is_writable_directory(parent) {
+        return None;
+    }
+    let legacy_data_dir = legacy_data_dirs.iter().find(|directory| has_application_data(directory));
+    if let Some(legacy_data_dir) = legacy_data_dir {
+        let staging = parent.join(format!("{}.pending-{}", PORTABLE_DATA_FOLDER, Uuid::new_v4()));
+        let copy_target = if target.exists() { &target } else { &staging };
+        if (copy_target == &target || fs::create_dir(&staging).is_ok())
+            && copy_data_directory(legacy_data_dir, copy_target).is_ok()
+            && (copy_target == &target || fs::rename(&staging, &target).is_ok())
+        {
+            return Some(target);
+        }
+        let _ = fs::remove_dir_all(staging);
+        return None;
+    }
+    is_writable_directory(&target).then_some(target)
 }
 
 fn app_data_dir() -> Result<PathBuf, String> {
+    let executable_dir = executable_directory().ok_or_else(|| "无法定位应用程序所在目录。".to_string())?;
+    let mut legacy_data_dirs = Vec::new();
     if let Some(target) = read_data_location_record(&data_location_pointer_path()?) {
-        return Ok(target);
+        if is_executable_sibling_data_directory(&target, &executable_dir) {
+            return Ok(target);
+        }
+        legacy_data_dirs.push(target);
     }
-    let default = default_app_data_dir()?;
-    // Existing installs keep using their established Windows data folder after an executable update.
-    if has_application_data(&default) {
-        return Ok(default);
+    if let Some(target) = read_data_location_record(&legacy_data_location_pointer_path()?) {
+        legacy_data_dirs.push(target);
     }
-    if let Some(portable) = portable_data_dir() {
-        if has_application_data(&portable) || is_writable_directory(&portable) {
-            return Ok(portable);
+    if let Ok(path) = pending_data_migration_path() {
+        if let Some(target) = read_data_location_record(&path) {
+            legacy_data_dirs.push(target);
         }
     }
-    Ok(default)
+    legacy_data_dirs.push(default_app_data_dir()?);
+    // Old C-drive data is only a one-time copy source. Every new active library lives beside the executable.
+    if let Some(executable_data) = prepare_executable_data_dir(&executable_dir, &legacy_data_dirs) {
+        return Ok(executable_data);
+    }
+    Err("无法在程序同级目录创建“资料终端数据”。请将便携版解压到你有写入权限的文件夹后再启动；应用不会把新资料写入 C 盘。".to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -4556,51 +4613,33 @@ fn get_startup_mode(state: State<'_, AppState>) -> StartupMode {
 #[tauri::command]
 fn get_data_directory_status(state: State<'_, AppState>) -> DataDirectoryStatus {
     let pointer = data_location_pointer_path().ok().and_then(|path| read_data_location_record(&path));
-    let portable = portable_data_dir();
-    let source = if pointer.as_deref() == Some(state.data_dir.as_path()) {
-        "custom"
-    } else if portable.as_deref() == Some(state.data_dir.as_path()) {
+    let portable = executable_data_dir();
+    let source = if portable.as_deref() == Some(state.data_dir.as_path()) {
         "portable"
+    } else if pointer.as_deref() == Some(state.data_dir.as_path()) {
+        "fresh_database"
     } else {
-        "windows_local"
+        "fresh_database"
     };
     DataDirectoryStatus {
         path: display_path(&state.data_dir),
         source: source.to_string(),
         portable_available: portable.as_deref().is_some_and(is_writable_directory),
-        restart_required: pending_data_migration_path().ok().and_then(|path| read_data_location_record(&path)).is_some(),
+        restart_required: false,
     }
 }
 
 #[tauri::command]
-fn set_data_directory(input: DataDirectoryInput, state: State<'_, AppState>) -> Result<DataDirectoryStatus, String> {
-    if state.recovery_mode {
-        return Err("安全恢复模式下不能迁移数据目录。请先恢复可用数据库。".to_string());
+fn start_fresh_database(state: State<'_, AppState>) -> Result<DataDirectoryStatus, String> {
+    if !state.recovery_mode {
+        return Err("当前数据库可正常使用，无需新建资料库。".to_string());
     }
-    let selected = PathBuf::from(input.path);
-    if !selected.is_absolute() {
-        return Err("请选择绝对路径的数据目录。".to_string());
-    }
-    fs::create_dir_all(&selected).map_err(|error| format!("无法创建数据目录：{error}"))?;
-    let target = fs::canonicalize(&selected).map_err(|error| error.to_string())?;
-    let current = fs::canonicalize(&state.data_dir).unwrap_or_else(|_| state.data_dir.clone());
-    if target == current {
-        return Err("所选目录已经是当前数据目录。".to_string());
-    }
-    if target.starts_with(&current) || current.starts_with(&target) {
-        return Err("不能选择当前数据目录或其父/子目录，避免迁移时递归复制。".to_string());
-    }
-    if fs::read_dir(&target).map_err(|error| error.to_string())?.next().is_some() {
-        return Err("新的数据目录必须为空，避免覆盖已有资料。".to_string());
-    }
-    if !is_writable_directory(&target) {
-        return Err("新的数据目录不可写入。".to_string());
-    }
-    write_data_location_record(&pending_data_migration_path()?, &target)?;
+    let target = create_fresh_data_directory()?;
+    write_data_location_record(&data_location_pointer_path()?, &target)?;
     Ok(DataDirectoryStatus {
-        path: display_path(&current),
-        source: "pending_migration".to_string(),
-        portable_available: portable_data_dir().as_deref().is_some_and(is_writable_directory),
+        path: display_path(&target),
+        source: "fresh_database".to_string(),
+        portable_available: executable_data_dir().as_deref().is_some_and(is_writable_directory),
         restart_required: true,
     })
 }
@@ -6121,9 +6160,6 @@ fn reveal_in_explorer(path: String, state: State<'_, AppState>) -> Result<(), St
 }
 
 fn main() {
-    let data_migration_notice = apply_pending_data_migration().err().map(|error| {
-        format!("数据目录迁移没有完成；旧目录保持不变，应用继续使用它。{error}")
-    });
     let data_dir = app_data_dir().expect("unable to locate app data directory");
     fs::create_dir_all(&data_dir).expect("unable to create app data directory");
     apply_pending_restore(&data_dir).expect("unable to apply pending restore");
@@ -6136,7 +6172,7 @@ fn main() {
         startup_recovery_notice
     } else {
         restore_quarantined_databases(&connection, &data_dir).or(startup_recovery_notice)
-    }.or(data_migration_notice);
+    };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -6203,7 +6239,7 @@ fn main() {
             get_startup_recovery_notice,
             get_startup_mode,
             get_data_directory_status,
-            set_data_directory,
+            start_fresh_database,
             reveal_recovery_data_directory,
             get_local_tool_status,
             install_local_tool,
@@ -6321,6 +6357,19 @@ mod preview_tests {
         assert!(super::has_application_data(&target));
         assert_eq!(fs::read(target.join("database-key.dpapi")).unwrap(), b"key");
         assert_eq!(fs::read(source.join("file-terminal.db")).unwrap(), b"database");
+    }
+
+    #[test]
+    fn fresh_database_directory_keeps_existing_data_and_uses_the_next_available_name() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join(super::FRESH_DATA_FOLDER_PREFIX);
+        fs::create_dir(&first).unwrap();
+        fs::write(first.join("file-terminal.db"), b"unreadable encrypted database").unwrap();
+        let second = super::create_fresh_data_directory_at(temp.path()).unwrap();
+        assert!(first.exists());
+        assert_eq!(fs::read(first.join("file-terminal.db")).unwrap(), b"unreadable encrypted database");
+        assert_eq!(second, temp.path().join(format!("{}-2", super::FRESH_DATA_FOLDER_PREFIX)));
+        assert!(second.is_dir());
     }
 
     #[test]

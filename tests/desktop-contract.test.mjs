@@ -107,19 +107,36 @@ test('an unreadable encrypted database opens a safe recovery-only shell instead 
   assert.match(shell, /reveal_recovery_data_directory/);
 });
 
-test('application data survives executable updates through a portable data root and a user-selected data location', async () => {
+test('application data stays beside the executable and only copies legacy data forward', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.match(backend, /const DATA_LOCATION_POINTER_FILE/);
-  assert.match(backend, /fn portable_data_dir/);
+  assert.match(backend, /fn executable_data_dir/);
   assert.match(backend, /fn has_application_data/);
+  assert.match(backend, /fn prepare_executable_data_dir/);
   assert.match(backend, /fn get_data_directory_status/);
-  assert.match(backend, /fn set_data_directory/);
   assert.match(backend, /copy_data_directory/);
-  assert.match(backend, /数据目录必须为空/);
   assert.match(shell, /get_data_directory_status/);
-  assert.match(shell, /set_data_directory/);
-  assert.match(shell, /choose-data-directory/);
+  const appDataStart = backend.indexOf('fn app_data_dir() -> Result<PathBuf, String> {');
+  const appDataEnd = backend.indexOf('\n#[derive', appDataStart);
+  const appDataDirectory = backend.slice(appDataStart, appDataEnd);
+  assert.match(appDataDirectory, /prepare_executable_data_dir/);
+  assert.doesNotMatch(appDataDirectory, /Ok\(default\)/);
+  assert.doesNotMatch(shell, /choose-data-directory/);
+});
+
+test('recovery mode can preserve unreadable data and start a separate empty local database next to the executable', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const workflow = await readFile(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+  assert.match(backend, /fn create_fresh_data_directory/);
+  assert.match(backend, /fn start_fresh_database/);
+  assert.match(backend, /资料终端数据-新建/);
+  assert.match(backend, /fn executable_data_dir/);
+  assert.match(backend, /资料终端数据/);
+  assert.match(shell, /start_fresh_database/);
+  assert.match(shell, /保留旧数据并新建资料库/);
+  assert.match(workflow, /Package portable bundle/);
 });
 
 test('assistant contract includes a deterministic fallback for game intent', async () => {
