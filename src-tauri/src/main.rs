@@ -79,6 +79,7 @@ const DATA_LOCATION_POINTER_FILE: &str = "data-location.json";
 const PENDING_DATA_MIGRATION_FILE: &str = "pending-data-migration.json";
 const DATA_LOCATION_SETTINGS_FOLDER: &str = "资料终端-bootstrap";
 const PORTABLE_DATA_FOLDER: &str = "资料终端数据";
+const INSTALL_BACKUP_FOLDER: &str = "资料终端数据.install-backup";
 const FRESH_DATA_FOLDER_PREFIX: &str = "资料终端数据-新建";
 const BACKUP_MAGIC: &[u8] = b"FTBK1";
 const MAX_GENERATED_FILES: usize = 40;
@@ -908,8 +909,31 @@ fn prepare_executable_data_dir(executable_dir: &Path, legacy_data_dirs: &[PathBu
     is_writable_directory(&target).then_some(target)
 }
 
+/// Recover the library temporarily renamed by the NSIS upgrade hook.
+/// Renaming keeps the database, WAL, key backup, models and indexes intact.
+fn restore_install_backup(executable_dir: &Path) -> Option<PathBuf> {
+    let target = executable_dir.join(PORTABLE_DATA_FOLDER);
+    let backup = executable_dir.join(INSTALL_BACKUP_FOLDER);
+    if !backup.is_dir() || !has_application_data(&backup) {
+        return None;
+    }
+    if target.is_dir() && has_application_data(&target) {
+        return Some(target);
+    }
+    if target.is_dir() && directory_is_empty(&target) {
+        let _ = fs::remove_dir(&target);
+    }
+    if !target.exists() && fs::rename(&backup, &target).is_ok() {
+        return Some(target);
+    }
+    None
+}
+
 fn app_data_dir() -> Result<PathBuf, String> {
     let executable_dir = executable_directory().ok_or_else(|| "无法定位应用程序所在目录。".to_string())?;
+    if let Some(restored) = restore_install_backup(&executable_dir) {
+        return Ok(restored);
+    }
     let mut legacy_data_dirs = Vec::new();
     if let Some(target) = read_data_location_record(&data_location_pointer_path()?) {
         if is_executable_sibling_data_directory(&target, &executable_dir) {

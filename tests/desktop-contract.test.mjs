@@ -689,6 +689,21 @@ test('desktop automatically retries preserved encrypted databases and merges rea
   assert.match(shell, /recoveryNotice/);
 });
 
+test('upgrades preserve and automatically restore the executable sibling library', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  const config = await readFile(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8');
+  const hooks = await readFile(new URL('../src-tauri/nsis-hooks.nsh', import.meta.url), 'utf8');
+  assert.match(backend, /fn restore_install_backup/);
+  assert.match(backend, /资料终端数据\.install-backup/);
+  assert.match(backend, /restore_install_backup\(&executable_dir\)/);
+  assert.match(config, /"installerHooks":\s*"nsis-hooks\.nsh"/);
+  assert.match(hooks, /NSIS_HOOK_PREINSTALL/);
+  assert.match(hooks, /NSIS_HOOK_POSTINSTALL/);
+  assert.match(hooks, /资料终端数据\.install-backup/);
+  assert.match(shell, /#media-settings button\{[^}]*white-space:nowrap/);
+});
+
 test('desktop updates cloud permission optimistically, imports files into managed storage, and exposes accessible settings', async () => {
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
