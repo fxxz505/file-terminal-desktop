@@ -701,6 +701,9 @@ test('upgrades preserve and automatically restore the executable sibling library
   assert.match(hooks, /NSIS_HOOK_PREINSTALL/);
   assert.match(hooks, /NSIS_HOOK_POSTINSTALL/);
   assert.match(hooks, /资料终端数据\.install-backup/);
+  assert.doesNotMatch(hooks, /\ndone:/);
+  assert.match(hooks, /preserve_done:/);
+  assert.match(hooks, /restore_done:/);
   assert.match(shell, /#media-settings button\{[^}]*white-space:nowrap/);
 });
 
