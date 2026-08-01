@@ -708,3 +708,14 @@ test('desktop updates cloud permission optimistically, imports files into manage
   assert.match(styles, /\.settings-page/);
   assert.match(styles, /#app\{zoom:var\(--user-font-scale\)\}/);
 });
+
+test('about page owns signed in-app update actions and restarts after installation', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(shell, /type View = .*'about'/);
+  assert.match(shell, /function aboutPage\(\)/);
+  assert.match(shell, /data-view="about"/);
+  assert.match(shell, /id="check-update"/);
+  assert.match(shell, /id="install-update"/);
+  assert.match(shell, /update\.downloadAndInstall/);
+  assert.match(shell, /await relaunch\(\)/);
+});

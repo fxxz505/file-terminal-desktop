@@ -48,7 +48,7 @@ type SensitiveFinding = { itemId: string; name: string; displayPath: string; cat
 type MetadataAuditEntry = { id: string; targetType: string; targetId: string; action: string; oldPolicy?: string; newPolicy?: string; createdAt: string };
 type StartupMode = { recoveryRequired: boolean; message?: string; dataDirectory: string; recoveryDirectory: string };
 type DataDirectoryStatus = { path: string; source: 'portable' | 'fresh_database'; portableAvailable: boolean; restartRequired: boolean };
-type View = 'workspace' | 'search' | 'assistant' | 'conversations' | 'settings';
+type View = 'workspace' | 'search' | 'assistant' | 'conversations' | 'settings' | 'about';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 let status: RuntimeStatus = { modelInstalled: false, runtimeInstalled: false, modelPath: '', activeModelName: '默认模型' };
@@ -253,10 +253,18 @@ function workspaceExtras() {
 }
 
 function settingsPage() {
-  const versionText = updateVersion ? `发现可用版本 ${escapeHtml(updateVersion)}` : escapeHtml(updateStatus);
   const source = ({ portable: '程序旁数据目录', fresh_database: '新的程序旁资料库' } as const)[dataDirectoryStatus?.source ?? 'portable'];
   const dataPath = dataDirectoryStatus?.path ?? '正在读取…';
-  return `<section class="single-panel panel"><header><div><small>PREFERENCES</small><h2>设置</h2></div><span class="local-chip">${icons.check} 保存在本机</span></header><div class="settings-page"><section class="settings-section"><div><b>界面文字大小</b><span>调整资料终端的阅读密度；设置仅保存在当前 Windows 用户的本机浏览器存储中。</span></div><div class="font-scale-control"><input id="font-scale" type="range" min="90" max="125" step="5" value="${fontScale}" aria-label="界面文字大小"><output id="font-scale-value">${fontScale}%</output></div></section><section class="settings-section data-directory-setting"><div><b>应用数据目录</b><span><strong>${source}</strong><code>${escapeHtml(displayPath(dataPath))}</code><span>数据固定在 exe 同级目录。若要更换保存位置，请先关闭应用，再将整个 exe 与同级资料目录一起移动到目标文件夹。</span></span></div></section><section class="settings-section"><div><b>软件更新</b><span>${versionText}</span></div><div class="settings-actions"><button class="quiet" id="check-update" ${isWorking ? 'disabled' : ''}>检查更新</button>${updateVersion ? '<button class="primary" id="install-update">下载并安装</button>' : ''}</div></section><section class="settings-section settings-note"><div><b>隐私与数据位置</b><span>文件上传副本保存在资料终端的本地应用数据目录；文件夹接入保持原位置引用。云端权限仅决定 Agent 可否按规则发送经过筛选的资料。</span></div></section></div></section>`;
+  return `<section class="single-panel panel"><header><div><small>PREFERENCES</small><h2>设置</h2></div><span class="local-chip">${icons.check} 保存在本机</span></header><div class="settings-page"><section class="settings-section"><div><b>界面文字大小</b><span>调整资料终端的阅读密度；设置仅保存在当前 Windows 用户的本机浏览器存储中。</span></div><div class="font-scale-control"><input id="font-scale" type="range" min="90" max="125" step="5" value="${fontScale}" aria-label="界面文字大小"><output id="font-scale-value">${fontScale}%</output></div></section><section class="settings-section data-directory-setting"><div><b>应用数据目录</b><span><strong>${source}</strong><code>${escapeHtml(displayPath(dataPath))}</code><span>数据固定在 exe 同级目录。若要更换保存位置，请先关闭应用，再将整个 exe 与同级资料目录一起移动到目标文件夹。</span></span></div></section><section class="settings-section settings-note"><div><b>隐私与数据位置</b><span>文件上传副本保存在资料终端的本地应用数据目录；文件夹接入保持原位置引用。云端权限仅决定 Agent 可否按规则发送经过筛选的资料。</span></div></section></div></section>`;
+}
+
+function aboutPage() {
+  const versionText = updateVersion ? `发现可用版本 ${escapeHtml(updateVersion)}` : escapeHtml(updateStatus);
+  const progressText = updateProgress ? `<section class="update-progress" role="status"><div><b>正在下载更新</b><span>${updateProgress.total ? `${Math.min(100, Math.round(updateProgress.completed / updateProgress.total * 100))}%` : '正在准备下载…'}</span></div><i><span style="width:${updateProgress.total ? Math.min(100, Math.round(updateProgress.completed / updateProgress.total * 100)) : 15}%"></span></i><small>下载完成后会自动安装并重新启动，资料终端资料库不会被清空。</small></section>` : '';
+  const action = updateVersion
+    ? `<button class="primary" id="install-update" ${isWorking ? 'disabled' : ''}>${icons.download} 立即更新</button>`
+    : '<button class="quiet" id="check-update" type="button">检查更新</button>';
+  return `<section class="single-panel panel about-page"><header><div><small>ABOUT</small><h2>关于资料终端</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><div class="about-content"><section class="about-identity"><span class="about-mark">${icons.mark}</span><div><h1>资料终端</h1><p>本地优先的资料管理与 AI 助手</p></div></section><section class="about-update"><div><b>软件更新</b><span>${versionText}</span><small>更新只替换程序文件；同级资料目录、模型和本机设置会保留。</small></div><div class="settings-actions">${action}</div></section>${progressText}<section class="about-detail"><b>更新方式</b><span>点击“检查更新”后，发现新版即可选择“立即更新”。系统会验证发布签名，自动下载、安装并重新启动，无需手动重新下载。</span></section></div></section>`;
 }
 
 function recoveryPage() {
@@ -277,12 +285,13 @@ function render() {
     search: { title: '本地搜索', subtitle: '按名称、路径、备注和标签查询', content: searchPanel() },
     assistant: { title: 'AI 助手', subtitle: '理解问题后，以本地索引给出结果', content: assistantPanel() },
     conversations: { title: 'AI 对话', subtitle: '本机保存的问答记录与结构化步骤', content: conversationPage() },
-    settings: { title: '设置', subtitle: '界面与更新偏好', content: settingsPage() },
+    settings: { title: '设置', subtitle: '界面与数据位置', content: settingsPage() },
+    about: { title: '关于', subtitle: '版本、更新与应用信息', content: aboutPage() },
   };
   const page = pages[activeView];
   const menu = contextTarget ? `<div class="context-menu" style="left:${contextPosition.x}px;top:${contextPosition.y}px" role="menu"><b>${escapeHtml(contextTarget.name)}</b><button data-metadata-action="note">编辑备注</button><button data-metadata-action="tags">编辑标签</button><button data-metadata-action="local_only">云端：禁止上传</button><button data-metadata-action="cloud_allowed">云端：允许上传</button><button data-metadata-action="ask_each_time">云端：每次询问</button></div>` : '';
   app.style.setProperty('--user-font-scale', `${fontScale / 100}`);
-  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-view="assistant">${icons.spark}<span>AI 助手</span></button><button class="nav ${activeView === 'conversations' ? 'active' : ''}" data-view="conversations">${icons.file}<span>AI 对话</span></button></nav><div class="sidebar-bottom"><button class="nav ${activeView === 'settings' ? 'active' : ''}" data-view="settings">${icons.settings}<span>设置</span></button><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${folderBrowser()}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>${menu}`;
+  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-view="assistant">${icons.spark}<span>AI 助手</span></button><button class="nav ${activeView === 'conversations' ? 'active' : ''}" data-view="conversations">${icons.file}<span>AI 对话</span></button></nav><div class="sidebar-bottom"><button class="nav ${activeView === 'settings' ? 'active' : ''}" data-view="settings">${icons.settings}<span>设置</span></button><button class="nav ${activeView === 'about' ? 'active' : ''}" data-view="about">${icons.file}<span>关于</span></button><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${folderBrowser()}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>${menu}`;
   bind();
 }
 
@@ -483,16 +492,24 @@ async function loadPreview(path: string) { if (!path) return; isWorking = true; 
 async function convertOfficePreview() { if (!preview) return; isWorking = true; error = ''; render(); try { preview = await invoke<FilePreview>('convert_office_preview', { path: preview.path }); } catch (reason) { error = `无法生成高保真预览：${String(reason)}`; } finally { isWorking = false; render(); } }
 async function revealPreview() { if (!preview) return; try { await invoke('reveal_in_explorer', { path: preview.path }); } catch (reason) { error = `无法打开资源管理器：${String(reason)}`; render(); } }
 async function checkForUpdate(showResult = false) {
+  if (showResult) {
+    isWorking = true;
+    error = '';
+    render();
+  }
   try {
     const update = await check();
     updateVersion = update?.version ?? '';
     updateStatus = updateVersion ? `发现可用版本 ${updateVersion}` : '当前已是最新版本';
-    if (showResult) render();
     if (updateVersion && !showResult && window.confirm(`发现 ${updateVersion} 新版本。现在下载并自动安装吗？`)) await installUpdate();
   } catch (reason) {
     updateStatus = `暂时无法检查更新：${String(reason)}`;
-    if (showResult) render();
     console.warn('Update check skipped:', reason);
+  } finally {
+    if (showResult) {
+      isWorking = false;
+      render();
+    }
   }
 }
 
