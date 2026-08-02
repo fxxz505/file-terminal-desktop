@@ -129,8 +129,14 @@ jobs:
               if (String.IsNullOrWhiteSpace(real) || !File.Exists(real)) return 2;
               var forwarded = String.Join(" ", args);
               var extra = " --verbose" + (String.IsNullOrWhiteSpace(log) ? "" : " --log-path=" + log);
-              var info = new ProcessStartInfo { FileName = real, Arguments = forwarded + extra, UseShellExecute = false, CreateNoWindow = true };
-              using (var process = Process.Start(info)) { process.WaitForExit(); return process.ExitCode; }
+              var info = new ProcessStartInfo { FileName = real, Arguments = forwarded + extra, UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true };
+              if (!String.IsNullOrWhiteSpace(log)) File.AppendAllText(log, "wrapper args=" + info.Arguments + Environment.NewLine);
+              using (var process = Process.Start(info)) {
+                var stderr = process.StandardError.ReadToEnd();
+                process.WaitForExit();
+                if (!String.IsNullOrWhiteSpace(log)) File.AppendAllText(log, "wrapper exit=" + process.ExitCode + Environment.NewLine + stderr + Environment.NewLine);
+                return process.ExitCode;
+              }
             }
           }
           '@ | Set-Content -LiteralPath $wrapperSource -Encoding UTF8
