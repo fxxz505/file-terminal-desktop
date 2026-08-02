@@ -127,6 +127,7 @@ jobs:
           TAURI_E2E_APP: ${{ github.workspace }}\src-tauri\target\debug\file-terminal-desktop.exe
           TAURI_E2E_ARTIFACTS: ${{ github.workspace }}\e2e-artifacts
           FILE_TERMINAL_TEST_DATA_DIR: ${{ runner.temp }}\file-terminal-e2e-data
+          TAURI_WEBVIEW_PROFILE: ${{ runner.temp }}\file-terminal-webview-profile
         run: npm run test:tauri-e2e
       - name: Stop Tauri WebDriver bridge
         if: always()
