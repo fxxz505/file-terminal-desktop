@@ -185,6 +185,17 @@ test('desktop updater verifies signed GitHub release updates before installation
   assert.match(backend, /tauri_plugin_updater/);
 });
 
+test('release versions stay aligned so the updater can detect a newer build', async () => {
+  const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  const lockJson = JSON.parse(await readFile(new URL('../package-lock.json', import.meta.url), 'utf8'));
+  const tauri = JSON.parse(await readFile(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+  const cargo = await readFile(new URL('../src-tauri/Cargo.toml', import.meta.url), 'utf8');
+  assert.equal(packageJson.version, lockJson.version);
+  assert.equal(packageJson.version, lockJson.packages[''].version);
+  assert.equal(packageJson.version, tauri.version);
+  assert.match(cargo, new RegExp(`version = "${packageJson.version}"`));
+});
+
 test('cloud collaboration keeps credentials outside SQLite and records only safe run metadata', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   assert.match(backend, /struct CloudProviderConfig/);
