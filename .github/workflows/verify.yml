@@ -43,6 +43,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install frontend dependencies
         run: npm ci
+      - name: Build frontend assets for Tauri WebView
+        run: npm run build
       - name: Build Tauri debug application
         run: cargo build --manifest-path src-tauri/Cargo.toml
       - name: Install Tauri WebDriver bridge
