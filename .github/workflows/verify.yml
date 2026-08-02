@@ -64,9 +64,11 @@ jobs:
       - name: Install matching Microsoft Edge WebDriver
         shell: pwsh
         run: |
-          $edge = Get-ChildItem 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe', 'C:\Program Files\Microsoft\Edge\Application\msedge.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $edge) { throw 'Microsoft Edge executable was not found on the runner' }
-          $version = $edge.VersionInfo.ProductVersion
+          # Tauri hosts its UI in WebView2, not the standalone Edge browser.  A browser-matched
+          # driver may reject the WebView2 process when their patch versions differ.
+          $webview = Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $webview) { throw 'WebView2 Runtime executable was not found on the runner' }
+          $version = $webview.VersionInfo.ProductVersion
           $download = Join-Path $env:RUNNER_TEMP 'edgedriver.zip'
           $extract = Join-Path $env:RUNNER_TEMP 'edgedriver'
           New-Item -ItemType Directory -Force -Path $extract | Out-Null
@@ -75,10 +77,14 @@ jobs:
             Expand-Archive -Path $download -DestinationPath $extract -Force
             $driverPath = Join-Path $extract 'msedgedriver.exe'
             if (-not (Test-Path $driverPath)) { throw 'Downloaded archive did not contain msedgedriver.exe' }
-            Write-Host "Using Edge $version with matching driver $driverPath"
+            $driverVersion = (& $driverPath --version)
+            if ($driverVersion -notmatch [regex]::Escape($version)) {
+              throw "EdgeDriver version mismatch. WebView2=$version; driver=$driverVersion"
+            }
+            Write-Host "Using WebView2 $version with matching driver $driverPath"
           } catch {
             $fallback = Get-Command msedgedriver -ErrorAction SilentlyContinue
-            if (-not $fallback) { throw "Unable to download matching EdgeDriver for Edge $version. $($_.Exception.Message)" }
+            if (-not $fallback) { throw "Unable to download matching EdgeDriver for WebView2 $version. $($_.Exception.Message)" }
             $driverPath = $fallback.Source
             Write-Warning "Matching EdgeDriver download failed; using runner-provided driver $driverPath. $($_.Exception.Message)"
           }
