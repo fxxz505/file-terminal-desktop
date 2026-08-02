@@ -7,7 +7,9 @@ pub fn extract_search_terms(question: &str) -> Vec<String> {
     }
 
     for word in normalized
-        .split(|character: char| !character.is_alphanumeric() && !('\u{4e00}'..='\u{9fff}').contains(&character))
+        .split(|character: char| {
+            !character.is_alphanumeric() && !('\u{4e00}'..='\u{9fff}').contains(&character)
+        })
         .filter(|word| word.chars().count() >= 2)
     {
         let candidate = word.to_string();

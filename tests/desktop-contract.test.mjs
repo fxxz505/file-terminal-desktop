@@ -762,3 +762,43 @@ test('desktop layout keeps wide pages readable and responsive', async () => {
   assert.match(styles, /\.about-page\{[^}]*max-width:none/);
   assert.match(styles, /@media\(max-width:760px\)/);
 });
+
+test('workspace folders and local conversation history use readable desktop information density', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(shell, /conversation-empty/);
+  assert.match(shell, /本机对话记录<\/b><small>/);
+  assert.match(styles, /\.folder-reference-row \.remove-folder-reference\{width:106px/);
+  assert.match(styles, /\.conversation-layout\.standalone\{grid-template-columns:280px minmax\(0,1fr\)/);
+  assert.match(styles, /\.chat-empty\{display:grid;place-items:center/);
+});
+
+test('managed model and language downloads use a resumable persistent task queue', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /FIXED_DOWNLOAD_RESOURCES/);
+  assert.match(backend, /ggml-tiny\.bin/);
+  assert.match(backend, /chi_sim\.traineddata/);
+  assert.match(backend, /CREATE TABLE IF NOT EXISTS download_tasks/);
+  assert.match(backend, /fn start_download_worker/);
+  assert.match(backend, /fn retry_download_task/);
+  assert.match(backend, /fn cancel_download_task/);
+  assert.match(backend, /recover_incomplete_download_tasks/);
+  assert.match(shell, /retry-download-task/);
+  assert.match(shell, /cancel-download-task/);
+});
+
+test('watcher failures fall back to bounded scans and real WebView automation has stable selectors', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const e2e = await readFile(new URL('../tests/tauri-e2e/desktop-webview.test.mjs', import.meta.url), 'utf8');
+  assert.match(backend, /struct FolderWatchHealth/);
+  assert.match(backend, /FALLBACK_SCAN_INTERVAL_MS/);
+  assert.match(backend, /watched_roots\.clear\(\)/);
+  assert.match(backend, /FILE_TERMINAL_TEST_DATA_DIR/);
+  assert.match(shell, /data-testid="nav-search"/);
+  assert.match(shell, /data-testid="nav-diagnostics"/);
+  assert.match(shell, /data-testid="nav-tasks"/);
+  assert.match(e2e, /tauri:options/);
+  assert.match(e2e, /TAURI_E2E_APP/);
+});

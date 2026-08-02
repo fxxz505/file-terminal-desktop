@@ -7,3 +7,5 @@ src-tauri/target/
 *.key
 *.pem
 *.sig
+e2e-artifacts/
+webdriver-logs/

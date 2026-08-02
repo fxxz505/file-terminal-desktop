@@ -1,0 +1,72 @@
+name: Verify desktop app
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: TypeScript check
+        run: npx tsc --noEmit
+      - name: Frontend tests
+        run: npm test
+      - name: Rust format check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Rust unit and integration tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Production frontend build
+        run: npm run build
+  desktop-e2e:
+    runs-on: windows-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build Tauri debug application
+        run: cargo build --manifest-path src-tauri/Cargo.toml
+      - name: Install Tauri WebDriver bridge
+        run: cargo install tauri-driver --version 2.0.6 --locked
+      - name: Start Tauri WebDriver bridge
+        shell: pwsh
+        run: |
+          $env:FILE_TERMINAL_TEST_DATA_DIR = Join-Path $env:RUNNER_TEMP 'file-terminal-e2e-data'
+          $driver = Start-Process tauri-driver -ArgumentList '--native-driver', 'msedgedriver', '--port', '4444' -PassThru -WindowStyle Hidden
+          "TAURI_DRIVER_PID=$($driver.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Run real Tauri WebView automation
+        shell: pwsh
+        env:
+          TAURI_E2E_APP: ${{ github.workspace }}\src-tauri\target\debug\file-terminal-desktop.exe
+          TAURI_E2E_ARTIFACTS: ${{ github.workspace }}\e2e-artifacts
+          FILE_TERMINAL_TEST_DATA_DIR: ${{ runner.temp }}\file-terminal-e2e-data
+        run: npm run test:tauri-e2e
+      - name: Stop Tauri WebDriver bridge
+        if: always()
+        shell: pwsh
+        run: if ($env:TAURI_DRIVER_PID) { Stop-Process -Id $env:TAURI_DRIVER_PID -Force -ErrorAction SilentlyContinue }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tauri-e2e-artifacts
+          path: e2e-artifacts/
+          retention-days: 14

@@ -1,0 +1,8 @@
+:root { font-family: "Microsoft YaHei UI", system-ui, sans-serif; color: #20364f; background: #edf3f8; }
+body { display: grid; min-height: 100vh; margin: 0; place-items: center; }
+.shell { width: min(540px, calc(100% - 48px)); padding: 36px; border: 1px solid #cdddea; background: #fff; }
+.eyebrow { margin: 0; color: #307ac2; font-size: 12px; font-weight: 700; letter-spacing: 1px; }
+h1 { margin: 10px 0; font-size: 30px; }
+p { color: #5f7489; line-height: 1.7; }
+button { border: 0; border-radius: 5px; background: #287ac2; color: #fff; cursor: pointer; padding: 10px 16px; font: inherit; }
+button:hover { background: #1869af; }

@@ -1,14 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use file_terminal_desktop::assistant::{extract_search_terms, matches_terms, parse_model_terms};
 use futures_util::StreamExt;
 use keyring::Entry;
 use lopdf::Document;
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
-use regex::Regex;
 use rand::RngCore;
+use regex::Regex;
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,7 +64,46 @@ const MODEL_URLS: &[(&str, &str)] = &[
 ];
 const MODEL_SHA256: &str = "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e";
 const MODEL_FILE: &str = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
+struct FixedDownloadResource {
+    id: &'static str,
+    label: &'static str,
+    resource_type: &'static str,
+    url: &'static str,
+    sha256: &'static str,
+    file_name: &'static str,
+}
+
+// Fixed resources are reviewed application assets. User-selected files are only registered, never deleted.
+const FIXED_DOWNLOAD_RESOURCES: &[FixedDownloadResource] = &[
+    FixedDownloadResource {
+        id: "whisper-tiny",
+        label: "Whisper tiny",
+        resource_type: "whisper_model",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
+        sha256: "518970a29bedb265f23ac48d486ddbc63bedffd90967b10140ae5ac61243acf3",
+        file_name: "ggml-tiny.bin",
+    },
+    FixedDownloadResource {
+        id: "tessdata-chi-sim",
+        label: "Tesseract Chinese Simplified",
+        resource_type: "ocr_language",
+        url:
+            "https://github.com/tesseract-ocr/tessdata_fast/raw/refs/heads/main/chi_sim.traineddata",
+        sha256: "d569b0da842d252d5828540859688dd2824cc7f5edcf1d3bc23f06c18f837846",
+        file_name: "chi_sim.traineddata",
+    },
+];
 const MAX_PREVIEW_BYTES: u64 = 1_048_576;
+const MAX_TEXT_INDEX_BYTES: u64 = 512 * 1024;
+const MAX_TEXT_INDEX_CHARS: usize = 80_000;
+const MAX_PDF_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PDF_INDEX_PAGES: usize = 200;
+const MAX_PDF_INDEX_CHARS: usize = 100_000;
+const MAX_OFFICE_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_OFFICE_ARCHIVE_ENTRIES: usize = 2_000;
+const MAX_OFFICE_ENTRY_UNCOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_OFFICE_TOTAL_UNCOMPRESSED_BYTES: u64 = 96 * 1024 * 1024;
+const MAX_OFFICE_INDEX_CHARS: usize = 100_000;
 const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_THUMBNAIL_BYTES: usize = 256 * 1024;
 const MAX_MEDIA_OUTPUT_CHARS: usize = 120_000;
@@ -142,6 +184,9 @@ struct AppState {
     recovery_mode: bool,
     prepared_runs: Mutex<HashMap<String, PreparedCloudRun>>,
     cancelled_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    cancelled_media_tasks: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    cancelled_download_tasks: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    folder_watch_status: Arc<Mutex<HashMap<String, FolderWatchStatus>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -156,6 +201,35 @@ struct IndexItem {
     cloud_policy: CloudPolicy,
     score: usize,
     display_path: String,
+    content_status: String,
+    content_reason_code: Option<String>,
+    extracted_chars: usize,
+    content_indexed_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ContentExtraction {
+    status: &'static str,
+    reason_code: Option<&'static str>,
+    content: Option<String>,
+}
+
+impl ContentExtraction {
+    fn indexed(content: String) -> Self {
+        Self {
+            status: "indexed",
+            reason_code: None,
+            content: Some(content),
+        }
+    }
+
+    fn status(status: &'static str, reason_code: &'static str) -> Self {
+        Self {
+            status,
+            reason_code: Some(reason_code),
+            content: None,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -286,9 +360,155 @@ struct IndexJobInput {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct IndexDiagnosticItem {
+    id: String,
+    folder_id: String,
+    name: String,
+    path: String,
+    display_path: String,
+    item_type: String,
+    source_size: Option<i64>,
+    source_modified_ms: Option<i64>,
+    content_status: String,
+    content_reason_code: Option<String>,
+    extracted_chars: usize,
+    content_indexed_at: Option<String>,
+    media_status: Option<String>,
+    embedding_status: String,
+    thumbnail_status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexDiagnosticFilter {
+    folder_id: Option<String>,
+    item_type: Option<String>,
+    content_status: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticRetryInput {
+    item_ids: Vec<String>,
+    confirmed: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticExport {
+    exported_at: String,
+    items: Vec<IndexDiagnosticItem>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundTask {
+    id: String,
+    task_type: String,
+    target: String,
+    status: String,
+    progress: String,
+    started_at: String,
+    error: Option<String>,
+    supports_pause: bool,
+    supports_cancel: bool,
+    supports_retry: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadTask {
+    id: String,
+    resource_id: String,
+    label: String,
+    status: String,
+    completed: u64,
+    total: Option<u64>,
+    error: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct FolderChangeDetected {
     folder_id: String,
     changed_at: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderWatchStatus {
+    folder_id: String,
+    mode: String,
+    detail: String,
+    last_checked_at: String,
+}
+
+#[derive(Clone, Debug)]
+struct FolderWatchHealth {
+    mode: &'static str,
+    last_fallback_scan_ms: Option<u64>,
+}
+
+impl FolderWatchHealth {
+    fn healthy() -> Self {
+        Self {
+            mode: "watching",
+            last_fallback_scan_ms: None,
+        }
+    }
+    fn mark_watch_failure(&mut self, _reason: &str) {
+        self.mode = "fallback_scan";
+    }
+    fn mark_watch_recovered(&mut self) {
+        self.mode = "watching";
+    }
+    fn should_scan_at(&mut self, now_ms: u64) -> bool {
+        const FALLBACK_SCAN_INTERVAL_MS: u64 = 30_000;
+        if self.mode != "fallback_scan"
+            || self
+                .last_fallback_scan_ms
+                .is_some_and(|last| now_ms.saturating_sub(last) < FALLBACK_SCAN_INTERVAL_MS)
+        {
+            return false;
+        }
+        self.last_fallback_scan_ms = Some(now_ms);
+        true
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedDownloadResource {
+    id: String,
+    label: String,
+    resource_type: String,
+    status: String,
+    path: String,
+    bytes: u64,
+    source: String,
+    can_delete: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedDownloadInput {
+    resource_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadTaskIdInput {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedDownloadDeleteInput {
+    resource_id: String,
+    confirmed: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -395,6 +615,7 @@ enum ManagedTool {
 #[serde(rename_all = "camelCase")]
 struct ManagedToolInput {
     tool: ManagedTool,
+    confirmed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -771,15 +992,21 @@ fn data_location_settings_dir() -> Result<PathBuf, String> {
 }
 
 fn data_location_pointer_path() -> Result<PathBuf, String> {
-    Ok(executable_directory().ok_or_else(|| "无法定位应用程序所在目录。".to_string())?.join(DATA_LOCATION_POINTER_FILE))
+    Ok(executable_directory()
+        .ok_or_else(|| "无法定位应用程序所在目录。".to_string())?
+        .join(DATA_LOCATION_POINTER_FILE))
 }
 
 fn pending_data_migration_path() -> Result<PathBuf, String> {
-    Ok(executable_directory().ok_or_else(|| "无法定位应用程序所在目录。".to_string())?.join(PENDING_DATA_MIGRATION_FILE))
+    Ok(executable_directory()
+        .ok_or_else(|| "无法定位应用程序所在目录。".to_string())?
+        .join(PENDING_DATA_MIGRATION_FILE))
 }
 
 fn executable_directory() -> Option<PathBuf> {
-    std::env::current_exe().ok().and_then(|path| path.parent().map(Path::to_path_buf))
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
 fn executable_data_dir() -> Option<PathBuf> {
@@ -811,7 +1038,9 @@ fn has_application_data(directory: &Path) -> bool {
 }
 
 fn directory_is_empty(directory: &Path) -> bool {
-    fs::read_dir(directory).map(|mut entries| entries.next().is_none()).unwrap_or(false)
+    fs::read_dir(directory)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
 }
 
 fn is_writable_directory(directory: &Path) -> bool {
@@ -819,20 +1048,30 @@ fn is_writable_directory(directory: &Path) -> bool {
         return false;
     }
     let probe = directory.join(format!(".write-probe-{}", Uuid::new_v4()));
-    File::create(&probe).and_then(|file| file.sync_all()).is_ok() && fs::remove_file(probe).is_ok()
+    File::create(&probe)
+        .and_then(|file| file.sync_all())
+        .is_ok()
+        && fs::remove_file(probe).is_ok()
 }
 
 fn read_data_location_record(path: &Path) -> Option<PathBuf> {
-    let record = fs::read_to_string(path).ok().and_then(|value| serde_json::from_str::<DataLocationRecord>(&value).ok())?;
+    let record = fs::read_to_string(path)
+        .ok()
+        .and_then(|value| serde_json::from_str::<DataLocationRecord>(&value).ok())?;
     let target = PathBuf::from(record.path);
     target.is_absolute().then_some(target)
 }
 
 fn write_data_location_record(path: &Path, target: &Path) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| "数据位置设置路径无效。".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "数据位置设置路径无效。".to_string())?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let temporary = path.with_extension(format!("{}.pending", Uuid::new_v4()));
-    let content = serde_json::to_vec(&DataLocationRecord { path: target.display().to_string() }).map_err(|error| error.to_string())?;
+    let content = serde_json::to_vec(&DataLocationRecord {
+        path: target.display().to_string(),
+    })
+    .map_err(|error| error.to_string())?;
     fs::write(&temporary, content).map_err(|error| error.to_string())?;
     fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
@@ -840,8 +1079,15 @@ fn write_data_location_record(path: &Path, target: &Path) -> Result<(), String> 
 fn copy_data_directory(source: &Path, target: &Path) -> Result<(), String> {
     for entry in WalkDir::new(source).follow_links(false) {
         let entry = entry.map_err(|error| error.to_string())?;
-        let relative = entry.path().strip_prefix(source).map_err(|error| error.to_string())?;
-        if relative.as_os_str().is_empty() || relative.components().any(|component| !matches!(component, Component::Normal(_))) {
+        let relative = entry
+            .path()
+            .strip_prefix(source)
+            .map_err(|error| error.to_string())?;
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
             continue;
         }
         let destination = target.join(relative);
@@ -859,7 +1105,9 @@ fn copy_data_directory(source: &Path, target: &Path) -> Result<(), String> {
 
 fn create_fresh_data_directory_at(parent: &Path) -> Result<PathBuf, String> {
     if !is_writable_directory(&parent) {
-        return Err("应用程序所在目录不可写入。请将便携版解压到可写入的下载目录后再启动。".to_string());
+        return Err(
+            "应用程序所在目录不可写入。请将便携版解压到可写入的下载目录后再启动。".to_string(),
+        );
     }
     for suffix in 1..=1000 {
         let name = if suffix == 1 {
@@ -881,7 +1129,10 @@ fn create_fresh_data_directory() -> Result<PathBuf, String> {
     create_fresh_data_directory_at(&parent)
 }
 
-fn prepare_executable_data_dir(executable_dir: &Path, legacy_data_dirs: &[PathBuf]) -> Option<PathBuf> {
+fn prepare_executable_data_dir(
+    executable_dir: &Path,
+    legacy_data_dirs: &[PathBuf],
+) -> Option<PathBuf> {
     let target = executable_dir.join(PORTABLE_DATA_FOLDER);
     if target.is_dir() && has_application_data(&target) {
         return Some(target);
@@ -893,9 +1144,15 @@ fn prepare_executable_data_dir(executable_dir: &Path, legacy_data_dirs: &[PathBu
     if !is_writable_directory(parent) {
         return None;
     }
-    let legacy_data_dir = legacy_data_dirs.iter().find(|directory| has_application_data(directory));
+    let legacy_data_dir = legacy_data_dirs
+        .iter()
+        .find(|directory| has_application_data(directory));
     if let Some(legacy_data_dir) = legacy_data_dir {
-        let staging = parent.join(format!("{}.pending-{}", PORTABLE_DATA_FOLDER, Uuid::new_v4()));
+        let staging = parent.join(format!(
+            "{}.pending-{}",
+            PORTABLE_DATA_FOLDER,
+            Uuid::new_v4()
+        ));
         let copy_target = if target.exists() { &target } else { &staging };
         if (copy_target == &target || fs::create_dir(&staging).is_ok())
             && copy_data_directory(legacy_data_dir, copy_target).is_ok()
@@ -930,7 +1187,17 @@ fn restore_install_backup(executable_dir: &Path) -> Option<PathBuf> {
 }
 
 fn app_data_dir() -> Result<PathBuf, String> {
-    let executable_dir = executable_directory().ok_or_else(|| "无法定位应用程序所在目录。".to_string())?;
+    // Test runs may isolate application data without changing the portable release behavior.
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("FILE_TERMINAL_TEST_DATA_DIR") {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+            return Ok(path);
+        }
+    }
+    let executable_dir =
+        executable_directory().ok_or_else(|| "无法定位应用程序所在目录。".to_string())?;
     if let Some(restored) = restore_install_backup(&executable_dir) {
         return Ok(restored);
     }
@@ -1027,7 +1294,10 @@ fn database_key_entry() -> Result<Entry, String> {
 }
 
 fn valid_database_key(key: &str) -> bool {
-    key.len() >= 32 && key.chars().all(|value| value.is_ascii_alphanumeric() || matches!(value, '+' | '/' | '='))
+    key.len() >= 32
+        && key
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '+' | '/' | '='))
 }
 
 #[cfg(windows)]
@@ -1035,22 +1305,36 @@ fn protect_database_key_with_dpapi(value: &[u8]) -> Result<Vec<u8>, String> {
     use std::ptr;
     use windows_sys::Win32::{
         Foundation::LocalFree,
-        Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN},
+        Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
     };
 
     if value.is_empty() || value.len() > u32::MAX as usize {
         return Err("数据库密钥备份长度无效。".to_string());
     }
-    let input = CRYPT_INTEGER_BLOB { cbData: value.len() as u32, pbData: value.as_ptr() as *mut u8 };
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: value.len() as u32,
+        pbData: value.as_ptr() as *mut u8,
+    };
     let mut output = CRYPT_INTEGER_BLOB::default();
     let protected = unsafe {
-        CryptProtectData(&input, ptr::null(), ptr::null(), ptr::null(), ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+        CryptProtectData(
+            &input,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
     };
     if protected == 0 || output.pbData.is_null() {
         return Err("Windows DPAPI 无法保护数据库密钥副本。".to_string());
     }
-    let result = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe { LocalFree(output.pbData as *mut std::ffi::c_void); }
+    let result =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pbData as *mut std::ffi::c_void);
+    }
     Ok(result)
 }
 
@@ -1059,22 +1343,38 @@ fn unprotect_database_key_with_dpapi(value: &[u8]) -> Result<Vec<u8>, String> {
     use std::ptr;
     use windows_sys::Win32::{
         Foundation::LocalFree,
-        Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN},
+        Security::Cryptography::{
+            CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+        },
     };
 
     if value.is_empty() || value.len() > u32::MAX as usize {
         return Err("数据库密钥备份无效。".to_string());
     }
-    let input = CRYPT_INTEGER_BLOB { cbData: value.len() as u32, pbData: value.as_ptr() as *mut u8 };
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: value.len() as u32,
+        pbData: value.as_ptr() as *mut u8,
+    };
     let mut output = CRYPT_INTEGER_BLOB::default();
     let unprotected = unsafe {
-        CryptUnprotectData(&input, ptr::null_mut(), ptr::null(), ptr::null(), ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+        CryptUnprotectData(
+            &input,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
     };
     if unprotected == 0 || output.pbData.is_null() {
         return Err("Windows DPAPI 无法解锁数据库密钥副本。".to_string());
     }
-    let result = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe { LocalFree(output.pbData as *mut std::ffi::c_void); }
+    let result =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pbData as *mut std::ffi::c_void);
+    }
     Ok(result)
 }
 
@@ -1111,16 +1411,24 @@ fn save_database_key_backup(data_dir: &Path, key: &str) -> Result<(), String> {
         }
     }
     let protected = protect_database_key_with_dpapi(key.as_bytes())?;
-    let temporary = data_dir.join(format!("{DATABASE_KEY_BACKUP_FILE}.{}.pending", Uuid::new_v4()));
+    let temporary = data_dir.join(format!(
+        "{DATABASE_KEY_BACKUP_FILE}.{}.pending",
+        Uuid::new_v4()
+    ));
     {
-        let mut file = File::create(&temporary).map_err(|_| "无法创建 Windows DPAPI 数据库密钥副本。".to_string())?;
-        file.write_all(&protected).map_err(|_| "无法写入 Windows DPAPI 数据库密钥副本。".to_string())?;
-        file.sync_all().map_err(|_| "无法保存 Windows DPAPI 数据库密钥副本。".to_string())?;
+        let mut file = File::create(&temporary)
+            .map_err(|_| "无法创建 Windows DPAPI 数据库密钥副本。".to_string())?;
+        file.write_all(&protected)
+            .map_err(|_| "无法写入 Windows DPAPI 数据库密钥副本。".to_string())?;
+        file.sync_all()
+            .map_err(|_| "无法保存 Windows DPAPI 数据库密钥副本。".to_string())?;
     }
     fs::rename(&temporary, database_key_backup_path(data_dir))
         .or_else(|_| {
             // The key never rotates. Replacing a damaged fallback is safe only after the new DPAPI blob is fully written.
-            fs::copy(&temporary, database_key_backup_path(data_dir)).map(|_| ()).and_then(|_| fs::remove_file(&temporary))
+            fs::copy(&temporary, database_key_backup_path(data_dir))
+                .map(|_| ())
+                .and_then(|_| fs::remove_file(&temporary))
         })
         .map_err(|_| "无法保存 Windows DPAPI 数据库密钥副本。".to_string())
 }
@@ -1129,9 +1437,12 @@ fn generate_and_store_database_key(data_dir: &Path) -> Result<String, String> {
     let mut raw = [0u8; 32];
     rand::rng().fill_bytes(&mut raw);
     let key = BASE64.encode(raw);
-    database_key_entry()?.set_password(&key).map_err(|_| "无法将数据库密钥保存到 Windows 凭据库。".to_string())?;
+    database_key_entry()?
+        .set_password(&key)
+        .map_err(|_| "无法将数据库密钥保存到 Windows 凭据库。".to_string())?;
     if let Err(error) = save_database_key_backup(data_dir, &key) {
-        let _ = database_key_entry().and_then(|entry| entry.delete_credential().map_err(|_| "".to_string()));
+        let _ = database_key_entry()
+            .and_then(|entry| entry.delete_credential().map_err(|_| "".to_string()));
         return Err(error);
     }
     Ok(key)
@@ -1166,9 +1477,11 @@ fn load_database_key(data_dir: &Path, database_exists: bool) -> Result<String, S
 }
 
 fn apply_database_key(connection: &Connection, key: &str) -> Result<(), String> {
-    connection.execute_batch(&format!("PRAGMA key = '{key}';"))
+    connection
+        .execute_batch(&format!("PRAGMA key = '{key}';"))
         .map_err(|_| "无法应用本地数据库密钥。".to_string())?;
-    let cipher_version = connection.query_row("PRAGMA cipher_version", [], |row| row.get::<_, String>(0))
+    let cipher_version = connection
+        .query_row("PRAGMA cipher_version", [], |row| row.get::<_, String>(0))
         .map_err(|_| "当前运行时未包含 SQLCipher；应用拒绝打开数据库。".to_string())?;
     if cipher_version.trim().is_empty() {
         return Err("当前运行时未启用 SQLCipher；应用拒绝打开数据库。".to_string());
@@ -1179,8 +1492,11 @@ fn apply_database_key(connection: &Connection, key: &str) -> Result<(), String> 
 fn open_encrypted_database(path: &Path, key: &str) -> Result<Connection, String> {
     let connection = Connection::open(path).map_err(|error| error.to_string())?;
     apply_database_key(&connection, key)?;
-    connection.execute_batch("PRAGMA foreign_keys = ON;").map_err(|error| error.to_string())?;
-    connection.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(|error| error.to_string())?;
+    connection
+        .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
         .map_err(|_| "无法使用本机凭据解锁数据库；数据未被修改。".to_string())?;
     Ok(connection)
 }
@@ -1191,12 +1507,20 @@ fn migrate_plaintext_database(database: &Path, key: &str) -> Result<(), String> 
     let _ = fs::remove_file(&migrated);
     let _ = fs::remove_file(&preserved);
     let source = Connection::open(database).map_err(|error| error.to_string())?;
-    source.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").map_err(|error| error.to_string())?;
+    source
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|error| error.to_string())?;
     let target_path = migrated.display().to_string().replace('\'', "''");
     let escaped_key = key.replace('\'', "''");
-    source.execute_batch(&format!("ATTACH DATABASE '{target_path}' AS encrypted KEY '{escaped_key}';"))
+    source
+        .execute_batch(&format!(
+            "ATTACH DATABASE '{target_path}' AS encrypted KEY '{escaped_key}';"
+        ))
         .map_err(|error| format!("无法创建加密迁移数据库；原始数据库未被修改：{error}"))?;
-    let exported = source.query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok::<(), rusqlite::Error>(()))
+    let exported = source
+        .query_row("SELECT sqlcipher_export('encrypted')", [], |_| {
+            Ok::<(), rusqlite::Error>(())
+        })
         .map_err(|error| format!("无法导出加密数据库；原始数据库未被修改：{error}"));
     let _ = source.execute_batch("DETACH DATABASE encrypted;");
     drop(source);
@@ -1206,7 +1530,9 @@ fn migrate_plaintext_database(database: &Path, key: &str) -> Result<(), String> 
     }
     if let Err(error) = open_encrypted_database(&migrated, key) {
         let _ = fs::remove_file(&migrated);
-        return Err(format!("数据库加密迁移校验失败；原始数据库未被修改：{error}"));
+        return Err(format!(
+            "数据库加密迁移校验失败；原始数据库未被修改：{error}"
+        ));
     }
     fs::rename(database, &preserved).map_err(|error| error.to_string())?;
     if let Err(error) = fs::rename(&migrated, database) {
@@ -1222,7 +1548,11 @@ fn migrate_plaintext_database(database: &Path, key: &str) -> Result<(), String> 
 fn open_app_database(data_dir: &Path) -> Result<Connection, String> {
     let database = data_dir.join("file-terminal.db");
     let key = load_database_key(data_dir, database.is_file())?;
-    if database.is_file() && fs::read(&database).map_err(|error| error.to_string())?.starts_with(b"SQLite format 3\0") {
+    if database.is_file()
+        && fs::read(&database)
+            .map_err(|error| error.to_string())?
+            .starts_with(b"SQLite format 3\0")
+    {
         migrate_plaintext_database(&database, &key)?;
     }
     open_encrypted_database(&database, &key)
@@ -1250,7 +1580,11 @@ const RECOVERABLE_TABLES: &[&str] = &[
     "index_jobs",
 ];
 
-fn database_table_columns(connection: &Connection, schema: &str, table: &str) -> Result<Vec<String>, String> {
+fn database_table_columns(
+    connection: &Connection,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, String> {
     let mut statement = connection
         .prepare(&format!("PRAGMA {schema}.table_info('{table}')"))
         .map_err(|error| error.to_string())?;
@@ -1305,7 +1639,11 @@ fn restore_fts_without_duplicates(connection: &Connection) -> Result<usize, Stri
     Ok(connection.changes() as usize)
 }
 
-fn restore_default_singleton_setting(connection: &Connection, table: &str, default_predicate: &str) -> Result<usize, String> {
+fn restore_default_singleton_setting(
+    connection: &Connection,
+    table: &str,
+    default_predicate: &str,
+) -> Result<usize, String> {
     if database_table_columns(connection, "recovery", table)?.is_empty() {
         return Ok(0);
     }
@@ -1326,7 +1664,11 @@ fn restore_default_singleton_setting(connection: &Connection, table: &str, defau
         .into_iter()
         .filter(|column| source_columns.contains(column))
         .collect::<Vec<_>>();
-    let quoted = columns.iter().map(|column| format!("\"{column}\"")).collect::<Vec<_>>().join(", ");
+    let quoted = columns
+        .iter()
+        .map(|column| format!("\"{column}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     connection
         .execute(
             &format!("INSERT OR REPLACE INTO main.\"{table}\" ({quoted}) SELECT {quoted} FROM recovery.\"{table}\" WHERE id = 1"),
@@ -1336,7 +1678,11 @@ fn restore_default_singleton_setting(connection: &Connection, table: &str, defau
     Ok(connection.changes() as usize)
 }
 
-fn restore_quarantined_database(connection: &Connection, recovery: &Path, key: &str) -> Result<usize, String> {
+fn restore_quarantined_database(
+    connection: &Connection,
+    recovery: &Path,
+    key: &str,
+) -> Result<usize, String> {
     let database = recovery.join("file-terminal.db");
     if !database.is_file() {
         return Err("恢复目录中没有 file-terminal.db。".to_string());
@@ -1344,10 +1690,14 @@ fn restore_quarantined_database(connection: &Connection, recovery: &Path, key: &
     let database_path = database.display().to_string().replace('\'', "''");
     let escaped_key = key.replace('\'', "''");
     connection
-        .execute_batch(&format!("ATTACH DATABASE '{database_path}' AS recovery KEY '{escaped_key}';"))
+        .execute_batch(&format!(
+            "ATTACH DATABASE '{database_path}' AS recovery KEY '{escaped_key}';"
+        ))
         .map_err(|_| "当前 Windows 凭据无法解锁旧数据库。".to_string())?;
     if connection
-        .query_row("PRAGMA recovery.schema_version", [], |row| row.get::<_, i64>(0))
+        .query_row("PRAGMA recovery.schema_version", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .is_err()
     {
         let _ = connection.execute_batch("DETACH DATABASE recovery;");
@@ -1355,7 +1705,9 @@ fn restore_quarantined_database(connection: &Connection, recovery: &Path, key: &
     }
 
     let restored = (|| -> Result<usize, String> {
-        connection.execute_batch("BEGIN IMMEDIATE;").map_err(|error| error.to_string())?;
+        connection
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|error| error.to_string())?;
         let result = (|| -> Result<usize, String> {
             // Parent records are deliberately restored first so foreign-key relationships stay valid.
             let mut restored = 0;
@@ -1364,10 +1716,24 @@ fn restore_quarantined_database(connection: &Connection, recovery: &Path, key: &
             }
             restored += restore_fts_without_duplicates(connection)?;
             // New empty databases contain these defaults. Restore an older user setting only while it is untouched.
-            restored += restore_default_singleton_setting(connection, "media_settings", "whisper_model_path = '' AND ocr_language = 'chi_sim+eng'")?;
-            restored += restore_default_singleton_setting(connection, "agent_preferences", "auto_apply_low_risk = 0")?;
-            restored += restore_default_singleton_setting(connection, "runtime_settings", "execution_mode = 'auto' AND threads = 4 AND context_size = 4096")?;
-            connection.execute_batch("COMMIT;").map_err(|error| error.to_string())?;
+            restored += restore_default_singleton_setting(
+                connection,
+                "media_settings",
+                "whisper_model_path = '' AND ocr_language = 'chi_sim+eng'",
+            )?;
+            restored += restore_default_singleton_setting(
+                connection,
+                "agent_preferences",
+                "auto_apply_low_risk = 0",
+            )?;
+            restored += restore_default_singleton_setting(
+                connection,
+                "runtime_settings",
+                "execution_mode = 'auto' AND threads = 4 AND context_size = 4096",
+            )?;
+            connection
+                .execute_batch("COMMIT;")
+                .map_err(|error| error.to_string())?;
             Ok(restored)
         })();
         if result.is_err() {
@@ -1392,7 +1758,12 @@ fn restore_quarantined_databases(connection: &Connection, data_dir: &Path) -> Op
 
     for entry in entries.flatten() {
         let recovery = entry.path();
-        if !recovery.is_dir() || !entry.file_name().to_string_lossy().starts_with("unreadable-") {
+        if !recovery.is_dir()
+            || !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("unreadable-")
+        {
             continue;
         }
         let status_file = recovery.join(AUTO_RESTORE_STATUS_FILE);
@@ -1406,7 +1777,9 @@ fn restore_quarantined_databases(connection: &Connection, data_dir: &Path) -> Op
             Ok(records) => {
                 let _ = fs::write(
                     recovery.join(AUTO_RESTORE_STATUS_FILE),
-                    format!("status=restored\nrecords={records}\noriginal_database_retained=true\n"),
+                    format!(
+                        "status=restored\nrecords={records}\noriginal_database_retained=true\n"
+                    ),
                 );
                 restored_records += records;
                 restored_directories += 1;
@@ -1440,7 +1813,8 @@ fn restore_quarantined_databases(connection: &Connection, data_dir: &Path) -> Op
 
 fn recovery_mode_connection(error: String) -> Result<(Connection, Option<String>, bool), String> {
     // The in-memory database exists only to keep the Tauri shell alive. It is never written to disk.
-    let connection = Connection::open_in_memory().map_err(|connection_error| connection_error.to_string())?;
+    let connection =
+        Connection::open_in_memory().map_err(|connection_error| connection_error.to_string())?;
     initialize_database(&connection)?;
     Ok((
         connection,
@@ -1451,11 +1825,15 @@ fn recovery_mode_connection(error: String) -> Result<(Connection, Option<String>
     ))
 }
 
-fn open_app_database_with_recovery(data_dir: &Path) -> Result<(Connection, Option<String>, bool), String> {
+fn open_app_database_with_recovery(
+    data_dir: &Path,
+) -> Result<(Connection, Option<String>, bool), String> {
     match open_app_database(data_dir) {
         Ok(connection) => Ok((connection, None, false)),
         // Any failure against an existing database must preserve it and still show the user a recovery path.
-        Err(error) if data_dir.join("file-terminal.db").is_file() => recovery_mode_connection(error),
+        Err(error) if data_dir.join("file-terminal.db").is_file() => {
+            recovery_mode_connection(error)
+        }
         Err(error) => Err(error),
     }
 }
@@ -1486,6 +1864,10 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 source_size INTEGER,
                 source_modified_ms INTEGER,
                 source_sha256 TEXT,
+                content_status TEXT NOT NULL DEFAULT 'pending',
+                content_reason_code TEXT,
+                extracted_chars INTEGER NOT NULL DEFAULT 0,
+                content_indexed_at TEXT,
                 FOREIGN KEY(folder_id) REFERENCES folder_refs(id)
             );
             CREATE INDEX IF NOT EXISTS index_items_folder_idx ON index_items(folder_id);
@@ -1530,6 +1912,19 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(item_id) REFERENCES index_items(id)
             );
             CREATE INDEX IF NOT EXISTS media_tasks_status_idx ON media_tasks(status, created_at);
+            CREATE TABLE IF NOT EXISTS download_tasks (
+                id TEXT PRIMARY KEY,
+                resource_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+                completed INTEGER NOT NULL DEFAULT 0,
+                total INTEGER,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_active_resource_idx ON download_tasks(resource_id) WHERE status IN ('queued', 'running');
+            CREATE INDEX IF NOT EXISTS download_tasks_status_idx ON download_tasks(status, created_at);
             CREATE TABLE IF NOT EXISTS media_extractions (
                 item_id TEXT NOT NULL,
                 kind TEXT NOT NULL,
@@ -1675,6 +2070,20 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     ensure_column(
         connection,
         "index_items",
+        "content_status",
+        "TEXT NOT NULL DEFAULT 'pending'",
+    )?;
+    ensure_column(connection, "index_items", "content_reason_code", "TEXT")?;
+    ensure_column(
+        connection,
+        "index_items",
+        "extracted_chars",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(connection, "index_items", "content_indexed_at", "TEXT")?;
+    ensure_column(
+        connection,
+        "index_items",
         "cloud_policy",
         "TEXT NOT NULL DEFAULT 'inherit'",
     )?;
@@ -1684,6 +2093,16 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
         "display_name",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    recover_interrupted_media_tasks(connection)?;
+    Ok(())
+}
+
+fn recover_interrupted_media_tasks(connection: &Connection) -> Result<(), String> {
+    // Interrupted commands cannot survive a process restart; put them back in the durable queue.
+    connection.execute(
+        "UPDATE media_tasks SET status = 'queued', error = '应用重启后重新排队', updated_at = datetime('now') WHERE status = 'running'",
+        [],
+    ).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1709,13 +2128,16 @@ fn ensure_column(
         .map_err(|error| error.to_string())
 }
 
-fn start_folder_change_watch(app: AppHandle, data_dir: PathBuf) {
+fn start_folder_change_watch(
+    app: AppHandle,
+    data_dir: PathBuf,
+    statuses: Arc<Mutex<HashMap<String, FolderWatchStatus>>>,
+) {
     thread::spawn(move || {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let Ok(mut watcher) = RecommendedWatcher::new(sender, NotifyConfig::default()) else {
-            return;
-        };
+        let mut watcher = RecommendedWatcher::new(sender.clone(), NotifyConfig::default()).ok();
         let mut watched_roots = HashMap::<PathBuf, String>::new();
+        let mut health = FolderWatchHealth::healthy();
         loop {
             let Ok(connection) = open_app_database(&data_dir) else {
                 thread::sleep(Duration::from_secs(5));
@@ -1735,21 +2157,57 @@ fn start_folder_change_watch(app: AppHandle, data_dir: PathBuf) {
                 })
                 .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
                 .unwrap_or_default();
-            let active_roots = roots.iter().map(|(_, root)| root.clone()).collect::<HashSet<_>>();
+            let active_roots = roots
+                .iter()
+                .map(|(_, root)| root.clone())
+                .collect::<HashSet<_>>();
             let removed_roots = watched_roots
                 .keys()
                 .filter(|root| !active_roots.contains(*root))
                 .cloned()
                 .collect::<Vec<_>>();
             for root in removed_roots {
-                let _ = watcher.unwatch(&root);
+                if let Some(watcher) = watcher.as_mut() {
+                    let _ = watcher.unwatch(&root);
+                }
                 watched_roots.remove(&root);
             }
-            for (folder_id, root) in roots {
-                if root.is_dir() && !watched_roots.contains_key(&root) {
-                    if watcher.watch(&root, RecursiveMode::Recursive).is_ok() {
-                        watched_roots.insert(root, folder_id);
+            if watcher.is_none() {
+                watcher = RecommendedWatcher::new(sender.clone(), NotifyConfig::default()).ok();
+                if watcher.is_some() {
+                    // A new watcher has no registrations. Re-register every live root below.
+                    watched_roots.clear();
+                    health.mark_watch_recovered();
+                } else {
+                    health.mark_watch_failure("watcher_unavailable");
+                }
+            }
+            for (folder_id, root) in &roots {
+                if root.is_dir() && !watched_roots.contains_key(root) {
+                    if let Some(watcher) = watcher.as_mut() {
+                        if watcher.watch(root, RecursiveMode::Recursive).is_ok() {
+                            watched_roots.insert(root.clone(), folder_id.clone());
+                        } else {
+                            health.mark_watch_failure("watch_registration_failed");
+                        }
                     }
+                }
+            }
+            if let Ok(mut values) = statuses.lock() {
+                for (folder_id, _) in &roots {
+                    values.insert(
+                        folder_id.clone(),
+                        FolderWatchStatus {
+                            folder_id: folder_id.clone(),
+                            mode: health.mode.to_string(),
+                            detail: if health.mode == "watching" {
+                                "正在监听文件变更".to_string()
+                            } else {
+                                "监听不可用，已降级为每 30 秒安全扫描".to_string()
+                            },
+                            last_checked_at: "现在".to_string(),
+                        },
+                    );
                 }
             }
             while let Ok(Ok(event)) = receiver.try_recv() {
@@ -1769,9 +2227,33 @@ fn start_folder_change_watch(app: AppHandle, data_dir: PathBuf) {
                     );
                 }
             }
+            let now_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if health.should_scan_at(now_ms) {
+                for (folder_id, _) in &roots {
+                    let _ = app.emit(
+                        "folder-change-detected",
+                        FolderChangeDetected {
+                            folder_id: folder_id.clone(),
+                            changed_at: "定时扫描".to_string(),
+                        },
+                    );
+                }
+            }
             thread::sleep(Duration::from_millis(500));
         }
     });
+}
+
+#[tauri::command]
+fn list_folder_watch_status(state: State<'_, AppState>) -> Vec<FolderWatchStatus> {
+    state
+        .folder_watch_status
+        .lock()
+        .map(|values| values.values().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn ai_output_roots(data_dir: &Path) -> Result<PathBuf, String> {
@@ -1896,13 +2378,24 @@ fn preview_mime(extension: &str) -> Option<(&'static str, &'static str)> {
 }
 
 fn command_available(command: &str) -> bool {
-    Command::new(command).arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+    Command::new(command)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn unique_library_file_path(library: &Path, original_name: &std::ffi::OsStr) -> PathBuf {
     let original = PathBuf::from(original_name);
-    let stem = original.file_stem().unwrap_or(original_name).to_string_lossy();
-    let extension = original.extension().map(|value| format!(".{}", value.to_string_lossy())).unwrap_or_default();
+    let stem = original
+        .file_stem()
+        .unwrap_or(original_name)
+        .to_string_lossy();
+    let extension = original
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
     let mut candidate = library.join(original_name);
     let mut number = 2usize;
     while candidate.exists() {
@@ -1913,7 +2406,12 @@ fn unique_library_file_path(library: &Path, original_name: &std::ffi::OsStr) -> 
 }
 
 fn pdf_renderer_available() -> bool {
-    Command::new("pdftoppm").arg("-v").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+    Command::new("pdftoppm")
+        .arg("-v")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 #[tauri::command]
@@ -1927,49 +2425,106 @@ fn get_local_tool_status() -> LocalToolStatus {
     }
 }
 
-fn extract_pdf_text(path: &Path) -> Option<String> {
-    const MAX_PDF_INDEX_BYTES: u64 = 32 * 1024 * 1024;
-    const MAX_PDF_INDEX_CHARS: usize = 100_000;
-    if fs::metadata(path).ok()?.len() > MAX_PDF_INDEX_BYTES { return None; }
-    let document = Document::load(path).ok()?;
-    let pages = document.get_pages().into_iter().take(200).map(|(page, _)| page).collect::<Vec<_>>();
-    document.extract_text(&pages).ok().map(|content| content.chars().take(MAX_PDF_INDEX_CHARS).collect()).filter(|content: &String| !content.trim().is_empty())
+fn extract_pdf_text(path: &Path) -> ContentExtraction {
+    let metadata = match fs::metadata(path) {
+        Ok(value) => value,
+        Err(_) => return ContentExtraction::status("failed", "extractor_failed"),
+    };
+    if metadata.len() > MAX_PDF_INDEX_BYTES {
+        return ContentExtraction::status("skipped", "file_too_large");
+    }
+    let document = match Document::load(path) {
+        Ok(value) => value,
+        Err(_) => return ContentExtraction::status("failed", "malformed_document"),
+    };
+    if document.is_encrypted() {
+        return ContentExtraction::status("failed", "encrypted_pdf");
+    }
+    let pages = document
+        .get_pages()
+        .into_iter()
+        .map(|(page, _)| page)
+        .collect::<Vec<_>>();
+    if pages.len() > MAX_PDF_INDEX_PAGES {
+        return ContentExtraction::status("skipped", "page_limit");
+    }
+    match document.extract_text(&pages) {
+        Ok(content) if !content.trim().is_empty() => {
+            ContentExtraction::indexed(content.chars().take(MAX_PDF_INDEX_CHARS).collect())
+        }
+        Ok(_) => ContentExtraction::status("skipped", "extractor_failed"),
+        Err(_) => ContentExtraction::status("failed", "extractor_failed"),
+    }
 }
 
 fn office_preview_text(path: &Path) -> Option<String> {
-    extract_document_text(path)
+    extract_document_text(path).content
 }
 
-fn extract_document_text(path: &Path) -> Option<String> {
-    const MAX_INDEX_CONTENT_BYTES: u64 = 512 * 1024;
-    const MAX_INDEX_CHARS: usize = 80_000;
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    let metadata = fs::metadata(path).ok()?;
-    if metadata.len() > MAX_INDEX_CONTENT_BYTES {
-        return None;
-    }
+fn extract_document_text(path: &Path) -> ContentExtraction {
+    let Some(extension) = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+    else {
+        return ContentExtraction::status("unsupported", "unsupported_format");
+    };
+    let metadata = match fs::metadata(path) {
+        Ok(value) => value,
+        Err(_) => return ContentExtraction::status("failed", "extractor_failed"),
+    };
     match extension.as_str() {
         "pdf" => extract_pdf_text(path),
         "txt" | "md" | "csv" | "json" | "log" | "rs" | "ts" | "js" | "html" | "css" | "xml"
         | "yml" | "yaml" | "toml" | "py" | "java" | "kt" | "sql" => {
-            let content = fs::read(path).ok()?;
-            if content.iter().take(8_192).any(|byte| *byte == 0) {
-                return None;
+            if metadata.len() > MAX_TEXT_INDEX_BYTES {
+                return ContentExtraction::status("skipped", "file_too_large");
             }
-            Some(
-                String::from_utf8_lossy(&content)
-                    .chars()
-                    .take(MAX_INDEX_CHARS)
-                    .collect(),
-            )
+            let content = match fs::read(path) {
+                Ok(value) => value,
+                Err(_) => return ContentExtraction::status("failed", "extractor_failed"),
+            };
+            if content.iter().take(8_192).any(|byte| *byte == 0) {
+                return ContentExtraction::status("unsupported", "unsupported_format");
+            }
+            let value = String::from_utf8_lossy(&content)
+                .chars()
+                .take(MAX_TEXT_INDEX_CHARS)
+                .collect::<String>();
+            if value.trim().is_empty() {
+                ContentExtraction::status("skipped", "extractor_failed")
+            } else {
+                ContentExtraction::indexed(value)
+            }
         }
-        // Office files are zip containers. Extract XML text only; unsupported layouts stay metadata-only.
         "docx" | "pptx" | "xlsx" => {
-            let bytes = fs::read(path).ok()?;
-            let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
+            if metadata.len() > MAX_OFFICE_INDEX_BYTES {
+                return ContentExtraction::status("skipped", "file_too_large");
+            }
+            let bytes = match fs::read(path) {
+                Ok(value) => value,
+                Err(_) => return ContentExtraction::status("failed", "extractor_failed"),
+            };
+            let mut archive = match zip::ZipArchive::new(Cursor::new(bytes)) {
+                Ok(value) => value,
+                Err(_) => return ContentExtraction::status("failed", "malformed_document"),
+            };
+            if archive.len() > MAX_OFFICE_ARCHIVE_ENTRIES {
+                return ContentExtraction::status("skipped", "archive_entry_limit");
+            }
             let mut output = String::new();
+            let mut total_uncompressed = 0u64;
             for index in 0..archive.len() {
-                let mut entry = archive.by_index(index).ok()?;
+                let mut entry = match archive.by_index(index) {
+                    Ok(value) => value,
+                    Err(_) => return ContentExtraction::status("failed", "malformed_document"),
+                };
+                total_uncompressed = total_uncompressed.saturating_add(entry.size());
+                if entry.size() > MAX_OFFICE_ENTRY_UNCOMPRESSED_BYTES
+                    || total_uncompressed > MAX_OFFICE_TOTAL_UNCOMPRESSED_BYTES
+                {
+                    return ContentExtraction::status("skipped", "archive_size_limit");
+                }
                 let name = entry.name().to_ascii_lowercase();
                 if !(name.ends_with(".xml")
                     && (name.starts_with("word/")
@@ -1983,13 +2538,17 @@ fn extract_document_text(path: &Path) -> Option<String> {
                     output.push_str(&strip_xml_tags(&xml));
                     output.push('\n');
                 }
-                if output.chars().count() >= MAX_INDEX_CHARS {
+                if output.chars().count() >= MAX_OFFICE_INDEX_CHARS {
                     break;
                 }
             }
-            (!output.trim().is_empty()).then(|| output.chars().take(MAX_INDEX_CHARS).collect())
+            if output.trim().is_empty() {
+                ContentExtraction::status("skipped", "extractor_failed")
+            } else {
+                ContentExtraction::indexed(output.chars().take(MAX_OFFICE_INDEX_CHARS).collect())
+            }
         }
-        _ => None,
+        _ => ContentExtraction::status("unsupported", "unsupported_format"),
     }
 }
 
@@ -2001,7 +2560,7 @@ fn strip_xml_tags(value: &str) -> String {
 }
 
 fn text_content_for_index(path: &Path) -> Option<String> {
-    extract_document_text(path)
+    extract_document_text(path).content
 }
 
 fn active_model_path(state: &AppState) -> PathBuf {
@@ -2034,28 +2593,52 @@ fn detect_gpu_compatibility() -> bool {
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .is_some_and(|output| String::from_utf8_lossy(&output.stdout).to_ascii_lowercase().contains("nvidia"))
+        .is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .to_ascii_lowercase()
+                .contains("nvidia")
+        })
 }
 
-fn runtime_variant_for_settings(settings: &RuntimeSettings) -> Result<&'static RuntimeManifest, String> {
-    let wants_gpu = settings.execution_mode == "gpu" || (settings.execution_mode == "auto" && detect_gpu_compatibility());
+fn runtime_variant_for_settings(
+    settings: &RuntimeSettings,
+) -> Result<&'static RuntimeManifest, String> {
+    let wants_gpu = settings.execution_mode == "gpu"
+        || (settings.execution_mode == "auto" && detect_gpu_compatibility());
     if wants_gpu && detect_gpu_compatibility() {
-        return RUNTIME_MANIFEST.iter().find(|manifest| manifest.gpu)
+        return RUNTIME_MANIFEST
+            .iter()
+            .find(|manifest| manifest.gpu)
             .ok_or_else(|| "未找到受支持的 GPU 运行时清单。".to_string());
     }
     if settings.execution_mode == "gpu" {
-        return Err("未检测到兼容的 NVIDIA GPU / 驱动，已拒绝下载 GPU 运行时。请切换到自动或 CPU 模式。".to_string());
+        return Err(
+            "未检测到兼容的 NVIDIA GPU / 驱动，已拒绝下载 GPU 运行时。请切换到自动或 CPU 模式。"
+                .to_string(),
+        );
     }
-    RUNTIME_MANIFEST.iter().find(|manifest| !manifest.gpu)
+    RUNTIME_MANIFEST
+        .iter()
+        .find(|manifest| !manifest.gpu)
         .ok_or_else(|| "未找到 CPU 运行时清单。".to_string())
 }
 
 #[tauri::command]
-fn get_runtime_settings(state: State<'_, AppState>) -> RuntimeSettings { runtime_settings(&state) }
+fn get_runtime_settings(state: State<'_, AppState>) -> RuntimeSettings {
+    runtime_settings(&state)
+}
 
 #[tauri::command]
-fn save_runtime_settings(input: RuntimeSettings, state: State<'_, AppState>) -> Result<RuntimeSettings, String> {
-    if !matches!(input.execution_mode.as_str(), "auto" | "cpu" | "gpu") || !(1..=64).contains(&input.threads) || !(512..=32768).contains(&input.context_size) { return Err("运行设置超出安全范围。".to_string()); }
+fn save_runtime_settings(
+    input: RuntimeSettings,
+    state: State<'_, AppState>,
+) -> Result<RuntimeSettings, String> {
+    if !matches!(input.execution_mode.as_str(), "auto" | "cpu" | "gpu")
+        || !(1..=64).contains(&input.threads)
+        || !(512..=32768).contains(&input.context_size)
+    {
+        return Err("运行设置超出安全范围。".to_string());
+    }
     state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?.execute("UPDATE runtime_settings SET execution_mode = ?1, threads = ?2, context_size = ?3 WHERE id = 1", params![input.execution_mode, input.threads, input.context_size]).map_err(|error| error.to_string())?;
     Ok(input)
 }
@@ -2066,16 +2649,85 @@ fn run_environment_acceptance(state: State<'_, AppState>) -> Vec<AcceptanceCheck
     let model = active_model_path(&state);
     let tools = get_local_tool_status();
     vec![
-        AcceptanceCheck { id: "runtime".into(), label: "llama.cpp 运行时".into(), status: if runtime.is_file() { "passed" } else { "failed" }.into(), detail: "运行时包通过版本固定清单与 SHA-256 校验后安装。".into() },
-        AcceptanceCheck { id: "gpu".into(), label: "GPU 推理兼容性".into(), status: if detect_gpu_compatibility() { "manual" } else { "skipped" }.into(), detail: if detect_gpu_compatibility() { "已发现 NVIDIA GPU；仍需以实际 llama.cpp GPU 推理完成验收。".into() } else { "未发现可用 NVIDIA 驱动，应用将使用 CPU 运行时。".into() } },
-        AcceptanceCheck { id: "model".into(), label: "本地 GGUF 模型".into(), status: if model.is_file() { "passed" } else { "failed" }.into(), detail: "检查当前模型文件可读。".into() },
-        AcceptanceCheck { id: "pdf".into(), label: "PDF 正文解析".into(), status: if tools.pdf_text { "passed" } else { "failed" }.into(), detail: "内置本地 PDF 文本解析器。".into() },
-        AcceptanceCheck { id: "office".into(), label: "Office 文本提取".into(), status: "manual".into(), detail: "需要在用户含复杂 Office 文件的设备上实测。".into() },
-        AcceptanceCheck { id: "ocr".into(), label: "OCR".into(), status: if tools.ocr { "manual" } else { "skipped" }.into(), detail: "需安装本地 Tesseract 后使用。".into() },
-        AcceptanceCheck { id: "transcription".into(), label: "音视频转写".into(), status: if tools.transcription && tools.ffmpeg { "manual" } else { "skipped" }.into(), detail: "需安装本地 Whisper 和 FFmpeg 后使用。".into() },
-        AcceptanceCheck { id: "chinese_path".into(), label: "中文路径".into(), status: "manual".into(), detail: "需在最终用户设备选择中文路径资料夹实测。".into() },
-        AcceptanceCheck { id: "cloud".into(), label: "云端协作".into(), status: "manual".into(), detail: "需配置用户自己的供应商后发送脱敏测试请求。".into() },
-        AcceptanceCheck { id: "updater".into(), label: "自动更新".into(), status: "manual".into(), detail: "需使用已签名发布包在最终用户设备实测。".into() },
+        AcceptanceCheck {
+            id: "runtime".into(),
+            label: "llama.cpp 运行时".into(),
+            status: if runtime.is_file() {
+                "passed"
+            } else {
+                "failed"
+            }
+            .into(),
+            detail: "运行时包通过版本固定清单与 SHA-256 校验后安装。".into(),
+        },
+        AcceptanceCheck {
+            id: "gpu".into(),
+            label: "GPU 推理兼容性".into(),
+            status: if detect_gpu_compatibility() {
+                "manual"
+            } else {
+                "skipped"
+            }
+            .into(),
+            detail: if detect_gpu_compatibility() {
+                "已发现 NVIDIA GPU；仍需以实际 llama.cpp GPU 推理完成验收。".into()
+            } else {
+                "未发现可用 NVIDIA 驱动，应用将使用 CPU 运行时。".into()
+            },
+        },
+        AcceptanceCheck {
+            id: "model".into(),
+            label: "本地 GGUF 模型".into(),
+            status: if model.is_file() { "passed" } else { "failed" }.into(),
+            detail: "检查当前模型文件可读。".into(),
+        },
+        AcceptanceCheck {
+            id: "pdf".into(),
+            label: "PDF 正文解析".into(),
+            status: if tools.pdf_text { "passed" } else { "failed" }.into(),
+            detail: "内置本地 PDF 文本解析器。".into(),
+        },
+        AcceptanceCheck {
+            id: "office".into(),
+            label: "Office 文本提取".into(),
+            status: "manual".into(),
+            detail: "需要在用户含复杂 Office 文件的设备上实测。".into(),
+        },
+        AcceptanceCheck {
+            id: "ocr".into(),
+            label: "OCR".into(),
+            status: if tools.ocr { "manual" } else { "skipped" }.into(),
+            detail: "需安装本地 Tesseract 后使用。".into(),
+        },
+        AcceptanceCheck {
+            id: "transcription".into(),
+            label: "音视频转写".into(),
+            status: if tools.transcription && tools.ffmpeg {
+                "manual"
+            } else {
+                "skipped"
+            }
+            .into(),
+            detail: "需安装本地 Whisper 和 FFmpeg 后使用。".into(),
+        },
+        AcceptanceCheck {
+            id: "chinese_path".into(),
+            label: "中文路径".into(),
+            status: "manual".into(),
+            detail: "需在最终用户设备选择中文路径资料夹实测。".into(),
+        },
+        AcceptanceCheck {
+            id: "cloud".into(),
+            label: "云端协作".into(),
+            status: "manual".into(),
+            detail: "需配置用户自己的供应商后发送脱敏测试请求。".into(),
+        },
+        AcceptanceCheck {
+            id: "updater".into(),
+            label: "自动更新".into(),
+            status: "manual".into(),
+            detail: "需使用已签名发布包在最终用户设备实测。".into(),
+        },
     ]
 }
 
@@ -2086,7 +2738,8 @@ fn index_content(connection: &Connection, item_id: &str, path: &Path) -> Result<
             params![item_id],
         )
         .map_err(|error| error.to_string())?;
-    let mut content = text_content_for_index(path).unwrap_or_default();
+    let extraction = extract_document_text(path);
+    let mut content = extraction.content.unwrap_or_default();
     let extracted = {
         let mut statement = connection
             .prepare("SELECT content FROM media_extractions WHERE item_id = ?1")
@@ -2099,18 +2752,37 @@ fn index_content(connection: &Connection, item_id: &str, path: &Path) -> Result<
         values
     };
     for value in extracted {
-        if !content.is_empty() { content.push('\n'); }
+        if !content.is_empty() {
+            content.push('\n');
+        }
         content.push_str(&value);
-        if content.chars().count() >= MAX_MEDIA_OUTPUT_CHARS { break; }
+        if content.chars().count() >= MAX_MEDIA_OUTPUT_CHARS {
+            break;
+        }
     }
     if !content.trim().is_empty() {
         connection
             .execute(
                 "INSERT INTO index_content_fts (item_id, content) VALUES (?1, ?2)",
-                params![item_id, content.chars().take(MAX_MEDIA_OUTPUT_CHARS).collect::<String>()],
+                params![
+                    item_id,
+                    content
+                        .chars()
+                        .take(MAX_MEDIA_OUTPUT_CHARS)
+                        .collect::<String>()
+                ],
             )
             .map_err(|error| error.to_string())?;
     }
+    let (status, reason_code) = if !content.trim().is_empty() {
+        ("indexed", None)
+    } else {
+        (extraction.status, extraction.reason_code)
+    };
+    connection.execute(
+        "UPDATE index_items SET content_status = ?1, content_reason_code = ?2, extracted_chars = ?3, content_indexed_at = datetime('now') WHERE id = ?4",
+        params![status, reason_code, content.chars().count() as i64, item_id],
+    ).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -2123,7 +2795,10 @@ fn source_state(path: &Path) -> (Option<i64>, Option<i64>) {
         .ok()
         .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|value| value.as_millis().min(i64::MAX as u128) as i64);
-    (Some(metadata.len().min(i64::MAX as u64) as i64), modified_ms)
+    (
+        Some(metadata.len().min(i64::MAX as u64) as i64),
+        modified_ms,
+    )
 }
 
 fn source_content_hash(path: &Path) -> Option<String> {
@@ -2137,7 +2812,9 @@ fn source_content_hash(path: &Path) -> Option<String> {
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer).ok()?;
-        if read == 0 { break; }
+        if read == 0 {
+            break;
+        }
         hasher.update(&buffer[..read]);
     }
     Some(format!("{:x}", hasher.finalize()))
@@ -2210,19 +2887,31 @@ fn pdf_thumbnail_bytes(path: &Path, cache_dir: &Path) -> Result<(&'static str, V
     let prefix = work_dir.join("page");
     let result = command_output_with_timeout(
         Command::new("pdftoppm")
-            .arg("-f").arg("1").arg("-l").arg("1")
-            .arg("-png").arg("-scale-to-x").arg("320").arg("-scale-to-y").arg("-1")
-            .arg(path).arg(&prefix),
+            .arg("-f")
+            .arg("1")
+            .arg("-l")
+            .arg("1")
+            .arg("-png")
+            .arg("-scale-to-x")
+            .arg("320")
+            .arg("-scale-to-y")
+            .arg("-1")
+            .arg(path)
+            .arg(&prefix),
         Duration::from_secs(30),
     );
     let output = prefix.with_file_name("page-1.png");
     let bytes = result.and_then(|result| {
-        if !result.status.success() { return Err("本地 PDF 渲染失败。".to_string()); }
+        if !result.status.success() {
+            return Err("本地 PDF 渲染失败。".to_string());
+        }
         fs::read(&output).map_err(|error| error.to_string())
     });
     let _ = fs::remove_dir_all(&work_dir);
     let bytes = bytes?;
-    if bytes.len() > MAX_THUMBNAIL_BYTES { return Err("生成的 PDF 缩略图超过安全大小限制。".to_string()); }
+    if bytes.len() > MAX_THUMBNAIL_BYTES {
+        return Err("生成的 PDF 缩略图超过安全大小限制。".to_string());
+    }
     Ok(("image/png", bytes))
 }
 
@@ -2296,7 +2985,10 @@ fn llama_server_path(state: &AppState) -> PathBuf {
     state.data_dir.join("runtime").join("llama-server.exe")
 }
 
-async fn start_embedding_server(state: &AppState, model: &EmbeddingModel) -> Result<(std::process::Child, reqwest::Client, String), String> {
+async fn start_embedding_server(
+    state: &AppState,
+    model: &EmbeddingModel,
+) -> Result<(std::process::Child, reqwest::Client, String), String> {
     const EMBEDDING_PORT: u16 = 18081;
     let runtime = llama_server_path(state);
     if !runtime.is_file() || !Path::new(&model.path).is_file() {
@@ -2322,7 +3014,12 @@ async fn start_embedding_server(state: &AppState, model: &EmbeddingModel) -> Res
         .map_err(|error| error.to_string())?;
     let url = format!("http://127.0.0.1:{EMBEDDING_PORT}/embedding");
     for _ in 0..30 {
-        if client.get(format!("http://127.0.0.1:{EMBEDDING_PORT}/health")).send().await.is_ok() {
+        if client
+            .get(format!("http://127.0.0.1:{EMBEDDING_PORT}/health"))
+            .send()
+            .await
+            .is_ok()
+        {
             return Ok((child, client, url));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2332,7 +3029,11 @@ async fn start_embedding_server(state: &AppState, model: &EmbeddingModel) -> Res
     Err("本地 embedding 服务启动超时。".to_string())
 }
 
-async fn request_embedding(client: &reqwest::Client, url: &str, text: &str) -> Result<Vec<f32>, String> {
+async fn request_embedding(
+    client: &reqwest::Client,
+    url: &str,
+    text: &str,
+) -> Result<Vec<f32>, String> {
     const MAX_EMBEDDING_CHARS: usize = 7_000;
     let payload = serde_json::json!({ "content": text.chars().take(MAX_EMBEDDING_CHARS).collect::<String>() });
     let body = client
@@ -2349,11 +3050,23 @@ async fn request_embedding(client: &reqwest::Client, url: &str, text: &str) -> R
     let values = body
         .get("embedding")
         .and_then(serde_json::Value::as_array)
-        .or_else(|| body.get("data").and_then(serde_json::Value::as_array).and_then(|items| items.first()).and_then(|item| item.get("embedding")).and_then(serde_json::Value::as_array))
+        .or_else(|| {
+            body.get("data")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("embedding"))
+                .and_then(serde_json::Value::as_array)
+        })
         .ok_or_else(|| "本地 embedding 服务返回了不受支持的响应。".to_string())?;
     let vector = values
         .iter()
-        .map(|value| value.as_f64().map(|item| item as f32).filter(|item| item.is_finite()).ok_or_else(|| "本地 embedding 向量包含无效数值。".to_string()))
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|item| item as f32)
+                .filter(|item| item.is_finite())
+                .ok_or_else(|| "本地 embedding 向量包含无效数值。".to_string())
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if vector.is_empty() || vector.len() > 16_384 {
         return Err("本地 embedding 向量维度无效。".to_string());
@@ -2361,7 +3074,11 @@ async fn request_embedding(client: &reqwest::Client, url: &str, text: &str) -> R
     Ok(vector)
 }
 
-async fn embed_text(state: &AppState, model: &EmbeddingModel, text: &str) -> Result<Vec<f32>, String> {
+async fn embed_text(
+    state: &AppState,
+    model: &EmbeddingModel,
+    text: &str,
+) -> Result<Vec<f32>, String> {
     let (mut child, client, url) = start_embedding_server(state, model).await?;
     let result = request_embedding(&client, &url, text).await;
     let _ = child.kill();
@@ -2434,7 +3151,13 @@ where
         .query_row(
             "SELECT root_path, note, tags_json FROM folder_refs WHERE id = ?1",
             params![folder_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .map_err(|_| "接入文件夹不存在。".to_string())?;
     let root = PathBuf::from(root_path);
@@ -2468,7 +3191,13 @@ where
     let mut seen = HashSet::new();
     let mut changed = 0usize;
     for (position, entry) in entries.into_iter().enumerate() {
-        let status = connection.query_row("SELECT status FROM index_jobs WHERE id = ?1", params![job_id], |row| row.get::<_, String>(0)).unwrap_or_else(|_| "cancelled".to_string());
+        let status = connection
+            .query_row(
+                "SELECT status FROM index_jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "cancelled".to_string());
         if status == "paused" {
             return Ok(changed);
         }
@@ -2478,29 +3207,54 @@ where
         let path = entry.path();
         let item_path = path.display().to_string();
         seen.insert(item_path.clone());
-        let item_type = if entry.file_type().is_dir() { "folder" } else { "file" };
+        let item_type = if entry.file_type().is_dir() {
+            "folder"
+        } else {
+            "file"
+        };
         let name = if path == root {
-            root.file_name().and_then(|value| value.to_str()).unwrap_or("未命名文件夹").to_string()
+            root.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("未命名文件夹")
+                .to_string()
         } else {
             entry.file_name().to_string_lossy().to_string()
         };
         let (source_size, source_modified_ms) = source_state(path);
         let source_sha256 = source_content_hash(path);
         match existing.get(&item_path) {
-            Some((id, _, previous_type, _, _, _, previous_size, previous_modified, previous_hash))
-                if previous_type == item_type && previous_size == &source_size && previous_modified == &source_modified_ms && previous_hash == &source_sha256 => {}
+            Some((
+                id,
+                _,
+                previous_type,
+                _,
+                _,
+                _,
+                previous_size,
+                previous_modified,
+                previous_hash,
+            )) if previous_type == item_type
+                && previous_size == &source_size
+                && previous_modified == &source_modified_ms
+                && previous_hash == &source_sha256 => {}
             Some((id, _, _, _, _, _, _, _, _)) => {
                 connection.execute(
                     "UPDATE index_items SET item_type = ?1, name = ?2, source_size = ?3, source_modified_ms = ?4, source_sha256 = ?5 WHERE id = ?6",
                     params![item_type, name, source_size, source_modified_ms, source_sha256, id],
                 ).map_err(|error| error.to_string())?;
-                if item_type == "file" { index_content(connection, id, path)?; }
+                if item_type == "file" {
+                    index_content(connection, id, path)?;
+                }
                 changed += 1;
             }
             None => {
                 let id = Uuid::new_v4().to_string();
                 let (note, tags, policy) = if path == root {
-                    (folder_note.clone(), folder_tags.clone(), "inherit".to_string())
+                    (
+                        folder_note.clone(),
+                        folder_tags.clone(),
+                        "inherit".to_string(),
+                    )
                 } else {
                     (String::new(), folder_tags.clone(), "inherit".to_string())
                 };
@@ -2508,7 +3262,9 @@ where
                     "INSERT INTO index_items (id, folder_id, item_type, name, path, note, tags_json, cloud_policy, source_size, source_modified_ms, source_sha256) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![id, folder_id, item_type, name, item_path, note, tags, policy, source_size, source_modified_ms, source_sha256],
                 ).map_err(|error| error.to_string())?;
-                if item_type == "file" { index_content(connection, &id, path)?; }
+                if item_type == "file" {
+                    index_content(connection, &id, path)?;
+                }
                 changed += 1;
             }
         }
@@ -2524,8 +3280,15 @@ where
     }
     for (path, (id, _, _, _, _, _, _, _, _)) in existing {
         if !seen.contains(&path) {
-            connection.execute("DELETE FROM index_content_fts WHERE item_id = ?1", params![id]).map_err(|error| error.to_string())?;
-            connection.execute("DELETE FROM index_items WHERE id = ?1", params![id]).map_err(|error| error.to_string())?;
+            connection
+                .execute(
+                    "DELETE FROM index_content_fts WHERE item_id = ?1",
+                    params![id],
+                )
+                .map_err(|error| error.to_string())?;
+            connection
+                .execute("DELETE FROM index_items WHERE id = ?1", params![id])
+                .map_err(|error| error.to_string())?;
             changed += 1;
         }
     }
@@ -2676,7 +3439,9 @@ fn local_agent_reply(
         .arg("--no-display-prompt")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if settings.execution_mode == "cpu" { command.arg("-ngl").arg("0"); }
+    if settings.execution_mode == "cpu" {
+        command.arg("-ngl").arg("0");
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return Ok(fallback),
@@ -2763,6 +3528,216 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
     }
 }
 
+fn managed_resource_path(data_dir: &Path, resource: &FixedDownloadResource) -> PathBuf {
+    match resource.resource_type {
+        "whisper_model" => data_dir
+            .join("models")
+            .join("whisper")
+            .join(resource.file_name),
+        "ocr_language" => data_dir.join("ocr-languages").join(resource.file_name),
+        _ => data_dir.join("downloads").join(resource.file_name),
+    }
+}
+
+fn fixed_download_resource(id: &str) -> Result<&'static FixedDownloadResource, String> {
+    FIXED_DOWNLOAD_RESOURCES
+        .iter()
+        .find(|resource| resource.id == id)
+        .ok_or_else(|| "不支持的应用下载资源。".to_string())
+}
+
+#[cfg(test)]
+fn remove_registered_external_model(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("外部模型文件不存在。".to_string());
+    }
+    // This validates removal of a registry entry only; it deliberately never deletes user-owned paths.
+    Ok(())
+}
+
+fn download_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadTask> {
+    Ok(DownloadTask {
+        id: row.get(0)?,
+        resource_id: row.get(1)?,
+        label: row.get(2)?,
+        status: row.get(3)?,
+        completed: row.get::<_, i64>(4)?.max(0) as u64,
+        total: row
+            .get::<_, Option<i64>>(5)?
+            .map(|value| value.max(0) as u64),
+        error: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn create_download_task(
+    connection: &Connection,
+    resource: &FixedDownloadResource,
+) -> Result<DownloadTask, String> {
+    if let Some(task) = connection.query_row(
+        "SELECT id, resource_id, label, status, completed, total, error, created_at, updated_at FROM download_tasks WHERE resource_id = ?1 AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1",
+        params![resource.id], download_task_from_row,
+    ).optional().map_err(|error| error.to_string())? { return Ok(task); }
+    let id = Uuid::new_v4().to_string();
+    connection.execute("INSERT INTO download_tasks (id, resource_id, label, status, created_at, updated_at) VALUES (?1, ?2, ?3, 'queued', datetime('now'), datetime('now'))", params![id, resource.id, resource.label]).map_err(|error| error.to_string())?;
+    connection.query_row("SELECT id, resource_id, label, status, completed, total, error, created_at, updated_at FROM download_tasks WHERE id = ?1", params![id], download_task_from_row).map_err(|error| error.to_string())
+}
+
+fn recover_incomplete_download_tasks(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE download_tasks SET status = 'queued', error = NULL, updated_at = datetime('now') WHERE status = 'running'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn emit_download_task(app: &AppHandle, task: &DownloadTask) {
+    let _ = app.emit("download-task-progress", task);
+}
+
+fn start_download_worker(
+    app: AppHandle,
+    data_dir: PathBuf,
+    cancelled_download_tasks: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+) {
+    thread::spawn(move || loop {
+        let Ok(connection) = open_app_database(&data_dir) else {
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        };
+        let task = connection
+            .query_row(
+                "SELECT id, resource_id, label, status, completed, total, error, created_at, updated_at FROM download_tasks WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1",
+                [],
+                download_task_from_row,
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let Some(task) = task else {
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        };
+        if connection
+            .execute(
+                "UPDATE download_tasks SET status = 'running', error = NULL, updated_at = datetime('now') WHERE id = ?1 AND status = 'queued'",
+                params![task.id],
+            )
+            .unwrap_or(0)
+            != 1
+        {
+            continue;
+        }
+        let running = DownloadTask {
+            status: "running".to_string(),
+            error: None,
+            ..task.clone()
+        };
+        emit_download_task(&app, &running);
+        let token = Arc::new(AtomicBool::new(false));
+        if let Ok(mut tokens) = cancelled_download_tasks.lock() {
+            tokens.insert(task.id.clone(), token.clone());
+        }
+        let outcome = match fixed_download_resource(&task.resource_id) {
+            Ok(resource) => {
+                let destination = managed_resource_path(&data_dir, resource);
+                let create_parent = destination
+                    .parent()
+                    .map(fs::create_dir_all)
+                    .transpose()
+                    .map_err(|error| error.to_string());
+                match create_parent {
+                    Ok(_) => tauri::async_runtime::block_on(download_to_with_progress(
+                        app.clone(),
+                        resource.resource_type,
+                        resource.label,
+                        resource.url,
+                        &destination,
+                        Some(resource.sha256),
+                        Some(&token),
+                        |completed, total| {
+                            connection
+                                .execute(
+                                    "UPDATE download_tasks SET completed = ?1, total = ?2, updated_at = datetime('now') WHERE id = ?3 AND status = 'running'",
+                                    params![completed as i64, total.map(|value| value as i64), task.id],
+                                )
+                                .map_err(|error| error.to_string())?;
+                            emit_download_task(
+                                &app,
+                                &DownloadTask {
+                                    completed,
+                                    total,
+                                    ..running.clone()
+                                },
+                            );
+                            Ok(())
+                        },
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let cancelled = token.load(Ordering::SeqCst);
+        let destination = fixed_download_resource(&task.resource_id)
+            .map(|resource| managed_resource_path(&data_dir, resource))
+            .ok();
+        let completed = destination
+            .as_ref()
+            .and_then(|path| fs::metadata(path).ok())
+            .map(|metadata| metadata.len() as i64)
+            .unwrap_or_else(|| {
+                fs::metadata(
+                    destination
+                        .as_ref()
+                        .map(|path| path.with_extension("partial"))
+                        .unwrap_or_default(),
+                )
+                .map(|metadata| metadata.len() as i64)
+                .unwrap_or(0)
+            });
+        let (status, error) = if cancelled {
+            ("cancelled", Some("用户取消".to_string()))
+        } else {
+            match outcome {
+                Ok(()) => ("completed", None),
+                Err(error) => ("failed", Some(error)),
+            }
+        };
+        let _ = connection.execute(
+            "UPDATE download_tasks SET status = ?1, completed = ?2, total = CASE WHEN ?1 = 'completed' THEN ?2 ELSE total END, error = ?3, updated_at = datetime('now') WHERE id = ?4 AND status = 'running'",
+            params![status, completed, error, task.id],
+        );
+        if status == "completed" && task.resource_id == "whisper-tiny" {
+            if let Some(path) = destination.as_ref() {
+                let _ = connection.execute(
+                    "UPDATE media_settings SET whisper_model_path = ?1 WHERE id = 1",
+                    params![path.display().to_string()],
+                );
+            }
+        }
+        if let Ok(mut tokens) = cancelled_download_tasks.lock() {
+            tokens.remove(&task.id);
+        }
+        let final_task = connection
+            .query_row(
+                "SELECT id, resource_id, label, status, completed, total, error, created_at, updated_at FROM download_tasks WHERE id = ?1",
+                params![task.id],
+                download_task_from_row,
+            )
+            .unwrap_or(DownloadTask {
+                status: status.to_string(),
+                error,
+                completed: completed.max(0) as u64,
+                ..task
+            });
+        emit_download_task(&app, &final_task);
+    });
+}
+
 async fn download_to(
     app: AppHandle,
     kind: &str,
@@ -2771,6 +3746,32 @@ async fn download_to(
     destination: &Path,
     expected_sha256: Option<&str>,
 ) -> Result<(), String> {
+    download_to_with_progress(
+        app,
+        kind,
+        source,
+        url,
+        destination,
+        expected_sha256,
+        None,
+        |_, _| Ok(()),
+    )
+    .await
+}
+
+async fn download_to_with_progress<F>(
+    app: AppHandle,
+    kind: &str,
+    source: &str,
+    url: &str,
+    destination: &Path,
+    expected_sha256: Option<&str>,
+    cancelled: Option<&AtomicBool>,
+    mut on_progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(u64, Option<u64>) -> Result<(), String>,
+{
     let temporary = destination.with_extension("partial");
     let result = async {
         let client = reqwest::Client::builder()
@@ -2784,6 +3785,9 @@ async fn download_to(
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         let mut request = client.get(url);
+        if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
+            return Err("下载任务已取消。".to_string());
+        }
         if resumed_bytes > 0 {
             request = request.header(reqwest::header::RANGE, format!("bytes={resumed_bytes}-"));
             // Range resume
@@ -2817,8 +3821,12 @@ async fn download_to(
         .map_err(|error| error.to_string())?;
         let mut stream = response.bytes_stream();
         let mut completed = if append { resumed_bytes } else { 0 };
+        on_progress(completed, total)?;
 
         while let Some(chunk) = stream.next().await {
+            if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
+                return Err("下载任务已取消。".to_string());
+            }
             let bytes = chunk.map_err(|error| format!("下载中断：{error}"))?;
             output
                 .write_all(&bytes)
@@ -2834,6 +3842,7 @@ async fn download_to(
                 },
             )
             .map_err(|error| error.to_string())?;
+            on_progress(completed, total)?;
         }
         output.flush().map_err(|error| error.to_string())?;
         drop(output);
@@ -2873,6 +3882,127 @@ async fn download_with_fallback(app: AppHandle, destination: &Path) -> Result<()
         "模型下载失败，已依次尝试官方源和镜像：{}",
         failures.join("；")
     ))
+}
+
+#[tauri::command]
+fn list_managed_download_resources(state: State<'_, AppState>) -> Vec<ManagedDownloadResource> {
+    FIXED_DOWNLOAD_RESOURCES
+        .iter()
+        .map(|resource| {
+            let path = managed_resource_path(&state.data_dir, resource);
+            let valid = path.is_file() && verify_sha256(&path, resource.sha256).is_ok();
+            ManagedDownloadResource {
+                id: resource.id.to_string(),
+                label: resource.label.to_string(),
+                resource_type: resource.resource_type.to_string(),
+                status: if valid { "installed" } else { "not_installed" }.to_string(),
+                bytes: fs::metadata(&path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+                path: display_path(&path),
+                source: resource.url.to_string(),
+                can_delete: true,
+            }
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn list_download_tasks(state: State<'_, AppState>) -> Result<Vec<DownloadTask>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut statement = connection.prepare("SELECT id, resource_id, label, status, completed, total, error, created_at, updated_at FROM download_tasks ORDER BY updated_at DESC LIMIT 100").map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], download_task_from_row)
+        .map_err(|error| error.to_string())?;
+    let tasks = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(tasks)
+}
+
+#[tauri::command]
+fn download_managed_resource(
+    input: ManagedDownloadInput,
+    state: State<'_, AppState>,
+) -> Result<DownloadTask, String> {
+    let resource = fixed_download_resource(&input.resource_id)?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    create_download_task(&connection, resource)
+}
+
+#[tauri::command]
+fn retry_download_task(
+    input: DownloadTaskIdInput,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let changed = connection.execute(
+        "UPDATE download_tasks SET status = 'queued', error = NULL, updated_at = datetime('now') WHERE id = ?1 AND status IN ('failed', 'cancelled')",
+        params![input.id],
+    ).map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err("下载任务无法重试或已完成。".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_download_task(
+    input: DownloadTaskIdInput,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if let Ok(tokens) = state.cancelled_download_tasks.lock() {
+        if let Some(token) = tokens.get(&input.id) {
+            token.store(true, Ordering::SeqCst);
+        }
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let changed = connection.execute(
+        "UPDATE download_tasks SET status = 'cancelled', error = '用户取消', updated_at = datetime('now') WHERE id = ?1 AND status = 'queued'",
+        params![input.id],
+    ).map_err(|error| error.to_string())?;
+    if changed == 0 {
+        let status = connection
+            .query_row(
+                "SELECT status FROM download_tasks WHERE id = ?1",
+                params![input.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if !matches!(status.as_deref(), Some("running") | Some("cancelled")) {
+            return Err("下载任务无法取消或已完成。".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_managed_download_resource(
+    input: ManagedDownloadDeleteInput,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if !input.confirmed {
+        return Err("请确认后再删除应用下载的资源。".to_string());
+    }
+    let resource = fixed_download_resource(&input.resource_id)?;
+    let path = managed_resource_path(&state.data_dir, resource);
+    if path.is_file() {
+        fs::remove_file(&path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3029,16 +4159,23 @@ fn delete_local_model(input: IdInput, state: State<'_, AppState>) -> Result<(), 
 
 #[tauri::command]
 fn list_embedding_models(state: State<'_, AppState>) -> Result<Vec<EmbeddingModel>, String> {
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
     let mut statement = connection
         .prepare("SELECT id, display_name, path, active, dimensions FROM embedding_models ORDER BY active DESC, created_at DESC")
         .map_err(|error| error.to_string())?;
     let models = statement
-        .query_map([], |row| Ok(EmbeddingModel {
-            id: row.get(0)?, display_name: row.get(1)?, path: row.get(2)?,
-            active: row.get::<_, i64>(3)? != 0,
-            dimensions: row.get::<_, Option<i64>>(4)?.map(|value| value as usize),
-        }))
+        .query_map([], |row| {
+            Ok(EmbeddingModel {
+                id: row.get(0)?,
+                display_name: row.get(1)?,
+                path: row.get(2)?,
+                active: row.get::<_, i64>(3)? != 0,
+                dimensions: row.get::<_, Option<i64>>(4)?.map(|value| value as usize),
+            })
+        })
         .map_err(|error| error.to_string())?
         .filter_map(Result::ok)
         .filter(|model| Path::new(&model.path).is_file())
@@ -3047,38 +4184,88 @@ fn list_embedding_models(state: State<'_, AppState>) -> Result<Vec<EmbeddingMode
 }
 
 #[tauri::command]
-fn register_embedding_model(input: EmbeddingModelInput, state: State<'_, AppState>) -> Result<EmbeddingModel, String> {
-    let path = fs::canonicalize(input.path.trim()).map_err(|_| "找不到本地 embedding GGUF 文件。".to_string())?;
-    if !path.is_file() || !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf")) {
+fn register_embedding_model(
+    input: EmbeddingModelInput,
+    state: State<'_, AppState>,
+) -> Result<EmbeddingModel, String> {
+    let path = fs::canonicalize(input.path.trim())
+        .map_err(|_| "找不到本地 embedding GGUF 文件。".to_string())?;
+    if !path.is_file()
+        || !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
         return Err("仅支持已存在的 embedding GGUF 模型文件。".to_string());
     }
     let model = EmbeddingModel {
         id: Uuid::new_v4().to_string(),
-        display_name: input.display_name.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| path.file_stem().and_then(|name| name.to_str()).unwrap_or("本地 embedding 模型").chars().take(100).collect()),
-        path: path.display().to_string(), active: true, dimensions: None,
+        display_name: input
+            .display_name
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("本地 embedding 模型")
+                    .chars()
+                    .take(100)
+                    .collect()
+            }),
+        path: path.display().to_string(),
+        active: true,
+        dimensions: None,
     };
-    let mut connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
-    let transaction = connection.transaction().map_err(|error| error.to_string())?;
-    transaction.execute("UPDATE embedding_models SET active = 0", []).map_err(|error| error.to_string())?;
+    let mut connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("UPDATE embedding_models SET active = 0", [])
+        .map_err(|error| error.to_string())?;
     transaction.execute("INSERT INTO embedding_models (id, display_name, path, active, created_at) VALUES (?1, ?2, ?3, 1, datetime('now')) ON CONFLICT(path) DO UPDATE SET display_name = excluded.display_name, active = 1", params![model.id, model.display_name, model.path]).map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(model)
 }
 
 #[tauri::command]
-async fn build_embedding_index(app: AppHandle, state: State<'_, AppState>) -> Result<EmbeddingIndexProgress, String> {
+async fn build_embedding_index(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<EmbeddingIndexProgress, String> {
     let model = {
-        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
-        active_embedding_model(&connection)?.ok_or_else(|| "请先选择本地 embedding GGUF 模型。".to_string())?
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "本地数据库被占用。".to_string())?;
+        active_embedding_model(&connection)?
+            .ok_or_else(|| "请先选择本地 embedding GGUF 模型。".to_string())?
     };
     let rows = {
-        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "本地数据库被占用。".to_string())?;
         let mut statement = connection.prepare(
             "SELECT index_items.id, index_items.name, index_items.path, index_items.note, index_items.tags_json, index_items.source_size, index_items.source_modified_ms, COALESCE(index_content_fts.content, '') FROM index_items LEFT JOIN index_content_fts ON index_items.id = index_content_fts.item_id ORDER BY index_items.name COLLATE NOCASE"
         ).map_err(|error| error.to_string())?;
-        let rows = statement.query_map([], |row| Ok((
-            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<i64>>(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, String>(7)?
-        ))).map_err(|error| error.to_string())?.filter_map(Result::ok).collect::<Vec<_>>();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
         rows
     };
     let total = rows.len();
@@ -3086,28 +4273,67 @@ async fn build_embedding_index(app: AppHandle, state: State<'_, AppState>) -> Re
     let mut completed = 0;
     let mut failed = 0;
     for (item_id, name, path, note, tags_json, source_size, source_modified_ms, content) in rows {
-        let signature = embedding_source_signature(&item_id, &name, &note, &tags_json, source_size, source_modified_ms, &content);
-        let current = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?.query_row(
-            "SELECT source_signature FROM item_embeddings WHERE item_id = ?1 AND model_id = ?2", params![item_id, model.id], |row| row.get::<_, String>(0)
-        ).optional().map_err(|error| error.to_string())?;
+        let signature = embedding_source_signature(
+            &item_id,
+            &name,
+            &note,
+            &tags_json,
+            source_size,
+            source_modified_ms,
+            &content,
+        );
+        let current = state
+            .database
+            .lock()
+            .map_err(|_| "本地数据库被占用。".to_string())?
+            .query_row(
+                "SELECT source_signature FROM item_embeddings WHERE item_id = ?1 AND model_id = ?2",
+                params![item_id, model.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
         if current.as_deref() != Some(signature.as_str()) {
-            match request_embedding(&client, &url, &embedding_text(&name, &path, &note, &tags_json, &content)).await {
+            match request_embedding(
+                &client,
+                &url,
+                &embedding_text(&name, &path, &note, &tags_json, &content),
+            )
+            .await
+            {
                 Ok(vector) => {
-                    let vector_json = serde_json::to_string(&vector).map_err(|error| error.to_string())?;
-                    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+                    let vector_json =
+                        serde_json::to_string(&vector).map_err(|error| error.to_string())?;
+                    let connection = state
+                        .database
+                        .lock()
+                        .map_err(|_| "本地数据库被占用。".to_string())?;
                     connection.execute("INSERT INTO item_embeddings (item_id, model_id, source_signature, vector_json, updated_at) VALUES (?1, ?2, ?3, ?4, datetime('now')) ON CONFLICT(item_id, model_id) DO UPDATE SET source_signature = excluded.source_signature, vector_json = excluded.vector_json, updated_at = excluded.updated_at", params![item_id, model.id, signature, vector_json]).map_err(|error| error.to_string())?;
-                    connection.execute("UPDATE embedding_models SET dimensions = ?1 WHERE id = ?2", params![vector.len() as i64, model.id]).map_err(|error| error.to_string())?;
+                    connection
+                        .execute(
+                            "UPDATE embedding_models SET dimensions = ?1 WHERE id = ?2",
+                            params![vector.len() as i64, model.id],
+                        )
+                        .map_err(|error| error.to_string())?;
                 }
                 Err(_) => failed += 1,
             }
         }
         completed += 1;
-        let progress = EmbeddingIndexProgress { completed, total, failed };
+        let progress = EmbeddingIndexProgress {
+            completed,
+            total,
+            failed,
+        };
         let _ = app.emit("embedding-index-progress", &progress);
     }
     let _ = child.kill();
     let _ = child.wait();
-    Ok(EmbeddingIndexProgress { completed, total, failed })
+    Ok(EmbeddingIndexProgress {
+        completed,
+        total,
+        failed,
+    })
 }
 
 #[tauri::command]
@@ -3348,13 +4574,17 @@ fn import_files_to_library(
     let library = fs::canonicalize(&library).map_err(|error| error.to_string())?;
     let mut copied = 0;
     for value in input.paths {
-        let source = fs::canonicalize(&value).map_err(|_| "选择的文件不存在或无法访问。".to_string())?;
+        let source =
+            fs::canonicalize(&value).map_err(|_| "选择的文件不存在或无法访问。".to_string())?;
         if !source.is_file() {
             return Err("上传入口仅接受文件；文件夹请使用“接入文件夹”。".to_string());
         }
-        let file_name = source.file_name().ok_or_else(|| "无法确定上传文件名。".to_string())?;
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| "无法确定上传文件名。".to_string())?;
         let target = unique_library_file_path(&library, file_name);
-        fs::copy(&source, &target).map_err(|error| format!("无法复制 {}：{error}", display_path(&source)))?;
+        fs::copy(&source, &target)
+            .map_err(|error| format!("无法复制 {}：{error}", display_path(&source)))?;
         copied += 1;
     }
     // The managed upload folder is indexed as one reference, preserving imported file copies.
@@ -3419,23 +4649,33 @@ fn list_index_jobs(state: State<'_, AppState>) -> Result<Vec<IndexJob>, String> 
 
 #[tauri::command]
 fn pause_index_job(input: IdInput, state: State<'_, AppState>) -> Result<(), String> {
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
     let changed = connection.execute(
         "UPDATE index_jobs SET status = 'paused', updated_at = datetime('now') WHERE id = ?1 AND status IN ('queued', 'running')",
         params![input.id],
     ).map_err(|error| error.to_string())?;
-    if changed == 0 { return Err("索引任务不可暂停。".to_string()); }
+    if changed == 0 {
+        return Err("索引任务不可暂停。".to_string());
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn resume_index_job(input: IdInput, state: State<'_, AppState>) -> Result<(), String> {
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
     let changed = connection.execute(
         "UPDATE index_jobs SET status = 'queued', updated_at = datetime('now') WHERE id = ?1 AND status IN ('paused', 'failed')",
         params![input.id],
     ).map_err(|error| error.to_string())?;
-    if changed == 0 { return Err("索引任务不可恢复。".to_string()); }
+    if changed == 0 {
+        return Err("索引任务不可恢复。".to_string());
+    }
     Ok(())
 }
 
@@ -3892,12 +5132,28 @@ fn apply_agent_advice_inner(
             return Err("云端建议包含重复文件路径。".to_string());
         }
         if target.exists() && (!input.allow_existing_edits || allow_low_risk_auto_apply) {
-            return Err(format!("拒绝修改已有工作区文件：{}；请在界面中审阅后单独批准。", display_path(&target)));
+            return Err(format!(
+                "拒绝修改已有工作区文件：{}；请在界面中审阅后单独批准。",
+                display_path(&target)
+            ));
         }
-        if target.exists() && (!target.is_file() || fs::metadata(&target).map_err(|error| error.to_string())?.len() > 2 * 1024 * 1024) {
-            return Err(format!("拒绝修改非普通文件或超过 2 MB 的已有文件：{}", display_path(&target)));
+        if target.exists()
+            && (!target.is_file()
+                || fs::metadata(&target)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    > 2 * 1024 * 1024)
+        {
+            return Err(format!(
+                "拒绝修改非普通文件或超过 2 MB 的已有文件：{}",
+                display_path(&target)
+            ));
         }
-        if target.exists() && !fs::canonicalize(&target).map_err(|error| error.to_string())?.starts_with(&root) {
+        if target.exists()
+            && !fs::canonicalize(&target)
+                .map_err(|error| error.to_string())?
+                .starts_with(&root)
+        {
             return Err("拒绝修改指向工作区外部的已有文件。".to_string());
         }
         let parent = target
@@ -3907,7 +5163,10 @@ fn apply_agent_advice_inner(
         targets.push((file, target, parent));
     }
     let mut written = Vec::new();
-    let backup_root = state.data_dir.join("agent-edit-backups").join(&input.run_id);
+    let backup_root = state
+        .data_dir
+        .join("agent-edit-backups")
+        .join(&input.run_id);
     for (file, target, parent) in targets {
         fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
         let parent = fs::canonicalize(&parent).map_err(|error| error.to_string())?;
@@ -3918,15 +5177,23 @@ fn apply_agent_advice_inner(
         if existed {
             let relative = safe_relative_path(&file.relative_path)?;
             let backup = backup_root.join(relative);
-            let backup_parent = backup.parent().ok_or_else(|| "备份路径无效。".to_string())?;
+            let backup_parent = backup
+                .parent()
+                .ok_or_else(|| "备份路径无效。".to_string())?;
             fs::create_dir_all(backup_parent).map_err(|error| error.to_string())?;
             fs::copy(&target, &backup).map_err(|error| format!("无法创建已有文件备份：{error}"))?;
         }
         let mut output = if existed {
-            fs::OpenOptions::new().write(true).truncate(true).open(&target)
+            fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&target)
                 .map_err(|error| format!("无法修改已批准文件：{error}"))?
         } else {
-            fs::OpenOptions::new().write(true).create_new(true).open(&target)
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
                 .map_err(|_| format!("拒绝覆盖已有工作区文件：{}", display_path(&target)))?
         };
         output
@@ -3945,7 +5212,12 @@ fn apply_agent_advice_inner(
     Ok(WorkspaceActionResult {
         status: "files_written".to_string(),
         written_files: written,
-        output: if input.allow_existing_edits { "代码已写入；已创建可恢复备份（agent-edit-backups），请主动选择只读构建或测试检查。".to_string() } else { "代码已写入；请主动选择只读构建或测试检查。".to_string() },
+        output: if input.allow_existing_edits {
+            "代码已写入；已创建可恢复备份（agent-edit-backups），请主动选择只读构建或测试检查。"
+                .to_string()
+        } else {
+            "代码已写入；请主动选择只读构建或测试检查。".to_string()
+        },
     })
 }
 
@@ -4045,9 +5317,15 @@ fn run_workspace_check(
             {
                 prepared.last_diagnostic = Some(diagnostic);
                 prepared.run.status = "check_failed".to_string();
-                prepared.run.feedback = "本地检查失败；可重试或请求受限的自动最小修复。".to_string();
+                prepared.run.feedback =
+                    "本地检查失败；可重试或请求受限的自动最小修复。".to_string();
             }
-        } else if let Some(prepared) = state.prepared_runs.lock().map_err(|_| "任务状态被占用。".to_string())?.get_mut(run_id) {
+        } else if let Some(prepared) = state
+            .prepared_runs
+            .lock()
+            .map_err(|_| "任务状态被占用。".to_string())?
+            .get_mut(run_id)
+        {
             prepared.run.status = "check_complete".to_string();
             prepared.run.feedback = "本地检查成功完成。".to_string();
         }
@@ -4619,6 +5897,141 @@ fn get_privacy_status(state: State<'_, AppState>) -> PrivacyStatus {
     }
 }
 
+fn index_diagnostic_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexDiagnosticItem> {
+    let path: String = row.get(3)?;
+    Ok(IndexDiagnosticItem {
+        id: row.get(0)?,
+        folder_id: row.get(1)?,
+        name: row.get(2)?,
+        display_path: display_path(Path::new(&path)),
+        path,
+        item_type: row.get(4)?,
+        source_size: row.get(5)?,
+        source_modified_ms: row.get(6)?,
+        content_status: row.get(7)?,
+        content_reason_code: row.get(8)?,
+        extracted_chars: row.get::<_, i64>(9)?.max(0) as usize,
+        content_indexed_at: row.get(10)?,
+        media_status: row.get(11)?,
+        embedding_status: row.get(12)?,
+        thumbnail_status: row.get(13)?,
+    })
+}
+
+#[tauri::command]
+fn list_index_diagnostics(
+    input: IndexDiagnosticFilter,
+    state: State<'_, AppState>,
+) -> Result<Vec<IndexDiagnosticItem>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut sql = "SELECT index_items.id, index_items.folder_id, index_items.name, index_items.path, index_items.item_type, index_items.source_size, index_items.source_modified_ms, index_items.content_status, index_items.content_reason_code, index_items.extracted_chars, index_items.content_indexed_at, (SELECT status FROM media_tasks WHERE media_tasks.item_id = index_items.id ORDER BY updated_at DESC LIMIT 1), CASE WHEN EXISTS (SELECT 1 FROM item_embeddings WHERE item_embeddings.item_id = index_items.id) THEN 'indexed' ELSE 'pending' END, CASE WHEN EXISTS (SELECT 1 FROM thumbnail_cache WHERE thumbnail_cache.item_id = index_items.id) THEN 'cached' ELSE 'pending' END FROM index_items WHERE 1 = 1".to_string();
+    let mut values = Vec::<Value>::new();
+    if let Some(folder_id) = input.folder_id.filter(|value| !value.trim().is_empty()) {
+        sql.push_str(" AND index_items.folder_id = ?");
+        values.push(Value::Text(folder_id));
+    }
+    if let Some(item_type) = input
+        .item_type
+        .filter(|value| matches!(value.as_str(), "file" | "folder"))
+    {
+        sql.push_str(" AND index_items.item_type = ?");
+        values.push(Value::Text(item_type));
+    }
+    if let Some(status) = input.content_status.filter(|value| {
+        matches!(
+            value.as_str(),
+            "pending" | "indexed" | "skipped" | "failed" | "unsupported"
+        )
+    }) {
+        sql.push_str(" AND index_items.content_status = ?");
+        values.push(Value::Text(status));
+    }
+    sql.push_str(
+        " ORDER BY index_items.content_indexed_at DESC, index_items.name COLLATE NOCASE LIMIT ?",
+    );
+    values.push(Value::Integer(
+        input.limit.unwrap_or(200).clamp(1, 500) as i64
+    ));
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params_from_iter(values.iter()), index_diagnostic_from_row)
+        .map_err(|error| error.to_string())?;
+    let items = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(items)
+}
+
+#[tauri::command]
+fn retry_index_diagnostics(
+    input: DiagnosticRetryInput,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    const MAX_DIAGNOSTIC_RETRY: usize = 100;
+    if !input.confirmed {
+        return Err("请确认后再重试失败索引项。".to_string());
+    }
+    if input.item_ids.is_empty() || input.item_ids.len() > MAX_DIAGNOSTIC_RETRY {
+        return Err(format!("每次最多重试 {MAX_DIAGNOSTIC_RETRY} 项。"));
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut retried = 0;
+    for item_id in input.item_ids {
+        let path = connection
+            .query_row(
+                "SELECT path FROM index_items WHERE id = ?1 AND item_type = 'file'",
+                params![item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(path) = path {
+            let target = PathBuf::from(path);
+            if target.is_file() {
+                index_content(&connection, &item_id, &target)?;
+                retried += 1;
+            } else {
+                connection.execute("UPDATE index_items SET content_status = 'failed', content_reason_code = 'source_unavailable', extracted_chars = 0, content_indexed_at = datetime('now') WHERE id = ?1", params![item_id]).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(retried)
+}
+
+#[tauri::command]
+fn export_index_diagnostics(
+    input: IndexDiagnosticFilter,
+    state: State<'_, AppState>,
+) -> Result<DiagnosticExport, String> {
+    let items = list_index_diagnostics(input, state)?;
+    Ok(DiagnosticExport {
+        exported_at: "本机导出".to_string(),
+        items,
+    })
+}
+
+#[tauri::command]
+fn list_background_tasks(state: State<'_, AppState>) -> Result<Vec<BackgroundTask>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let mut tasks = connection.prepare("SELECT index_jobs.id, folder_refs.name, index_jobs.status, index_jobs.completed, index_jobs.total, index_jobs.created_at, index_jobs.error FROM index_jobs INNER JOIN folder_refs ON folder_refs.id = index_jobs.folder_id WHERE index_jobs.status <> 'completed' ORDER BY index_jobs.created_at DESC LIMIT 100").map_err(|error| error.to_string())?.query_map([], |row| Ok(BackgroundTask { id: row.get(0)?, task_type: "index".to_string(), target: row.get(1)?, status: row.get(2)?, progress: format!("{}/{}", row.get::<_, i64>(3)?, row.get::<_, i64>(4)?), started_at: row.get(5)?, error: row.get(6)?, supports_pause: true, supports_cancel: false, supports_retry: true })).map_err(|error| error.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+    let media = connection.prepare("SELECT media_tasks.id, index_items.name, media_tasks.kind, media_tasks.status, media_tasks.created_at, media_tasks.error FROM media_tasks INNER JOIN index_items ON index_items.id = media_tasks.item_id WHERE media_tasks.status IN ('queued', 'running', 'failed', 'cancelled') ORDER BY media_tasks.created_at DESC LIMIT 100").map_err(|error| error.to_string())?.query_map([], |row| Ok(BackgroundTask { id: row.get(0)?, task_type: row.get(2)?, target: row.get(1)?, status: row.get(3)?, progress: "本地单线程".to_string(), started_at: row.get(4)?, error: row.get(5)?, supports_pause: false, supports_cancel: true, supports_retry: true })).map_err(|error| error.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+    tasks.extend(media);
+    let downloads = connection.prepare("SELECT id, resource_id, label, status, completed, total, error, created_at FROM download_tasks WHERE status IN ('queued', 'running', 'failed', 'cancelled') ORDER BY created_at DESC LIMIT 100").map_err(|error| error.to_string())?.query_map([], |row| { let status = row.get::<_, String>(3)?; Ok(BackgroundTask { id: row.get(0)?, task_type: format!("download:{}", row.get::<_, String>(1)?), target: row.get(2)?, status: status.clone(), progress: match row.get::<_, Option<i64>>(5)? { Some(total) if total > 0 => format!("{}/{}", row.get::<_, i64>(4)?, total), _ => format!("{}", row.get::<_, i64>(4)?) }, started_at: row.get(7)?, error: row.get(6)?, supports_pause: false, supports_cancel: matches!(status.as_str(), "queued" | "running"), supports_retry: matches!(status.as_str(), "failed" | "cancelled") }) }).map_err(|error| error.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+    tasks.extend(downloads);
+    Ok(tasks)
+}
+
 #[tauri::command]
 fn get_startup_recovery_notice(state: State<'_, AppState>) -> Option<String> {
     state.startup_recovery_notice.clone()
@@ -4636,7 +6049,9 @@ fn get_startup_mode(state: State<'_, AppState>) -> StartupMode {
 
 #[tauri::command]
 fn get_data_directory_status(state: State<'_, AppState>) -> DataDirectoryStatus {
-    let pointer = data_location_pointer_path().ok().and_then(|path| read_data_location_record(&path));
+    let pointer = data_location_pointer_path()
+        .ok()
+        .and_then(|path| read_data_location_record(&path));
     let portable = executable_data_dir();
     let source = if portable.as_deref() == Some(state.data_dir.as_path()) {
         "portable"
@@ -4663,7 +6078,9 @@ fn start_fresh_database(state: State<'_, AppState>) -> Result<DataDirectoryStatu
     Ok(DataDirectoryStatus {
         path: display_path(&target),
         source: "fresh_database".to_string(),
-        portable_available: executable_data_dir().as_deref().is_some_and(is_writable_directory),
+        portable_available: executable_data_dir()
+            .as_deref()
+            .is_some_and(is_writable_directory),
         restart_required: true,
     })
 }
@@ -4671,7 +6088,11 @@ fn start_fresh_database(state: State<'_, AppState>) -> Result<DataDirectoryStatu
 #[tauri::command]
 fn reveal_recovery_data_directory(state: State<'_, AppState>) -> Result<(), String> {
     let recovery_root = state.data_dir.join("database-recovery");
-    let target = if recovery_root.is_dir() { recovery_root } else { state.data_dir.clone() };
+    let target = if recovery_root.is_dir() {
+        recovery_root
+    } else {
+        state.data_dir.clone()
+    };
     Command::new("explorer.exe")
         .arg(target)
         .spawn()
@@ -4688,15 +6109,21 @@ fn backup_key() -> Result<[u8; 32], String> {
     let entry = backup_key_entry()?;
     match entry.get_password() {
         Ok(encoded) => {
-            let decoded = BASE64.decode(encoded).map_err(|_| "本地备份密钥无效。".to_string())?;
-            return decoded.try_into().map_err(|_| "本地备份密钥长度无效。".to_string());
+            let decoded = BASE64
+                .decode(encoded)
+                .map_err(|_| "本地备份密钥无效。".to_string())?;
+            return decoded
+                .try_into()
+                .map_err(|_| "本地备份密钥长度无效。".to_string());
         }
         Err(keyring::Error::NoEntry) => {}
         Err(_) => return Err("无法读取 Windows 凭据库中的备份密钥。".to_string()),
     }
     let mut key = [0u8; 32];
     rand::rng().fill_bytes(&mut key);
-    entry.set_password(&BASE64.encode(key)).map_err(|_| "无法在 Windows 凭据库保存备份密钥。".to_string())?;
+    entry
+        .set_password(&BASE64.encode(key))
+        .map_err(|_| "无法在 Windows 凭据库保存备份密钥。".to_string())?;
     Ok(key)
 }
 
@@ -4705,7 +6132,9 @@ fn encrypt_backup(plain: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "无法初始化备份加密。".to_string())?;
     let mut nonce = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce);
-    let encrypted = cipher.encrypt(Nonce::from_slice(&nonce), plain).map_err(|_| "无法加密本地备份。".to_string())?;
+    let encrypted = cipher
+        .encrypt(Nonce::from_slice(&nonce), plain)
+        .map_err(|_| "无法加密本地备份。".to_string())?;
     let mut result = Vec::with_capacity(BACKUP_MAGIC.len() + nonce.len() + encrypted.len());
     result.extend_from_slice(BACKUP_MAGIC);
     result.extend_from_slice(&nonce);
@@ -4714,50 +6143,94 @@ fn encrypt_backup(plain: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn decrypt_backup(value: &[u8]) -> Result<Vec<u8>, String> {
-    if value.len() <= BACKUP_MAGIC.len() + 12 || !value.starts_with(BACKUP_MAGIC) { return Err("不是资料终端加密备份。".to_string()); }
+    if value.len() <= BACKUP_MAGIC.len() + 12 || !value.starts_with(BACKUP_MAGIC) {
+        return Err("不是资料终端加密备份。".to_string());
+    }
     let key = backup_key()?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "无法初始化备份解密。".to_string())?;
-    cipher.decrypt(Nonce::from_slice(&value[BACKUP_MAGIC.len()..BACKUP_MAGIC.len() + 12]), &value[BACKUP_MAGIC.len() + 12..])
+    cipher
+        .decrypt(
+            Nonce::from_slice(&value[BACKUP_MAGIC.len()..BACKUP_MAGIC.len() + 12]),
+            &value[BACKUP_MAGIC.len() + 12..],
+        )
         .map_err(|_| "无法解密备份；请在创建备份的同一 Windows 用户账户中恢复。".to_string())
 }
 
 #[tauri::command]
 fn create_encrypted_backup(state: State<'_, AppState>) -> Result<EncryptedBackup, String> {
-    let backup_path = state.data_dir.join("backups").join(format!("file-terminal-{}.ftbackup", Uuid::new_v4()));
-    fs::create_dir_all(backup_path.parent().ok_or_else(|| "备份路径无效。".to_string())?).map_err(|error| error.to_string())?;
+    let backup_path = state
+        .data_dir
+        .join("backups")
+        .join(format!("file-terminal-{}.ftbackup", Uuid::new_v4()));
+    fs::create_dir_all(
+        backup_path
+            .parent()
+            .ok_or_else(|| "备份路径无效。".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     let temporary = state.data_dir.join(format!("backup-{}.db", Uuid::new_v4()));
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
-    connection.execute("VACUUM INTO ?1", params![temporary.display().to_string()]).map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    connection
+        .execute("VACUUM INTO ?1", params![temporary.display().to_string()])
+        .map_err(|error| error.to_string())?;
     drop(connection);
     let plain = fs::read(&temporary).map_err(|error| error.to_string())?;
     fs::write(&backup_path, encrypt_backup(&plain)?).map_err(|error| error.to_string())?;
     let _ = fs::remove_file(temporary);
-    Ok(EncryptedBackup { path: backup_path.display().to_string(), display_path: display_path(&backup_path), created_at: "刚刚".to_string(), database_bytes: plain.len() })
+    Ok(EncryptedBackup {
+        path: backup_path.display().to_string(),
+        display_path: display_path(&backup_path),
+        created_at: "刚刚".to_string(),
+        database_bytes: plain.len(),
+    })
 }
 
 #[tauri::command]
-fn stage_encrypted_restore(input: BackupPathInput, state: State<'_, AppState>) -> Result<RestoreStage, String> {
+fn stage_encrypted_restore(
+    input: BackupPathInput,
+    state: State<'_, AppState>,
+) -> Result<RestoreStage, String> {
     let source = PathBuf::from(input.path);
-    if !source.is_file() || source.extension().and_then(|value| value.to_str()) != Some("ftbackup") { return Err("请选择 .ftbackup 加密备份文件。".to_string()); }
+    if !source.is_file() || source.extension().and_then(|value| value.to_str()) != Some("ftbackup")
+    {
+        return Err("请选择 .ftbackup 加密备份文件。".to_string());
+    }
     let staged = state.data_dir.join("pending-restore.db");
-    fs::write(&staged, decrypt_backup(&fs::read(source).map_err(|error| error.to_string())?)?).map_err(|error| error.to_string())?;
-    if load_database_key(&state.data_dir, state.data_dir.join("file-terminal.db").is_file())
-        .and_then(|key| open_encrypted_database(&staged, &key))
-        .is_err()
+    fs::write(
+        &staged,
+        decrypt_backup(&fs::read(source).map_err(|error| error.to_string())?)?,
+    )
+    .map_err(|error| error.to_string())?;
+    if load_database_key(
+        &state.data_dir,
+        state.data_dir.join("file-terminal.db").is_file(),
+    )
+    .and_then(|key| open_encrypted_database(&staged, &key))
+    .is_err()
     {
         let _ = fs::remove_file(staged);
         return Err("备份数据库校验失败，未替换任何本地数据。".to_string());
     }
-    Ok(RestoreStage { pending: true, message: "备份已校验，重启应用后才会安全替换当前数据库。".to_string() })
+    Ok(RestoreStage {
+        pending: true,
+        message: "备份已校验，重启应用后才会安全替换当前数据库。".to_string(),
+    })
 }
 
 fn apply_pending_restore(data_dir: &Path) -> Result<(), String> {
     let staged = data_dir.join("pending-restore.db");
-    if !staged.is_file() { return Ok(()); }
+    if !staged.is_file() {
+        return Ok(());
+    }
     let database = data_dir.join("file-terminal.db");
     let preserved = data_dir.join("pre-restore.db");
     let _ = fs::remove_file(&preserved);
-    if database.is_file() { fs::rename(&database, &preserved).map_err(|error| error.to_string())?; }
+    if database.is_file() {
+        fs::rename(&database, &preserved).map_err(|error| error.to_string())?;
+    }
     fs::rename(staged, database).map_err(|error| error.to_string())?;
     let _ = fs::remove_file(data_dir.join("file-terminal.db-wal"));
     let _ = fs::remove_file(data_dir.join("file-terminal.db-shm"));
@@ -4766,25 +6239,75 @@ fn apply_pending_restore(data_dir: &Path) -> Result<(), String> {
 
 #[tauri::command]
 fn scan_sensitive_index(state: State<'_, AppState>) -> Result<Vec<SensitiveFinding>, String> {
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
     let mut statement = connection.prepare("SELECT index_items.id, index_items.name, index_items.path, index_content_fts.content FROM index_items INNER JOIN index_content_fts ON index_items.id = index_content_fts.item_id LIMIT 10000").map_err(|error| error.to_string())?;
-    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))).map_err(|error| error.to_string())?;
-    let patterns = [("key", r"(?i)\b(?:sk|rk|pk)_[a-z0-9_-]{16,}\b"), ("email", r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"), ("phone", r"\b1[3-9]\d{9}\b"), ("id", r"\b\d{17}[\dXx]\b")];
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let patterns = [
+        ("key", r"(?i)\b(?:sk|rk|pk)_[a-z0-9_-]{16,}\b"),
+        ("email", r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"),
+        ("phone", r"\b1[3-9]\d{9}\b"),
+        ("id", r"\b\d{17}[\dXx]\b"),
+    ];
     let mut findings = Vec::new();
-    for row in rows.filter_map(Result::ok) { for (category, pattern) in patterns {
-        let count = Regex::new(pattern).map_err(|_| "敏感扫描规则无效。".to_string())?.find_iter(&row.3).count();
-        if count > 0 { findings.push(SensitiveFinding { item_id: row.0.clone(), name: row.1.clone(), display_path: display_path(Path::new(&row.2)), category: category.to_string(), match_count: count }); }
-    }}
+    for row in rows.filter_map(Result::ok) {
+        for (category, pattern) in patterns {
+            let count = Regex::new(pattern)
+                .map_err(|_| "敏感扫描规则无效。".to_string())?
+                .find_iter(&row.3)
+                .count();
+            if count > 0 {
+                findings.push(SensitiveFinding {
+                    item_id: row.0.clone(),
+                    name: row.1.clone(),
+                    display_path: display_path(Path::new(&row.2)),
+                    category: category.to_string(),
+                    match_count: count,
+                });
+            }
+        }
+    }
     Ok(findings)
 }
 
 #[tauri::command]
-fn list_metadata_audit(input: AuditFilterInput, state: State<'_, AppState>) -> Result<Vec<MetadataAuditEntry>, String> {
-    let target_type = input.target_type.filter(|value| matches!(value.as_str(), "folder" | "item"));
+fn list_metadata_audit(
+    input: AuditFilterInput,
+    state: State<'_, AppState>,
+) -> Result<Vec<MetadataAuditEntry>, String> {
+    let target_type = input
+        .target_type
+        .filter(|value| matches!(value.as_str(), "folder" | "item"));
     let limit = input.limit.unwrap_or(100).clamp(1, 500);
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
     let mut statement = connection.prepare("SELECT id, target_type, target_id, action, old_policy, new_policy, created_at FROM metadata_audit WHERE (?1 IS NULL OR target_type = ?1) ORDER BY rowid DESC LIMIT ?2").map_err(|error| error.to_string())?;
-    let rows = statement.query_map(params![target_type, limit], |row| Ok(MetadataAuditEntry { id: row.get(0)?, target_type: row.get(1)?, target_id: row.get(2)?, action: row.get(3)?, old_policy: row.get(4)?, new_policy: row.get(5)?, created_at: row.get(6)? })).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![target_type, limit], |row| {
+            Ok(MetadataAuditEntry {
+                id: row.get(0)?,
+                target_type: row.get(1)?,
+                target_id: row.get(2)?,
+                action: row.get(3)?,
+                old_policy: row.get(4)?,
+                new_policy: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
     Ok(rows.filter_map(Result::ok).collect())
 }
 
@@ -4990,7 +6513,10 @@ fn store_agent_run(run: &AgentRun, state: &AppState) -> Result<(), String> {
 
 // Bind source identities and paths locally only; cloud payloads never receive these bindings.
 fn bind_agent_sources(run_id: &str, sources: &[IndexItem], state: &AppState) -> Result<(), String> {
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
     for source in sources {
         connection.execute("INSERT INTO agent_source_bindings (id, run_id, source_item_id, source_path, cloud_policy, is_restricted, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))", params![Uuid::new_v4().to_string(), run_id, source.id, source.path, source.cloud_policy.as_database(), source.cloud_policy != CloudPolicy::CloudAllowed]).map_err(|error| error.to_string())?;
     }
@@ -4998,13 +6524,47 @@ fn bind_agent_sources(run_id: &str, sources: &[IndexItem], state: &AppState) -> 
 }
 
 #[tauri::command]
-fn get_agent_evidence_report(input: AgentRunIdInput, state: State<'_, AppState>) -> Result<AgentEvidenceReport, String> {
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
-    let status = connection.query_row("SELECT status FROM agent_runs WHERE id = ?1", params![input.run_id], |row| row.get::<_, String>(0)).map_err(|_| "任务不存在。".to_string())?;
-    let restricted_bindings = connection.query_row("SELECT COUNT(*) FROM agent_source_bindings WHERE run_id = ?1 AND is_restricted = 1", params![input.run_id], |row| row.get::<_, usize>(0)).map_err(|error| error.to_string())?;
+fn get_agent_evidence_report(
+    input: AgentRunIdInput,
+    state: State<'_, AppState>,
+) -> Result<AgentEvidenceReport, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let status = connection
+        .query_row(
+            "SELECT status FROM agent_runs WHERE id = ?1",
+            params![input.run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "任务不存在。".to_string())?;
+    let restricted_bindings = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_source_bindings WHERE run_id = ?1 AND is_restricted = 1",
+            params![input.run_id],
+            |row| row.get::<_, usize>(0),
+        )
+        .map_err(|error| error.to_string())?;
     let mut statement = connection.prepare("SELECT status, message, created_at FROM agent_events WHERE run_id = ?1 ORDER BY rowid ASC LIMIT 100").map_err(|error| error.to_string())?;
-    let evidence = statement.query_map(params![input.run_id], |row| Ok(format!("{} · {} · {}", row.get::<_, String>(2)?, row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map_err(|error| error.to_string())?.filter_map(Result::ok).collect();
-    Ok(AgentEvidenceReport { run_id: input.run_id, status, final_evidence: evidence, restricted_bindings })
+    let evidence = statement
+        .query_map(params![input.run_id], |row| {
+            Ok(format!(
+                "{} · {} · {}",
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(AgentEvidenceReport {
+        run_id: input.run_id,
+        status,
+        final_evidence: evidence,
+        restricted_bindings,
+    })
 }
 
 fn update_agent_run_status(
@@ -5141,18 +6701,28 @@ async fn auto_repair_agent_run(
     if !ALLOWED_WORKSPACE_CHECKS.contains(&input.command.as_str()) {
         return Err("自动最小修复仅支持固定构建/测试检查。".to_string());
     }
-    let prepared = state.prepared_runs.lock().map_err(|_| "任务状态被占用。".to_string())?
-        .get(&input.run_id).cloned().ok_or_else(|| "任务已失效；请重新发起。".to_string())?;
+    let prepared = state
+        .prepared_runs
+        .lock()
+        .map_err(|_| "任务状态被占用。".to_string())?
+        .get(&input.run_id)
+        .cloned()
+        .ok_or_else(|| "任务已失效；请重新发起。".to_string())?;
     if prepared.run.route != "cloud_auto" || prepared.run.status != "check_failed" {
         return Err("自动最小修复仅适用于已失败的自动云端协作任务。".to_string());
     }
     if prepared.repair_attempts >= MAX_AGENT_REPAIR_ATTEMPTS {
         return Err("已达到自动最小修复次数上限；请人工审阅最终证据报告。".to_string());
     }
-    let diagnostic = prepared.last_diagnostic.clone().ok_or_else(|| "未找到经过脱敏的失败摘要，不能请求修复。".to_string())?;
-    let config = cloud_config(&state)?.filter(|config| config.configured)
+    let diagnostic = prepared
+        .last_diagnostic
+        .clone()
+        .ok_or_else(|| "未找到经过脱敏的失败摘要，不能请求修复。".to_string())?;
+    let config = cloud_config(&state)?
+        .filter(|config| config.configured)
         .ok_or_else(|| "未配置可用的云端提供商或密钥。".to_string())?;
-    let api_key = cloud_key_entry(&config.provider_id)?.get_password()
+    let api_key = cloud_key_entry(&config.provider_id)?
+        .get_password()
         .map_err(|_| "无法从 Windows 凭据库读取云端密钥。".to_string())?;
     let request_body = serde_json::json!({
         "task": "根据以下经过脱敏的本地检查摘要，提供最小修复建议。",
@@ -5160,32 +6730,98 @@ async fn auto_repair_agent_run(
         "constraints": ["只返回新增相对路径文件", "不得修改或覆盖已有文件", "不得请求受限资料", "不得调用命令、网络或发布"],
     });
     let request_text = serde_json::to_string(&request_body).map_err(|error| error.to_string())?;
-    if request_text.len() > MAX_CLOUD_REQUEST_BYTES { return Err("最小修复请求超过安全大小限制。".to_string()); }
-    update_agent_run_status(&input.run_id, "repairing_cloud", "正在请求自动最小修复；仅发送脱敏失败摘要。", &state)?;
+    if request_text.len() > MAX_CLOUD_REQUEST_BYTES {
+        return Err("最小修复请求超过安全大小限制。".to_string());
+    }
+    update_agent_run_status(
+        &input.run_id,
+        "repairing_cloud",
+        "正在请求自动最小修复；仅发送脱敏失败摘要。",
+        &state,
+    )?;
     let endpoint = chat_endpoint(&config.base_url);
     let response = reqwest::Client::builder().timeout(Duration::from_secs(45)).build()
         .map_err(|_| "无法建立安全云端连接。".to_string())?
         .post(endpoint).bearer_auth(api_key)
         .json(&serde_json::json!({"model": config.model, "messages":[{"role":"system","content":"你是受限修复助手。仅返回 JSON，包含 answer、assumptions、files、steps、uncertainties。files 只能是新建的相对路径；严禁覆盖、删除、命令、联网或敏感资料。"},{"role":"user","content":request_text}]}))
         .send().await.map_err(|_| "云端最小修复请求失败；未记录请求内容。".to_string())?;
-    if !response.status().is_success() { update_agent_run_status(&input.run_id, "check_failed", "云端最小修复请求失败；工作区未被改写。", &state)?; return Err("云端服务返回错误；工作区未被改写。".to_string()); }
-    let value = response.json::<serde_json::Value>().await.map_err(|_| "云端修复响应格式无效。".to_string())?;
-    let raw_advice = value.pointer("/choices/0/message/content").and_then(|value| value.as_str()).unwrap_or("");
+    if !response.status().is_success() {
+        update_agent_run_status(
+            &input.run_id,
+            "check_failed",
+            "云端最小修复请求失败；工作区未被改写。",
+            &state,
+        )?;
+        return Err("云端服务返回错误；工作区未被改写。".to_string());
+    }
+    let value = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|_| "云端修复响应格式无效。".to_string())?;
+    let raw_advice = value
+        .pointer("/choices/0/message/content")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
     let (safe_advice, _) = redact_sensitive_text(raw_advice);
     {
-        let mut runs = state.prepared_runs.lock().map_err(|_| "任务状态被占用。".to_string())?;
-        let run = runs.get_mut(&input.run_id).ok_or_else(|| "任务已失效；请重新发起。".to_string())?;
+        let mut runs = state
+            .prepared_runs
+            .lock()
+            .map_err(|_| "任务状态被占用。".to_string())?;
+        let run = runs
+            .get_mut(&input.run_id)
+            .ok_or_else(|| "任务已失效；请重新发起。".to_string())?;
         run.repair_attempts += 1;
         run.run.status = "approved".to_string();
         run.run.advice = Some(safe_advice);
-        run.run.feedback = format!("云端最小修复建议已返回，开始第 {} 次受控写入。", run.repair_attempts);
+        run.run.feedback = format!(
+            "云端最小修复建议已返回，开始第 {} 次受控写入。",
+            run.repair_attempts
+        );
     }
-    add_agent_event(&input.run_id, "repair_advice_received", "已收到最小修复建议；仅验证新建相对路径文件。", &state)?;
-    let write = apply_agent_advice_inner(WorkspaceAdviceInput { run_id: input.run_id.clone(), workspace_id: input.workspace_id.clone(), allow_existing_edits: false }, false, &state)?;
-    let check = run_workspace_check(WorkspaceCheckInput { workspace_id: input.workspace_id, command: input.command, run_id: Some(input.run_id.clone()) }, state.clone())?;
-    let status = if check.status == "check_complete" { "repair_complete" } else { "check_failed" };
-    update_agent_run_status(&input.run_id, status, if status == "repair_complete" { "自动最小修复已通过固定检查。" } else { "自动最小修复写入后检查仍失败；未继续覆盖或删除任何文件。" }, &state)?;
-    Ok(WorkspaceActionResult { status: status.to_string(), written_files: write.written_files, output: format!("{}\n\n修复检查：\n{}", write.output, check.output) })
+    add_agent_event(
+        &input.run_id,
+        "repair_advice_received",
+        "已收到最小修复建议；仅验证新建相对路径文件。",
+        &state,
+    )?;
+    let write = apply_agent_advice_inner(
+        WorkspaceAdviceInput {
+            run_id: input.run_id.clone(),
+            workspace_id: input.workspace_id.clone(),
+            allow_existing_edits: false,
+        },
+        false,
+        &state,
+    )?;
+    let check = run_workspace_check(
+        WorkspaceCheckInput {
+            workspace_id: input.workspace_id,
+            command: input.command,
+            run_id: Some(input.run_id.clone()),
+        },
+        state.clone(),
+    )?;
+    let status = if check.status == "check_complete" {
+        "repair_complete"
+    } else {
+        "check_failed"
+    };
+    update_agent_run_status(
+        &input.run_id,
+        status,
+        if status == "repair_complete" {
+            "自动最小修复已通过固定检查。"
+        } else {
+            "自动最小修复写入后检查仍失败；未继续覆盖或删除任何文件。"
+        },
+        &state,
+    )?;
+    Ok(WorkspaceActionResult {
+        status: status.to_string(),
+        written_files: write.written_files,
+        output: format!("{}\n\n修复检查：\n{}", write.output, check.output),
+    })
 }
 
 #[tauri::command]
@@ -5500,7 +7136,7 @@ fn ask_assistant(question: String, state: State<'_, AppState>) -> Result<Vec<Ind
     };
     let mut statement = connection
         .prepare(
-            "SELECT index_items.id, index_items.item_type, index_items.name, index_items.path, index_items.note, index_items.tags_json, folder_refs.note, folder_refs.tags_json, folder_refs.cloud_policy, index_items.cloud_policy
+            "SELECT index_items.id, index_items.item_type, index_items.name, index_items.path, index_items.note, index_items.tags_json, folder_refs.note, folder_refs.tags_json, folder_refs.cloud_policy, index_items.cloud_policy, index_items.content_status, index_items.content_reason_code, index_items.extracted_chars, index_items.content_indexed_at
              FROM index_items INNER JOIN folder_refs ON index_items.folder_id = folder_refs.id",
         )
         .map_err(|error| error.to_string())?;
@@ -5517,6 +7153,10 @@ fn ask_assistant(question: String, state: State<'_, AppState>) -> Result<Vec<Ind
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, Option<String>>(13)?,
             ))
         })
         .map_err(|error| error.to_string())?;
@@ -5534,6 +7174,10 @@ fn ask_assistant(question: String, state: State<'_, AppState>) -> Result<Vec<Ind
                 folder_tags_json,
                 folder_policy,
                 item_policy,
+                content_status,
+                content_reason_code,
+                extracted_chars,
+                content_indexed_at,
             )| {
                 let tags = serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default();
                 let folder_tags =
@@ -5559,6 +7203,10 @@ fn ask_assistant(question: String, state: State<'_, AppState>) -> Result<Vec<Ind
                         CloudPolicy::from_database(&item_policy),
                     ),
                     score,
+                    content_status,
+                    content_reason_code,
+                    extracted_chars: extracted_chars.max(0) as usize,
+                    content_indexed_at,
                 })
             },
         )
@@ -5591,18 +7239,27 @@ fn build_source_citations(sources: &[IndexItem]) -> Vec<SourceCitation> {
         .collect()
 }
 
-fn embedding_fallback_fts(input: SearchDocumentsInput, state: State<'_, AppState>) -> Result<SearchDocumentsResult, String> {
+fn embedding_fallback_fts(
+    input: SearchDocumentsInput,
+    state: State<'_, AppState>,
+) -> Result<SearchDocumentsResult, String> {
     search_documents(input, state)
 }
 
 #[tauri::command]
-async fn semantic_search(input: SearchDocumentsInput, state: State<'_, AppState>) -> Result<SearchDocumentsResult, String> {
+async fn semantic_search(
+    input: SearchDocumentsInput,
+    state: State<'_, AppState>,
+) -> Result<SearchDocumentsResult, String> {
     let query = input.query.trim();
     if query.is_empty() || query.chars().count() > 500 {
         return Err("搜索内容不能为空且不能超过 500 个字符。".to_string());
     }
     let model = {
-        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "本地数据库被占用。".to_string())?;
         active_embedding_model(&connection)?
     };
     let Some(model) = model else {
@@ -5613,29 +7270,126 @@ async fn semantic_search(input: SearchDocumentsInput, state: State<'_, AppState>
     let query_vector = embed_text(&state, &model, query).await?;
     let page_size = input.page_size.unwrap_or(30).clamp(1, 100);
     let page = input.page.unwrap_or(0);
-    let tag = input.tag.filter(|value| !value.trim().is_empty()).map(|value| value.to_ascii_lowercase());
+    let tag = input
+        .tag
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_ascii_lowercase());
     let folder_id = input.folder_id.filter(|value| !value.trim().is_empty());
-    let item_type = input.item_type.filter(|value| matches!(value.as_str(), "file" | "folder"));
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let item_type = input
+        .item_type
+        .filter(|value| matches!(value.as_str(), "file" | "folder"));
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
     let mut statement = connection.prepare(
-        "SELECT index_items.id, index_items.folder_id, index_items.item_type, index_items.name, index_items.path, index_items.note, index_items.tags_json, folder_refs.cloud_policy, index_items.cloud_policy, item_embeddings.vector_json FROM item_embeddings INNER JOIN index_items ON index_items.id = item_embeddings.item_id INNER JOIN folder_refs ON folder_refs.id = index_items.folder_id WHERE item_embeddings.model_id = ?1"
+        "SELECT index_items.id, index_items.folder_id, index_items.item_type, index_items.name, index_items.path, index_items.note, index_items.tags_json, folder_refs.cloud_policy, index_items.cloud_policy, item_embeddings.vector_json, index_items.content_status, index_items.content_reason_code, index_items.extracted_chars, index_items.content_indexed_at FROM item_embeddings INNER JOIN index_items ON index_items.id = item_embeddings.item_id INNER JOIN folder_refs ON folder_refs.id = index_items.folder_id WHERE item_embeddings.model_id = ?1"
     ).map_err(|error| error.to_string())?;
-    let mut ranked = statement.query_map(params![model.id], |row| Ok((
-        row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?, row.get::<_, String>(9)?
-    ))).map_err(|error| error.to_string())?.filter_map(Result::ok).filter_map(|(id, actual_folder_id, kind, name, path, note, tags_json, folder_policy, item_policy, vector_json)| {
-        if folder_id.as_deref().is_some_and(|requested| requested != actual_folder_id) { return None; }
-        if item_type.as_deref().is_some_and(|requested| requested != kind) { return None; }
-        let tags = serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default();
-        if tag.as_ref().is_some_and(|requested| !tags.iter().any(|value| value.to_ascii_lowercase() == *requested)) { return None; }
-        let vector = serde_json::from_str::<Vec<f32>>(&vector_json).ok()?;
-        let similarity = cosine_similarity(&query_vector, &vector)?;
-        Some((similarity, IndexItem { id, item_type: kind, name, display_path: display_path(Path::new(&path)), path, note, tags, cloud_policy: effective_cloud_policy(CloudPolicy::from_database(&folder_policy), CloudPolicy::from_database(&item_policy)), score: (similarity.max(0.0) * 1000.0).round() as usize }))
-    }).collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.0.total_cmp(&left.0).then_with(|| left.1.name.cmp(&right.1.name)));
+    let mut ranked = statement
+        .query_map(params![model.id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, Option<String>>(13)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .filter_map(
+            |(
+                id,
+                actual_folder_id,
+                kind,
+                name,
+                path,
+                note,
+                tags_json,
+                folder_policy,
+                item_policy,
+                vector_json,
+                content_status,
+                content_reason_code,
+                extracted_chars,
+                content_indexed_at,
+            )| {
+                if folder_id
+                    .as_deref()
+                    .is_some_and(|requested| requested != actual_folder_id)
+                {
+                    return None;
+                }
+                if item_type
+                    .as_deref()
+                    .is_some_and(|requested| requested != kind)
+                {
+                    return None;
+                }
+                let tags = serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default();
+                if tag.as_ref().is_some_and(|requested| {
+                    !tags
+                        .iter()
+                        .any(|value| value.to_ascii_lowercase() == *requested)
+                }) {
+                    return None;
+                }
+                let vector = serde_json::from_str::<Vec<f32>>(&vector_json).ok()?;
+                let similarity = cosine_similarity(&query_vector, &vector)?;
+                Some((
+                    similarity,
+                    IndexItem {
+                        id,
+                        item_type: kind,
+                        name,
+                        display_path: display_path(Path::new(&path)),
+                        path,
+                        note,
+                        tags,
+                        cloud_policy: effective_cloud_policy(
+                            CloudPolicy::from_database(&folder_policy),
+                            CloudPolicy::from_database(&item_policy),
+                        ),
+                        score: (similarity.max(0.0) * 1000.0).round() as usize,
+                        content_status,
+                        content_reason_code,
+                        extracted_chars: extracted_chars.max(0) as usize,
+                        content_indexed_at,
+                    },
+                ))
+            },
+        )
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
     let total = ranked.len();
     let offset = page.saturating_mul(page_size);
-    let items = ranked.into_iter().skip(offset).take(page_size).map(|(_, item)| item).collect();
-    Ok(SearchDocumentsResult { items, total, page, page_size, search_mode: "semantic".to_string() })
+    let items = ranked
+        .into_iter()
+        .skip(offset)
+        .take(page_size)
+        .map(|(_, item)| item)
+        .collect();
+    Ok(SearchDocumentsResult {
+        items,
+        total,
+        page,
+        page_size,
+        search_mode: "semantic".to_string(),
+    })
 }
 
 #[tauri::command]
@@ -5746,6 +7500,10 @@ fn search_documents(
                     CloudPolicy::from_database(&item_policy),
                 ),
                 score: row.get(8)?,
+                content_status: "pending".to_string(),
+                content_reason_code: None,
+                extracted_chars: 0,
+                content_indexed_at: None,
             })
         })
         .map_err(|error| format!("读取搜索结果失败：{error}"))?;
@@ -5788,9 +7546,18 @@ fn preview_file(path: String, state: State<'_, AppState>) -> Result<FilePreview,
     if matches!(extension.as_str(), "docx" | "pptx" | "xlsx") {
         let content = office_preview_text(&target).unwrap_or_default();
         return Ok(FilePreview {
-            kind: "text".into(), name, display_path: display_path(&target), path: target.display().to_string(),
-            mime_type: "text/plain".into(), message: if content.is_empty() { "无法从此 Office 文档提取可预览文本；原文件未改动。".into() } else { "只读文本预览，复杂版式、公式和嵌入对象可能不显示。".into() },
-            content, truncated: false,
+            kind: "text".into(),
+            name,
+            display_path: display_path(&target),
+            path: target.display().to_string(),
+            mime_type: "text/plain".into(),
+            message: if content.is_empty() {
+                "无法从此 Office 文档提取可预览文本；原文件未改动。".into()
+            } else {
+                "只读文本预览，复杂版式、公式和嵌入对象可能不显示。".into()
+            },
+            content,
+            truncated: false,
         });
     }
     let Some((kind, mime_type)) = preview_mime(&extension) else {
@@ -5852,31 +7619,85 @@ fn emit_media_task(app: &AppHandle, task: &MediaTask) {
 }
 
 fn media_settings(connection: &Connection) -> Result<MediaSettings, String> {
-    connection.query_row(
-        "SELECT whisper_model_path, ocr_language FROM media_settings WHERE id = 1",
-        [],
-        |row| Ok(MediaSettings { whisper_model_path: row.get(0)?, ocr_language: row.get(1)? }),
-    ).map_err(|error| error.to_string())
+    connection
+        .query_row(
+            "SELECT whisper_model_path, ocr_language FROM media_settings WHERE id = 1",
+            [],
+            |row| {
+                Ok(MediaSettings {
+                    whisper_model_path: row.get(0)?,
+                    ocr_language: row.get(1)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())
 }
 
-fn bounded_command_output(command: &mut Command) -> Result<String, String> {
+fn media_result_may_persist(cancelled: &Arc<AtomicBool>) -> bool {
+    !cancelled.load(Ordering::SeqCst)
+}
+
+fn media_completion_may_commit(cancelled: &Arc<AtomicBool>, database_still_running: bool) -> bool {
+    database_still_running && media_result_may_persist(cancelled)
+}
+
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
+    #[cfg(windows)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.wait();
+}
+
+fn bounded_command_output(
+    command: &mut Command,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<String, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let started = SystemTime::now();
     loop {
+        if !media_result_may_persist(cancelled) {
+            terminate_process_tree(&mut child);
+            return Err("媒体任务已取消。".to_string());
+        }
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            let output = child.wait_with_output().map_err(|error| error.to_string())?;
+            let output = child
+                .wait_with_output()
+                .map_err(|error| error.to_string())?;
             if !status.success() {
-                return Err(String::from_utf8_lossy(&output.stderr).chars().take(2_000).collect::<String>());
+                return Err(String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(2_000)
+                    .collect::<String>());
             }
-            return Ok(String::from_utf8_lossy(&output.stdout).chars().take(MAX_MEDIA_OUTPUT_CHARS).collect());
+            return Ok(String::from_utf8_lossy(&output.stdout)
+                .chars()
+                .take(MAX_MEDIA_OUTPUT_CHARS)
+                .collect());
         }
         if started.elapsed().unwrap_or_default() > MEDIA_TASK_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_tree(&mut child);
             return Err("本地媒体任务超时，已停止。".to_string());
         }
         thread::sleep(Duration::from_millis(150));
+    }
+}
+
+trait MediaCommandRunner {
+    fn run(&self, command: &mut Command, cancelled: &Arc<AtomicBool>) -> Result<String, String>;
+}
+
+struct SystemMediaCommandRunner;
+
+impl MediaCommandRunner for SystemMediaCommandRunner {
+    fn run(&self, command: &mut Command, cancelled: &Arc<AtomicBool>) -> Result<String, String> {
+        bounded_command_output(command, cancelled)
     }
 }
 
@@ -5890,30 +7711,51 @@ fn managed_tool_package(tool: &ManagedTool) -> (&'static str, &'static str) {
 
 #[tauri::command]
 fn install_local_tool(input: ManagedToolInput) -> Result<String, String> {
+    if !input.confirmed {
+        return Err("请先确认 Windows winget 固定包安装。".to_string());
+    }
     let (package_id, label) = managed_tool_package(&input.tool);
     if !command_available("winget") {
-        return Err("未检测到 Windows 包管理器 winget；请从 Microsoft Store 更新“应用安装程序”后重试。".to_string());
+        return Err(
+            "未检测到 Windows 包管理器 winget；请从 Microsoft Store 更新“应用安装程序”后重试。"
+                .to_string(),
+        );
     }
     // Only a fixed package allowlist is passed to winget; user input never reaches a shell.
     let status = Command::new("winget")
         .args([
-            "install", "--id", package_id, "--exact", "--silent", "--accept-source-agreements",
-            "--accept-package-agreements", "--disable-interactivity",
+            "install",
+            "--id",
+            package_id,
+            "--exact",
+            "--silent",
+            "--accept-source-agreements",
+            "--accept-package-agreements",
+            "--disable-interactivity",
         ])
         .status()
         .map_err(|_| "无法启动 winget；请确认 Windows 包管理器可用。".to_string())?;
     if !status.success() {
         return Err(format!("{label} 安装未完成；winget 未返回成功状态。"));
     }
-    Ok(format!("{label} 已由 winget 安装。首次使用前请重新打开资料终端，以刷新工具检测。"))
+    Ok(format!(
+        "{label} 已由 winget 安装。首次使用前请重新打开资料终端，以刷新工具检测。"
+    ))
 }
 
-fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<std::process::Output, String> {
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let started = SystemTime::now();
     loop {
-        if child.try_wait().map_err(|error| error.to_string())?.is_some() {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
             return child.wait_with_output().map_err(|error| error.to_string());
         }
         if started.elapsed().unwrap_or_default() > timeout {
@@ -5926,75 +7768,256 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Resu
 }
 
 fn indexed_media_path(connection: &Connection, item_id: &str) -> Result<PathBuf, String> {
-    let value = connection.query_row(
-        "SELECT path FROM index_items WHERE id = ?1 AND item_type = 'file'",
-        params![item_id],
-        |row| row.get::<_, String>(0),
-    ).map_err(|_| "媒体资料不存在或不是文件。".to_string())?;
+    let value = connection
+        .query_row(
+            "SELECT path FROM index_items WHERE id = ?1 AND item_type = 'file'",
+            params![item_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "媒体资料不存在或不是文件。".to_string())?;
     let path = fs::canonicalize(value).map_err(|_| "媒体文件不存在或无法访问。".to_string())?;
-    let mut statement = connection.prepare("SELECT root_path FROM folder_refs").map_err(|error| error.to_string())?;
-    let permitted = statement.query_map([], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())?
+    let mut statement = connection
+        .prepare("SELECT root_path FROM folder_refs")
+        .map_err(|error| error.to_string())?;
+    let permitted = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
         .filter_map(Result::ok)
         .filter_map(|root| fs::canonicalize(root).ok())
         .any(|root| path.starts_with(root));
-    permitted.then_some(path).ok_or_else(|| "媒体文件不在已接入资料夹内。".to_string())
+    permitted
+        .then_some(path)
+        .ok_or_else(|| "媒体文件不在已接入资料夹内。".to_string())
 }
 
-fn run_media_extraction(connection: &Connection, task: &MediaTask, data_dir: &Path) -> Result<(), String> {
+fn run_media_extraction(
+    connection: &Connection,
+    task: &MediaTask,
+    data_dir: &Path,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    run_media_extraction_with_runner(
+        connection,
+        task,
+        data_dir,
+        cancelled,
+        &SystemMediaCommandRunner,
+    )
+}
+
+fn media_task_still_running(connection: &Connection, task_id: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT status = 'running' FROM media_tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map(|status| status.unwrap_or(false))
+        .map_err(|error| error.to_string())
+}
+
+fn persist_media_extraction(
+    connection: &Connection,
+    task: &MediaTask,
+    path: &Path,
+    signature: &str,
+    content: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    // Check the shared cancellation token and durable task status immediately before writing.
+    if !media_completion_may_commit(cancelled, media_task_still_running(connection, &task.id)?) {
+        return Err("媒体任务已取消。".to_string());
+    }
+    connection.execute(
+        "INSERT OR REPLACE INTO media_extractions (item_id, kind, source_signature, content, updated_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+        params![task.item_id, task.kind, signature, content],
+    ).map_err(|error| error.to_string())?;
+    if !media_completion_may_commit(cancelled, media_task_still_running(connection, &task.id)?) {
+        connection
+            .execute(
+                "DELETE FROM media_extractions WHERE item_id = ?1 AND kind = ?2",
+                params![task.item_id, task.kind],
+            )
+            .map_err(|error| error.to_string())?;
+        return Err("媒体任务已取消。".to_string());
+    }
+    index_content(connection, &task.item_id, path)
+}
+
+fn run_media_extraction_with_runner(
+    connection: &Connection,
+    task: &MediaTask,
+    data_dir: &Path,
+    cancelled: &Arc<AtomicBool>,
+    runner: &dyn MediaCommandRunner,
+) -> Result<(), String> {
+    if !media_result_may_persist(cancelled) {
+        return Err("媒体任务已取消。".to_string());
+    }
     let path = indexed_media_path(connection, &task.item_id)?;
-    if fs::metadata(&path).map_err(|error| error.to_string())?.len() > MAX_MEDIA_SOURCE_BYTES {
+    if fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .len()
+        > MAX_MEDIA_SOURCE_BYTES
+    {
         return Err("媒体文件超过本地识别安全大小限制。".to_string());
     }
     let signature = source_signature(&path)?;
     let settings = media_settings(connection)?;
     let content = match task.kind.as_str() {
         "ocr" => {
-            if !command_available("tesseract") { return Err("未检测到 Tesseract；请安装本地 OCR 和语言包。".to_string()); }
-            let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
-            if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp") { return Err("OCR 仅支持本地图片文件。".to_string()); }
-            bounded_command_output(Command::new("tesseract").arg(&path).arg("stdout").arg("-l").arg(settings.ocr_language))?
+            if !command_available("tesseract") {
+                return Err("未检测到 Tesseract；请安装本地 OCR 和语言包。".to_string());
+            }
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !matches!(
+                extension.as_str(),
+                "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp"
+            ) {
+                return Err("OCR 仅支持本地图片文件。".to_string());
+            }
+            let mut command = Command::new("tesseract");
+            command
+                .arg(&path)
+                .arg("stdout")
+                .arg("-l")
+                .arg(settings.ocr_language);
+            let managed_tessdata = data_dir.join("ocr-languages");
+            if managed_tessdata.join("chi_sim.traineddata").is_file() {
+                // Keep downloaded language data in the app directory instead of mutating Tesseract's system installation.
+                command.arg("--tessdata-dir").arg(managed_tessdata);
+            }
+            runner.run(&mut command, cancelled)?
         }
         "transcription" => {
-            let whisper = if command_available("whisper-cli") { "whisper-cli" } else if command_available("whisper") { "whisper" } else { return Err("未检测到本地 Whisper CLI。".to_string()); };
-            if !command_available("ffmpeg") { return Err("未检测到 FFmpeg，无法安全转换音视频。".to_string()); }
-            if settings.whisper_model_path.trim().is_empty() || !Path::new(&settings.whisper_model_path).is_file() { return Err("请先选择本地 Whisper 模型文件。".to_string()); }
+            let whisper = if command_available("whisper-cli") {
+                "whisper-cli"
+            } else if command_available("whisper") {
+                "whisper"
+            } else {
+                return Err("未检测到本地 Whisper CLI。".to_string());
+            };
+            if !command_available("ffmpeg") {
+                return Err("未检测到 FFmpeg，无法安全转换音视频。".to_string());
+            }
+            if settings.whisper_model_path.trim().is_empty()
+                || !Path::new(&settings.whisper_model_path).is_file()
+            {
+                return Err("请先选择本地 Whisper 模型文件。".to_string());
+            }
             let task_dir = data_dir.join("media-work").join(&task.id);
             fs::create_dir_all(&task_dir).map_err(|error| error.to_string())?;
             let wav = task_dir.join("input.wav");
             let prefix = task_dir.join("transcript");
-            let converted = bounded_command_output(Command::new("ffmpeg").arg("-y").arg("-i").arg(&path).arg("-vn").arg("-ac").arg("1").arg("-ar").arg("16000").arg(&wav));
-            if let Err(error) = converted { let _ = fs::remove_dir_all(&task_dir); return Err(error); }
-            let result = bounded_command_output(Command::new(whisper).arg("-m").arg(settings.whisper_model_path).arg("-f").arg(&wav).arg("-otxt").arg("-of").arg(&prefix));
-            let transcript = fs::read_to_string(prefix.with_extension("txt")).map_err(|_| result.err().unwrap_or_else(|| "Whisper 未生成可读取文本。".to_string()));
+            let mut conversion = Command::new("ffmpeg");
+            conversion
+                .arg("-y")
+                .arg("-i")
+                .arg(&path)
+                .arg("-vn")
+                .arg("-ac")
+                .arg("1")
+                .arg("-ar")
+                .arg("16000")
+                .arg(&wav);
+            let converted = runner.run(&mut conversion, cancelled);
+            if let Err(error) = converted {
+                let _ = fs::remove_dir_all(&task_dir);
+                return Err(error);
+            }
+            if !media_result_may_persist(cancelled) {
+                let _ = fs::remove_dir_all(&task_dir);
+                return Err("媒体任务已取消。".to_string());
+            }
+            let mut transcription = Command::new(whisper);
+            transcription
+                .arg("-m")
+                .arg(settings.whisper_model_path)
+                .arg("-f")
+                .arg(&wav)
+                .arg("-otxt")
+                .arg("-of")
+                .arg(&prefix);
+            let result = runner.run(&mut transcription, cancelled);
+            let transcript = fs::read_to_string(prefix.with_extension("txt")).map_err(|_| {
+                result
+                    .err()
+                    .unwrap_or_else(|| "Whisper 未生成可读取文本。".to_string())
+            });
             let _ = fs::remove_dir_all(&task_dir);
             transcript?
         }
         _ => return Err("不支持的媒体任务类型。".to_string()),
     };
-    let content = content.chars().take(MAX_MEDIA_OUTPUT_CHARS).collect::<String>();
-    if content.trim().is_empty() { return Err("本地工具未识别出可索引文本。".to_string()); }
-    connection.execute(
-        "INSERT OR REPLACE INTO media_extractions (item_id, kind, source_signature, content, updated_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-        params![task.item_id, task.kind, signature, content],
-    ).map_err(|error| error.to_string())?;
-    index_content(connection, &task.item_id, &path)
+    if !media_result_may_persist(cancelled) {
+        return Err("媒体任务已取消。".to_string());
+    }
+    let content = content
+        .chars()
+        .take(MAX_MEDIA_OUTPUT_CHARS)
+        .collect::<String>();
+    if content.trim().is_empty() {
+        return Err("本地工具未识别出可索引文本。".to_string());
+    }
+    persist_media_extraction(connection, task, &path, &signature, &content, cancelled)
 }
 
-fn start_media_worker(app: AppHandle, data_dir: PathBuf) {
+fn start_media_worker(
+    app: AppHandle,
+    data_dir: PathBuf,
+    cancelled_media_tasks: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+) {
     thread::spawn(move || loop {
-        let Ok(connection) = open_app_database(&data_dir) else { thread::sleep(Duration::from_secs(2)); continue; };
+        let Ok(connection) = open_app_database(&data_dir) else {
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        };
         let task = connection.query_row(
             "SELECT media_tasks.id, media_tasks.item_id, index_items.name, media_tasks.kind, media_tasks.status, media_tasks.error, media_tasks.created_at, media_tasks.updated_at FROM media_tasks INNER JOIN index_items ON index_items.id = media_tasks.item_id WHERE media_tasks.status = 'queued' ORDER BY media_tasks.created_at ASC LIMIT 1",
             [], media_task_from_row,
         ).optional().ok().flatten();
-        let Some(task) = task else { thread::sleep(Duration::from_millis(500)); continue; };
-        let _ = connection.execute("UPDATE media_tasks SET status = 'running', error = NULL, updated_at = datetime('now') WHERE id = ?1 AND status = 'queued'", params![task.id]);
-        let running = MediaTask { status: "running".to_string(), error: None, ..task.clone() };
+        let Some(task) = task else {
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        };
+        let claimed = connection.execute("UPDATE media_tasks SET status = 'running', error = NULL, updated_at = datetime('now') WHERE id = ?1 AND status = 'queued'", params![task.id]).unwrap_or(0);
+        if claimed != 1 {
+            continue;
+        }
+        let cancellation = Arc::new(AtomicBool::new(false));
+        if let Ok(mut tokens) = cancelled_media_tasks.lock() {
+            tokens.insert(task.id.clone(), cancellation.clone());
+        }
+        let running = MediaTask {
+            status: "running".to_string(),
+            error: None,
+            ..task.clone()
+        };
         emit_media_task(&app, &running);
-        let outcome = run_media_extraction(&connection, &running, &data_dir);
-        let (status, error) = match outcome { Ok(()) => ("completed", None), Err(error) => ("failed", Some(error)) };
+        let outcome = run_media_extraction(&connection, &running, &data_dir, &cancellation);
+        let (status, error) = if !media_completion_may_commit(&cancellation, true) {
+            ("cancelled", Some("用户取消".to_string()))
+        } else {
+            match outcome {
+                Ok(()) => ("completed", None),
+                Err(error) => ("failed", Some(error)),
+            }
+        };
         let _ = connection.execute("UPDATE media_tasks SET status = ?1, error = ?2, updated_at = datetime('now') WHERE id = ?3 AND status = 'running'", params![status, error, task.id]);
-        let finished = MediaTask { status: status.to_string(), error, ..task };
+        if let Ok(mut tokens) = cancelled_media_tasks.lock() {
+            tokens.remove(&task.id);
+        }
+        let _ = fs::remove_dir_all(data_dir.join("media-work").join(&task.id));
+        let finished = MediaTask {
+            status: status.to_string(),
+            error,
+            ..task
+        };
         emit_media_task(&app, &finished);
     });
 }
@@ -6002,21 +8025,39 @@ fn start_media_worker(app: AppHandle, data_dir: PathBuf) {
 #[tauri::command]
 fn convert_office_preview(path: String, state: State<'_, AppState>) -> Result<FilePreview, String> {
     let target = indexed_path(Path::new(&path), &state)?;
-    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
-    if !matches!(extension.as_str(), "doc" | "docx" | "ppt" | "pptx" | "xls" | "xlsx" | "odt" | "odp" | "ods") {
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(
+        extension.as_str(),
+        "doc" | "docx" | "ppt" | "pptx" | "xls" | "xlsx" | "odt" | "odp" | "ods"
+    ) {
         return Err("高保真预览仅支持 Office 文档。".to_string());
     }
-    if !command_available("soffice") { return Err("未检测到 LibreOffice；请安装后再使用高保真预览。".to_string()); }
+    if !command_available("soffice") {
+        return Err("未检测到 LibreOffice；请安装后再使用高保真预览。".to_string());
+    }
     let metadata = fs::metadata(&target).map_err(|error| error.to_string())?;
-    if metadata.len() > MAX_OFFICE_PREVIEW_SOURCE_BYTES { return Err("Office 文件超过隔离预览安全大小限制。".to_string()); }
+    if metadata.len() > MAX_OFFICE_PREVIEW_SOURCE_BYTES {
+        return Err("Office 文件超过隔离预览安全大小限制。".to_string());
+    }
     let signature = source_signature(&target)?;
     let cache_dir = state.data_dir.join("office-preview-cache").join(signature);
     fs::create_dir_all(&cache_dir).map_err(|error| error.to_string())?;
-    let pdf = cache_dir.join(format!("{}.pdf", target.file_stem().and_then(|value| value.to_str()).unwrap_or("preview")));
+    let pdf = cache_dir.join(format!(
+        "{}.pdf",
+        target
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("preview")
+    ));
     if !pdf.is_file() {
         let profile_dir = cache_dir.join("profile");
         fs::create_dir_all(&profile_dir).map_err(|error| error.to_string())?;
-        let profile_url = url::Url::from_directory_path(&profile_dir).map_err(|_| "无法创建 LibreOffice 隔离配置目录。".to_string())?;
+        let profile_url = url::Url::from_directory_path(&profile_dir)
+            .map_err(|_| "无法创建 LibreOffice 隔离配置目录。".to_string())?;
         let output = command_output_with_timeout(
             Command::new("soffice")
                 .arg("--headless")
@@ -6031,11 +8072,19 @@ fn convert_office_preview(path: String, state: State<'_, AppState>) -> Result<Fi
             OFFICE_PREVIEW_TIMEOUT,
         )?;
         if !output.status.success() || !pdf.is_file() {
-            return Err(format!("LibreOffice 转换失败：{}", String::from_utf8_lossy(&output.stderr).chars().take(2_000).collect::<String>()));
+            return Err(format!(
+                "LibreOffice 转换失败：{}",
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(2_000)
+                    .collect::<String>()
+            ));
         }
     }
     let bytes = fs::read(&pdf).map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_PREVIEW_BYTES * 20 { return Err("转换后的 PDF 过大；请在资源管理器中打开原文件。".to_string()); }
+    if bytes.len() as u64 > MAX_PREVIEW_BYTES * 20 {
+        return Err("转换后的 PDF 过大；请在资源管理器中打开原文件。".to_string());
+    }
     Ok(FilePreview {
         kind: "pdf".to_string(),
         name: target.file_name().and_then(|value| value.to_str()).unwrap_or("Office 文档").to_string(),
@@ -6056,7 +8105,10 @@ fn get_thumbnail(input: ThumbnailInput, state: State<'_, AppState>) -> Result<Th
     let target = indexed_path(Path::new(&input.path), &state)?;
     let signature = source_signature(&target)?;
     let existing = {
-        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "本地数据库被占用。".to_string())?;
         connection
             .query_row(
                 "SELECT cache_path, mime_type FROM thumbnail_cache WHERE item_id = ?1 AND source_signature = ?2",
@@ -6068,32 +8120,62 @@ fn get_thumbnail(input: ThumbnailInput, state: State<'_, AppState>) -> Result<Th
     };
     if let Some((cache_path, mime_type)) = existing {
         if let Ok(bytes) = fs::read(&cache_path) {
-            return Ok(Thumbnail { item_id: input.item_id, source_signature: signature, mime_type, content: BASE64.encode(bytes), cached: true });
+            return Ok(Thumbnail {
+                item_id: input.item_id,
+                source_signature: signature,
+                mime_type,
+                content: BASE64.encode(bytes),
+                cached: true,
+            });
         }
     }
     let cache_dir = thumbnail_cache_dir(&state.data_dir)?;
-    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
-    let (mime_type, bytes) = if extension == "pdf" { pdf_thumbnail_bytes(&target, &cache_dir)? } else { image_thumbnail_bytes(&target)? };
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let (mime_type, bytes) = if extension == "pdf" {
+        pdf_thumbnail_bytes(&target, &cache_dir)?
+    } else {
+        image_thumbnail_bytes(&target)?
+    };
     let cache_path = cache_dir.join(format!("{}-{}.png", input.item_id, signature));
     fs::write(&cache_path, &bytes).map_err(|error| error.to_string())?;
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
-    connection.execute(
-        "DELETE FROM thumbnail_cache WHERE item_id = ?1 AND source_signature != ?2",
-        params![input.item_id, signature],
-    ).map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    connection
+        .execute(
+            "DELETE FROM thumbnail_cache WHERE item_id = ?1 AND source_signature != ?2",
+            params![input.item_id, signature],
+        )
+        .map_err(|error| error.to_string())?;
     connection.execute(
         "INSERT OR REPLACE INTO thumbnail_cache (item_id, source_signature, cache_path, mime_type, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
         params![input.item_id, signature, cache_path.display().to_string(), mime_type],
     ).map_err(|error| error.to_string())?;
-    Ok(Thumbnail { item_id: input.item_id, source_signature: signature, mime_type: mime_type.into(), content: BASE64.encode(bytes), cached: false })
+    Ok(Thumbnail {
+        item_id: input.item_id,
+        source_signature: signature,
+        mime_type: mime_type.into(),
+        content: BASE64.encode(bytes),
+        cached: false,
+    })
 }
 
 #[tauri::command]
 fn clear_thumbnail_cache(state: State<'_, AppState>) -> Result<ThumbnailCacheClearResult, String> {
     let entries = {
-        let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "本地数据库被占用。".to_string())?;
         let cache_paths = {
-            let mut statement = connection.prepare("SELECT cache_path FROM thumbnail_cache").map_err(|error| error.to_string())?;
+            let mut statement = connection
+                .prepare("SELECT cache_path FROM thumbnail_cache")
+                .map_err(|error| error.to_string())?;
             let paths = statement
                 .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|error| error.to_string())?
@@ -6101,19 +8183,26 @@ fn clear_thumbnail_cache(state: State<'_, AppState>) -> Result<ThumbnailCacheCle
                 .collect::<Vec<_>>();
             paths
         };
-        connection.execute("DELETE FROM thumbnail_cache", []).map_err(|error| error.to_string())?;
+        connection
+            .execute("DELETE FROM thumbnail_cache", [])
+            .map_err(|error| error.to_string())?;
         cache_paths
     };
     let mut removed = 0;
     for path in entries {
-        if fs::remove_file(path).is_ok() { removed += 1; }
+        if fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
     }
     Ok(ThumbnailCacheClearResult { removed })
 }
 
 #[tauri::command]
 fn list_media_tasks(state: State<'_, AppState>) -> Result<Vec<MediaTask>, String> {
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
     let mut statement = connection.prepare(
         "SELECT media_tasks.id, media_tasks.item_id, index_items.name, media_tasks.kind, media_tasks.status, media_tasks.error, media_tasks.created_at, media_tasks.updated_at FROM media_tasks INNER JOIN index_items ON index_items.id = media_tasks.item_id ORDER BY media_tasks.created_at DESC LIMIT 100"
     ).map_err(|error| error.to_string())?;
@@ -6126,13 +8215,39 @@ fn list_media_tasks(state: State<'_, AppState>) -> Result<Vec<MediaTask>, String
 }
 
 #[tauri::command]
-fn enqueue_media_task(input: MediaTaskInput, state: State<'_, AppState>) -> Result<MediaTask, String> {
-    if !matches!(input.kind.as_str(), "ocr" | "transcription") { return Err("不支持的媒体任务类型。".to_string()); }
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+fn enqueue_media_task(
+    input: MediaTaskInput,
+    state: State<'_, AppState>,
+) -> Result<MediaTask, String> {
+    if !matches!(input.kind.as_str(), "ocr" | "transcription") {
+        return Err("不支持的媒体任务类型。".to_string());
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
     let path = indexed_media_path(&connection, &input.item_id)?;
-    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
-    if input.kind == "ocr" && !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp") { return Err("OCR 只能加入图片文件。".to_string()); }
-    if input.kind == "transcription" && !matches!(extension.as_str(), "wav" | "mp3" | "m4a" | "flac" | "ogg" | "mp4" | "mkv" | "mov" | "webm" | "avi") { return Err("转写只能加入音频或视频文件。".to_string()); }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if input.kind == "ocr"
+        && !matches!(
+            extension.as_str(),
+            "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp"
+        )
+    {
+        return Err("OCR 只能加入图片文件。".to_string());
+    }
+    if input.kind == "transcription"
+        && !matches!(
+            extension.as_str(),
+            "wav" | "mp3" | "m4a" | "flac" | "ogg" | "mp4" | "mkv" | "mov" | "webm" | "avi"
+        )
+    {
+        return Err("转写只能加入音频或视频文件。".to_string());
+    }
     if let Some(task) = connection.query_row(
         "SELECT media_tasks.id, media_tasks.item_id, index_items.name, media_tasks.kind, media_tasks.status, media_tasks.error, media_tasks.created_at, media_tasks.updated_at FROM media_tasks INNER JOIN index_items ON index_items.id = media_tasks.item_id WHERE media_tasks.item_id = ?1 AND media_tasks.kind = ?2 AND media_tasks.status IN ('queued', 'running') ORDER BY media_tasks.created_at DESC LIMIT 1",
         params![input.item_id, input.kind], media_task_from_row,
@@ -6147,24 +8262,67 @@ fn enqueue_media_task(input: MediaTaskInput, state: State<'_, AppState>) -> Resu
 
 #[tauri::command]
 fn cancel_media_task(input: MediaTaskIdInput, state: State<'_, AppState>) -> Result<(), String> {
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
-    let changed = connection.execute("UPDATE media_tasks SET status = 'cancelled', error = '用户取消', updated_at = datetime('now') WHERE id = ?1 AND status IN ('queued', 'running')", params![input.id]).map_err(|error| error.to_string())?;
-    if changed == 0 { return Err("媒体任务无法取消或已完成。".to_string()); }
+    if let Ok(tokens) = state.cancelled_media_tasks.lock() {
+        if let Some(token) = tokens.get(&input.id) {
+            token.store(true, Ordering::SeqCst);
+        }
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    let changed = connection.execute("UPDATE media_tasks SET status = 'cancelled', error = '用户取消', updated_at = datetime('now') WHERE id = ?1 AND status = 'queued'", params![input.id]).map_err(|error| error.to_string())?;
+    if changed == 0 {
+        let status = connection
+            .query_row(
+                "SELECT status FROM media_tasks WHERE id = ?1",
+                params![input.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if !matches!(status.as_deref(), Some("running") | Some("cancelled")) {
+            return Err("媒体任务无法取消或已完成。".to_string());
+        }
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn get_media_settings(state: State<'_, AppState>) -> Result<MediaSettings, String> {
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
     media_settings(&connection)
 }
 
 #[tauri::command]
-fn save_media_settings(input: MediaSettings, state: State<'_, AppState>) -> Result<MediaSettings, String> {
-    if input.ocr_language.trim().is_empty() || input.ocr_language.len() > 80 || input.whisper_model_path.len() > 1_024 { return Err("媒体工具设置无效。".to_string()); }
-    if !input.whisper_model_path.trim().is_empty() && !Path::new(&input.whisper_model_path).is_file() { return Err("Whisper 模型文件不存在。".to_string()); }
-    let connection = state.database.lock().map_err(|_| "本地数据库被占用。".to_string())?;
-    connection.execute("UPDATE media_settings SET whisper_model_path = ?1, ocr_language = ?2 WHERE id = 1", params![input.whisper_model_path, input.ocr_language]).map_err(|error| error.to_string())?;
+fn save_media_settings(
+    input: MediaSettings,
+    state: State<'_, AppState>,
+) -> Result<MediaSettings, String> {
+    if input.ocr_language.trim().is_empty()
+        || input.ocr_language.len() > 80
+        || input.whisper_model_path.len() > 1_024
+    {
+        return Err("媒体工具设置无效。".to_string());
+    }
+    if !input.whisper_model_path.trim().is_empty()
+        && !Path::new(&input.whisper_model_path).is_file()
+    {
+        return Err("Whisper 模型文件不存在。".to_string());
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "本地数据库被占用。".to_string())?;
+    connection
+        .execute(
+            "UPDATE media_settings SET whisper_model_path = ?1, ocr_language = ?2 WHERE id = 1",
+            params![input.whisper_model_path, input.ocr_language],
+        )
+        .map_err(|error| error.to_string())?;
     Ok(input)
 }
 
@@ -6187,8 +8345,8 @@ fn main() {
     let data_dir = app_data_dir().expect("unable to locate app data directory");
     fs::create_dir_all(&data_dir).expect("unable to create app data directory");
     apply_pending_restore(&data_dir).expect("unable to apply pending restore");
-    let (connection, startup_recovery_notice, recovery_mode) = open_app_database_with_recovery(&data_dir)
-        .expect("unable to open encrypted database");
+    let (connection, startup_recovery_notice, recovery_mode) =
+        open_app_database_with_recovery(&data_dir).expect("unable to open encrypted database");
     if !recovery_mode {
         initialize_database(&connection).expect("unable to initialize database");
     }
@@ -6209,13 +8367,32 @@ fn main() {
             recovery_mode,
             prepared_runs: Mutex::new(HashMap::new()),
             cancelled_runs: Mutex::new(HashMap::new()),
+            cancelled_media_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cancelled_download_tasks: Arc::new(Mutex::new(HashMap::new())),
+            folder_watch_status: Arc::new(Mutex::new(HashMap::new())),
         })
         .setup(|app| {
             let state = app.state::<AppState>();
             if !state.recovery_mode {
-                start_folder_change_watch(app.handle().clone(), app_data_dir()?);
+                start_folder_change_watch(
+                    app.handle().clone(),
+                    app_data_dir()?,
+                    state.folder_watch_status.clone(),
+                );
                 start_index_worker(app.handle().clone(), app_data_dir()?);
-                start_media_worker(app.handle().clone(), app_data_dir()?);
+                start_media_worker(
+                    app.handle().clone(),
+                    app_data_dir()?,
+                    state.cancelled_media_tasks.clone(),
+                );
+                if let Ok(connection) = open_app_database(&state.data_dir) {
+                    let _ = recover_incomplete_download_tasks(&connection);
+                }
+                start_download_worker(
+                    app.handle().clone(),
+                    state.data_dir.clone(),
+                    state.cancelled_download_tasks.clone(),
+                );
             }
             Ok(())
         })
@@ -6238,6 +8415,17 @@ fn main() {
             refresh_folder_index,
             enqueue_index_job,
             list_index_jobs,
+            list_index_diagnostics,
+            retry_index_diagnostics,
+            export_index_diagnostics,
+            list_background_tasks,
+            list_folder_watch_status,
+            list_managed_download_resources,
+            list_download_tasks,
+            download_managed_resource,
+            retry_download_task,
+            cancel_download_task,
+            delete_managed_download_resource,
             pause_index_job,
             resume_index_job,
             remove_folder_reference,
@@ -6307,13 +8495,25 @@ fn main() {
 #[cfg(test)]
 mod preview_tests {
     use super::{
-        cosine_similarity, display_path, effective_cloud_policy, incremental_index_folder_inner,
-        initialize_database, migrate_plaintext_database, open_encrypted_database, preview_mime,
-        read_database_key_backup, recovery_mode_connection, restore_quarantined_database, save_database_key_backup,
-        safe_relative_path, unique_library_file_path, CloudPolicy,
+        cosine_similarity, create_download_task, display_path, effective_cloud_policy,
+        incremental_index_folder_inner, index_content, initialize_database,
+        migrate_plaintext_database, open_encrypted_database, preview_mime,
+        read_database_key_backup, recover_incomplete_download_tasks, recovery_mode_connection,
+        restore_quarantined_database, safe_relative_path, save_database_key_backup,
+        unique_library_file_path, CloudPolicy, MediaCommandRunner, MediaTask,
     };
     use rusqlite::{params, Connection};
-    use std::{fs, path::{Path, PathBuf}, time::Instant};
+    use std::{
+        fs,
+        io::Write,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Instant,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -6354,14 +8554,332 @@ mod preview_tests {
     }
 
     #[test]
+    fn indexes_large_office_documents_and_records_content_status() {
+        let temp = tempdir().unwrap();
+        let document = temp.path().join("large.docx");
+        let file = fs::File::create(&document).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file(
+                "word/document.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"<w:document><w:body><w:p><w:t>game design searchable text</w:t></w:p></w:body></w:document>").unwrap();
+        archive
+            .start_file(
+                "word/media/padding.bin",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(&vec![b'x'; 600 * 1024]).unwrap();
+        archive.finish().unwrap();
+
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        connection.execute("INSERT INTO folder_refs (id, root_path, name, note, tags_json, cloud_policy, imported_at) VALUES ('folder', ?1, 'fixture', '', '[]', 'local_only', datetime('now'))", params![temp.path().display().to_string()]).unwrap();
+        connection.execute("INSERT INTO index_items (id, folder_id, item_type, name, path, note, tags_json, cloud_policy) VALUES ('item', 'folder', 'file', 'large.docx', ?1, '', '[]', 'inherit')", params![document.display().to_string()]).unwrap();
+
+        index_content(&connection, "item", &document).unwrap();
+
+        let content = connection
+            .query_row(
+                "SELECT content FROM index_content_fts WHERE item_id = 'item'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(content.contains("game design searchable text"));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT content_status FROM index_items WHERE id = 'item'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "indexed"
+        );
+    }
+
+    #[test]
+    fn malformed_document_has_a_safe_index_diagnostic_instead_of_silent_empty_content() {
+        let temp = tempdir().unwrap();
+        let document = temp.path().join("broken.docx");
+        fs::write(&document, b"this is not a zip document").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        connection.execute("INSERT INTO folder_refs (id, root_path, name, note, tags_json, cloud_policy, imported_at) VALUES ('folder', ?1, 'fixture', '', '[]', 'local_only', datetime('now'))", params![temp.path().display().to_string()]).unwrap();
+        connection.execute("INSERT INTO index_items (id, folder_id, item_type, name, path, note, tags_json, cloud_policy) VALUES ('item', 'folder', 'file', 'broken.docx', ?1, '', '[]', 'inherit')", params![document.display().to_string()]).unwrap();
+
+        index_content(&connection, "item", &document).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT content_status FROM index_items WHERE id = 'item'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT content_reason_code FROM index_items WHERE id = 'item'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "malformed_document"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM index_content_fts WHERE item_id = 'item'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn interrupted_media_tasks_are_requeued_and_cancelled_tasks_stay_cancelled() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        connection.execute("INSERT INTO folder_refs (id, root_path, name, note, tags_json, cloud_policy, imported_at) VALUES ('folder', 'C:/fixture', 'fixture', '', '[]', 'local_only', datetime('now'))", []).unwrap();
+        connection.execute("INSERT INTO index_items (id, folder_id, item_type, name, path, note, tags_json, cloud_policy) VALUES ('item', 'folder', 'file', 'file.png', 'C:/fixture/file.png', '', '[]', 'inherit')", []).unwrap();
+        connection.execute("INSERT INTO media_tasks (id, item_id, kind, status, created_at, updated_at) VALUES ('running', 'item', 'ocr', 'running', datetime('now'), datetime('now')), ('cancelled', 'item', 'ocr', 'cancelled', datetime('now'), datetime('now'))", []).unwrap();
+
+        super::recover_interrupted_media_tasks(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM media_tasks WHERE id = 'running'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "queued"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM media_tasks WHERE id = 'cancelled'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn cancelled_media_task_never_persists_extraction_output() {
+        let token = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(!super::media_result_may_persist(&token));
+    }
+
+    #[test]
+    fn index_diagnostics_filter_failures_and_retry_preserves_metadata() {
+        let temp = tempdir().unwrap();
+        let document = temp.path().join("retry.txt");
+        fs::write(&document, "game retry content").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        connection.execute("INSERT INTO folder_refs (id, root_path, name, note, tags_json, cloud_policy, imported_at) VALUES ('folder', ?1, 'fixture', 'keep note', '[\"game\"]', 'local_only', datetime('now'))", params![temp.path().display().to_string()]).unwrap();
+        connection.execute("INSERT INTO index_items (id, folder_id, item_type, name, path, note, tags_json, cloud_policy, content_status, content_reason_code) VALUES ('item', 'folder', 'file', 'retry.txt', ?1, 'keep item note', '[\"keep\"]', 'inherit', 'failed', 'extractor_failed')", params![document.display().to_string()]).unwrap();
+
+        super::index_content(&connection, "item", &document).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT content_status FROM index_items WHERE id = 'item'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "indexed"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT note FROM index_items WHERE id = 'item'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "keep item note"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT tags_json FROM index_items WHERE id = 'item'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "[\"keep\"]"
+        );
+    }
+
+    #[test]
+    fn manual_kit_like_folder_is_incrementally_indexed_and_searchable_without_touching_source() {
+        let temp = tempdir().unwrap();
+        let website = temp.path().join("website");
+        let assets = temp.path().join("assets");
+        fs::create_dir_all(&website).unwrap();
+        fs::create_dir_all(&assets).unwrap();
+        let page = website.join("index.html");
+        let brief = assets.join("project-brief.md");
+        let copy = assets.join("public-game-copy.txt");
+        fs::write(&page, "<h1>资料终端演示网页</h1>").unwrap();
+        fs::write(&brief, "游戏项目说明").unwrap();
+        fs::write(&copy, "公开游戏文案").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        connection.execute("INSERT INTO folder_refs (id, root_path, name, note, tags_json, cloud_policy, imported_at) VALUES ('kit', ?1, 'assets', '资料终端功能验收素材', '[\"游戏\"]', 'local_only', datetime('now'))", params![temp.path().display().to_string()]).unwrap();
+        connection.execute("INSERT INTO index_jobs (id, folder_id, status, completed, total, changed, created_at, updated_at) VALUES ('job', 'kit', 'queued', 0, 0, 0, datetime('now'), datetime('now'))", []).unwrap();
+
+        super::incremental_index_folder_inner(&connection, "job", "kit", |_| {}).unwrap();
+
+        let indexed = connection
+            .query_row(
+                "SELECT COUNT(*) FROM index_content_fts WHERE content LIKE '%游戏%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert!(indexed >= 2);
+        assert_eq!(
+            fs::read_to_string(&page).unwrap(),
+            "<h1>资料终端演示网页</h1>"
+        );
+        connection
+            .execute("DELETE FROM index_items WHERE folder_id = 'kit'", [])
+            .unwrap();
+        assert!(brief.is_file() && copy.is_file() && page.is_file());
+    }
+
+    #[test]
+    fn media_runner_cancellation_wins_the_completion_race_and_keeps_results_unwritten() {
+        struct CompletingRunner;
+        impl super::MediaCommandRunner for CompletingRunner {
+            fn run(
+                &self,
+                _command: &mut Command,
+                cancelled: &Arc<AtomicBool>,
+            ) -> Result<String, String> {
+                // The simulated child completes just as its caller cancels the task.
+                cancelled.store(true, Ordering::SeqCst);
+                Ok("recognised text".to_string())
+            }
+        }
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("image.png");
+        fs::write(&source, b"not-an-image-but-runner-is-injected").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        connection.execute("INSERT INTO folder_refs (id, root_path, name, note, tags_json, cloud_policy, imported_at) VALUES ('folder', ?1, 'folder', '', '[]', 'local_only', datetime('now'))", params![temp.path().display().to_string()]).unwrap();
+        connection.execute("INSERT INTO index_items (id, folder_id, item_type, name, path, note, tags_json, cloud_policy) VALUES ('item', 'folder', 'file', 'image.png', ?1, '', '[]', 'inherit')", params![source.display().to_string()]).unwrap();
+        connection.execute("INSERT INTO media_tasks (id, item_id, kind, status, created_at, updated_at) VALUES ('task', 'item', 'ocr', 'running', datetime('now'), datetime('now'))", []).unwrap();
+        let task = MediaTask {
+            id: "task".to_string(),
+            item_id: "item".to_string(),
+            name: "image.png".to_string(),
+            kind: "ocr".to_string(),
+            status: "running".to_string(),
+            error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let token = Arc::new(AtomicBool::new(false));
+        let mut command = Command::new("unused");
+        let runner = CompletingRunner;
+        assert!(runner.run(&mut command, &token).is_ok());
+        let result = super::persist_media_extraction(
+            &connection,
+            &task,
+            &source,
+            "signature",
+            "recognised text",
+            &token,
+        );
+        assert!(result.is_err());
+        let count = connection
+            .query_row("SELECT COUNT(*) FROM media_extractions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(super::media_completion_may_commit(&token, true) == false);
+    }
+
+    #[test]
+    fn failed_watch_switches_to_deduplicated_fallback_scan_until_a_watcher_recovers() {
+        let mut health = super::FolderWatchHealth::healthy();
+        health.mark_watch_failure("watcher_unavailable");
+        assert_eq!(health.mode, "fallback_scan");
+        assert!(health.should_scan_at(1_000));
+        assert!(!health.should_scan_at(1_100));
+        health.mark_watch_recovered();
+        assert_eq!(health.mode, "watching");
+    }
+
+    #[test]
+    fn fixed_download_resources_use_https_sha256_and_never_delete_external_files() {
+        for resource in super::FIXED_DOWNLOAD_RESOURCES {
+            assert!(resource.url.starts_with("https://"));
+            assert_eq!(resource.sha256.len(), 64);
+        }
+        let temp = tempdir().unwrap();
+        let external = temp.path().join("external.gguf");
+        fs::write(&external, "user owned").unwrap();
+        assert!(super::remove_registered_external_model(&external).is_ok());
+        assert!(external.is_file());
+    }
+
+    #[test]
+    fn incomplete_downloads_are_requeued_and_duplicate_resources_share_one_active_task() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        let resource = &super::FIXED_DOWNLOAD_RESOURCES[0];
+        let first = create_download_task(&connection, resource).unwrap();
+        let second = create_download_task(&connection, resource).unwrap();
+        assert_eq!(first.id, second.id);
+        connection
+            .execute(
+                "UPDATE download_tasks SET status = 'running' WHERE id = ?1",
+                params![first.id],
+            )
+            .unwrap();
+        recover_incomplete_download_tasks(&connection).unwrap();
+        let status = connection
+            .query_row(
+                "SELECT status FROM download_tasks WHERE id = ?1",
+                params![first.id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(status, "queued");
+    }
+
+    #[test]
     fn unreadable_existing_database_uses_an_in_memory_recovery_connection() {
-        let (connection, notice, recovery_mode) = recovery_mode_connection(
-            "已有本地数据库但找不到可用密钥".to_string(),
-        ).unwrap();
+        let (connection, notice, recovery_mode) =
+            recovery_mode_connection("已有本地数据库但找不到可用密钥".to_string()).unwrap();
         assert!(recovery_mode);
         assert!(notice.unwrap().contains("安全恢复模式"));
         assert_eq!(
-            connection.query_row("SELECT COUNT(*) FROM folder_refs", [], |row| row.get::<_, i64>(0)).unwrap(),
+            connection
+                .query_row("SELECT COUNT(*) FROM folder_refs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
             0
         );
     }
@@ -6380,7 +8898,10 @@ mod preview_tests {
 
         assert!(super::has_application_data(&target));
         assert_eq!(fs::read(target.join("database-key.dpapi")).unwrap(), b"key");
-        assert_eq!(fs::read(source.join("file-terminal.db")).unwrap(), b"database");
+        assert_eq!(
+            fs::read(source.join("file-terminal.db")).unwrap(),
+            b"database"
+        );
     }
 
     #[test]
@@ -6388,11 +8909,22 @@ mod preview_tests {
         let temp = tempdir().unwrap();
         let first = temp.path().join(super::FRESH_DATA_FOLDER_PREFIX);
         fs::create_dir(&first).unwrap();
-        fs::write(first.join("file-terminal.db"), b"unreadable encrypted database").unwrap();
+        fs::write(
+            first.join("file-terminal.db"),
+            b"unreadable encrypted database",
+        )
+        .unwrap();
         let second = super::create_fresh_data_directory_at(temp.path()).unwrap();
         assert!(first.exists());
-        assert_eq!(fs::read(first.join("file-terminal.db")).unwrap(), b"unreadable encrypted database");
-        assert_eq!(second, temp.path().join(format!("{}-2", super::FRESH_DATA_FOLDER_PREFIX)));
+        assert_eq!(
+            fs::read(first.join("file-terminal.db")).unwrap(),
+            b"unreadable encrypted database"
+        );
+        assert_eq!(
+            second,
+            temp.path()
+                .join(format!("{}-2", super::FRESH_DATA_FOLDER_PREFIX))
+        );
         assert!(second.is_dir());
     }
 
@@ -6401,14 +8933,21 @@ mod preview_tests {
         let temp = tempdir().unwrap();
         let pointer = temp.path().join("location.json");
         super::write_data_location_record(&pointer, &PathBuf::from(r"C:\\资料终端数据")).unwrap();
-        assert_eq!(super::read_data_location_record(&pointer).unwrap(), PathBuf::from(r"C:\\资料终端数据"));
+        assert_eq!(
+            super::read_data_location_record(&pointer).unwrap(),
+            PathBuf::from(r"C:\\资料终端数据")
+        );
         fs::write(&pointer, r#"{"path":"relative"}"#).unwrap();
         assert!(super::read_data_location_record(&pointer).is_none());
     }
 
     #[test]
     fn chooses_cpu_runtime_when_gpu_is_not_explicitly_available() {
-        let settings = super::RuntimeSettings { execution_mode: "cpu".into(), threads: 4, context_size: 4096 };
+        let settings = super::RuntimeSettings {
+            execution_mode: "cpu".into(),
+            threads: 4,
+            context_size: 4096,
+        };
         let runtime = super::runtime_variant_for_settings(&settings).unwrap();
         assert!(!runtime.gpu);
         assert_eq!(runtime.executable, "llama-cli.exe");
@@ -6419,13 +8958,22 @@ mod preview_tests {
         let temp = tempdir().unwrap();
         let database = temp.path().join("migration.db");
         let plain = Connection::open(&database).unwrap();
-        plain.execute_batch("CREATE TABLE proof (value TEXT); INSERT INTO proof VALUES ('kept');").unwrap();
+        plain
+            .execute_batch("CREATE TABLE proof (value TEXT); INSERT INTO proof VALUES ('kept');")
+            .unwrap();
         drop(plain);
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         migrate_plaintext_database(&database, key).unwrap();
         let encrypted = open_encrypted_database(&database, key).unwrap();
-        assert_eq!(encrypted.query_row("SELECT value FROM proof", [], |row| row.get::<_, String>(0)).unwrap(), "kept");
-        assert!(!fs::read(&database).unwrap().starts_with(b"SQLite format 3\0"));
+        assert_eq!(
+            encrypted
+                .query_row("SELECT value FROM proof", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "kept"
+        );
+        assert!(!fs::read(&database)
+            .unwrap()
+            .starts_with(b"SQLite format 3\0"));
     }
 
     #[cfg(windows)]
@@ -6462,9 +9010,31 @@ mod preview_tests {
         ).unwrap();
 
         assert!(restore_quarantined_database(&target, &recovery, key).unwrap() >= 1);
-        assert_eq!(target.query_row("SELECT COUNT(*) FROM folder_refs", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
-        assert_eq!(target.query_row("SELECT note FROM folder_refs WHERE id = 'old'", [], |row| row.get::<_, String>(0)).unwrap(), "来自旧库");
-        assert_eq!(target.query_row("SELECT threads FROM runtime_settings WHERE id = 1", [], |row| row.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(
+            target
+                .query_row("SELECT COUNT(*) FROM folder_refs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            target
+                .query_row("SELECT note FROM folder_refs WHERE id = 'old'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "来自旧库"
+        );
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT threads FROM runtime_settings WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            7
+        );
         assert!(source_path.is_file());
     }
 
@@ -6478,7 +9048,10 @@ mod preview_tests {
         let target = unique_library_file_path(&library, std::ffi::OsStr::new("notes.txt"));
 
         assert_eq!(target.file_name().unwrap(), "notes (2).txt");
-        assert_eq!(fs::read_to_string(library.join("notes.txt")).unwrap(), "first copy");
+        assert_eq!(
+            fs::read_to_string(library.join("notes.txt")).unwrap(),
+            "first copy"
+        );
     }
 
     #[test]
@@ -6530,18 +9103,48 @@ mod preview_tests {
         let mut paused = false;
         let changed = incremental_index_folder_inner(&connection, job_id, folder_id, |job| {
             if !paused && job.completed >= 25 {
-                connection.execute("UPDATE index_jobs SET status = 'paused' WHERE id = ?1", params![job_id]).unwrap();
+                connection
+                    .execute(
+                        "UPDATE index_jobs SET status = 'paused' WHERE id = ?1",
+                        params![job_id],
+                    )
+                    .unwrap();
                 paused = true;
             }
-        }).unwrap();
+        })
+        .unwrap();
         assert!(paused);
         assert!(changed >= 25 && changed < 101);
-        assert_eq!(connection.query_row("SELECT status FROM index_jobs WHERE id = ?1", params![job_id], |row| row.get::<_, String>(0)).unwrap(), "paused");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM index_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "paused"
+        );
 
-        connection.execute("UPDATE index_jobs SET status = 'queued' WHERE id = ?1", params![job_id]).unwrap();
-        let resumed_changed = incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap();
+        connection
+            .execute(
+                "UPDATE index_jobs SET status = 'queued' WHERE id = ?1",
+                params![job_id],
+            )
+            .unwrap();
+        let resumed_changed =
+            incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap();
         assert_eq!(resumed_changed, 101 - changed);
-        assert_eq!(connection.query_row("SELECT status FROM index_jobs WHERE id = ?1", params![job_id], |row| row.get::<_, String>(0)).unwrap(), "completed");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM index_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "completed"
+        );
     }
 
     #[test]
@@ -6550,7 +9153,11 @@ mod preview_tests {
         let root = temp.path().join("benchmark");
         fs::create_dir_all(&root).unwrap();
         for index in 0..10_000 {
-            fs::write(root.join(format!("item-{index:05}.txt")), "benchmark content").unwrap();
+            fs::write(
+                root.join(format!("item-{index:05}.txt")),
+                "benchmark content",
+            )
+            .unwrap();
         }
         let connection = Connection::open_in_memory().unwrap();
         initialize_database(&connection).unwrap();
@@ -6566,16 +9173,35 @@ mod preview_tests {
         ).unwrap();
 
         let first_start = Instant::now();
-        assert_eq!(incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap(), 10_001);
+        assert_eq!(
+            incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap(),
+            10_001
+        );
         let first = first_start.elapsed();
-        connection.execute("UPDATE index_jobs SET status = 'queued' WHERE id = ?1", params![job_id]).unwrap();
+        connection
+            .execute(
+                "UPDATE index_jobs SET status = 'queued' WHERE id = ?1",
+                params![job_id],
+            )
+            .unwrap();
         let unchanged_start = Instant::now();
-        assert_eq!(incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap(), 0);
+        assert_eq!(
+            incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap(),
+            0
+        );
         let unchanged = unchanged_start.elapsed();
         fs::write(root.join("item-05000.txt"), "changed benchmark content").unwrap();
-        connection.execute("UPDATE index_jobs SET status = 'queued' WHERE id = ?1", params![job_id]).unwrap();
+        connection
+            .execute(
+                "UPDATE index_jobs SET status = 'queued' WHERE id = ?1",
+                params![job_id],
+            )
+            .unwrap();
         let changed_start = Instant::now();
-        assert_eq!(incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap(), 1);
+        assert_eq!(
+            incremental_index_folder_inner(&connection, job_id, folder_id, |_| {}).unwrap(),
+            1
+        );
         let one_changed = changed_start.elapsed();
         eprintln!("10k incremental benchmark: first={first:?}, unchanged={unchanged:?}, one_changed={one_changed:?}");
         // A deliberately broad ceiling catches accidental quadratic work without assuming a specific disk speed.

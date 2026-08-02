@@ -12,6 +12,9 @@ mod tests {
 
     #[test]
     fn model_terms_accept_a_small_json_like_list() {
-        assert_eq!(parse_model_terms("[\"游戏\", \"steam\"]"), vec!["游戏", "steam"]);
+        assert_eq!(
+            parse_model_terms("[\"游戏\", \"steam\"]"),
+            vec!["游戏", "steam"]
+        );
     }
 }
