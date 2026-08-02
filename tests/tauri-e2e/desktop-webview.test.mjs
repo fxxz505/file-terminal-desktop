@@ -19,6 +19,10 @@ async function request(path, init = {}) {
   return body.value;
 }
 
+async function requestWithRetry(path, init = {}, timeoutMs = 60_000) {
+  return eventually(() => request(path, init), timeoutMs);
+}
+
 async function eventually(action, timeoutMs = 12_000) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
@@ -30,7 +34,7 @@ async function eventually(action, timeoutMs = 12_000) {
 
 test('real Tauri WebView navigates between local search, diagnostics, and task center', { timeout: 45_000 }, async (t) => {
   assert.ok(appPath, 'TAURI_E2E_APP must point to the debug Tauri executable');
-  const session = await request('/session', {
+  const session = await requestWithRetry('/session', {
     method: 'POST',
     body: JSON.stringify({
       capabilities: {
