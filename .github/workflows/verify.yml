@@ -86,16 +86,30 @@ jobs:
       - name: Start Tauri WebDriver bridge
         shell: pwsh
         run: |
-          $env:FILE_TERMINAL_TEST_DATA_DIR = Join-Path $env:RUNNER_TEMP 'file-terminal-e2e-data'
+          $testData = Join-Path $env:RUNNER_TEMP 'file-terminal-e2e-data'
+          New-Item -ItemType Directory -Force -Path $testData | Out-Null
+          $env:FILE_TERMINAL_TEST_DATA_DIR = $testData
+          "FILE_TERMINAL_TEST_DATA_DIR=$testData" | Out-File -FilePath $env:GITHUB_ENV -Append
           $stdout = Join-Path $env:RUNNER_TEMP 'tauri-driver.stdout.log'
           $stderr = Join-Path $env:RUNNER_TEMP 'tauri-driver.stderr.log'
-          $driver = Start-Process tauri-driver -ArgumentList '--native-driver', $env:EDGE_DRIVER_PATH, '--port', '4444' -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
+          $driver = Start-Process tauri-driver -ArgumentList '--native-driver', $env:EDGE_DRIVER_PATH, '--port', '4444', '--native-port', '4445' -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
           "TAURI_DRIVER_PID=$($driver.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
           $ready = $false
           for ($i = 0; $i -lt 60; $i++) {
             try { Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4444/status | Out-Null; $ready = $true; break } catch { Start-Sleep -Seconds 1 }
           }
           if (-not $ready) { Get-Content $stdout, $stderr -ErrorAction SilentlyContinue; throw 'tauri-driver did not become ready on port 4444' }
+      - name: Preflight Tauri application startup
+        shell: pwsh
+        env:
+          TAURI_E2E_APP: ${{ github.workspace }}\src-tauri\target\debug\file-terminal-desktop.exe
+        run: |
+          $app = $env:TAURI_E2E_APP
+          if (-not (Test-Path $app)) { throw "Tauri executable not found: $app" }
+          $process = Start-Process $app -WorkingDirectory (Split-Path $app) -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 12
+          if ($process.HasExited) { throw "Tauri application exited before WebDriver session creation. ExitCode=$($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
       - name: Capture desktop process diagnostics
         if: always()
         shell: pwsh
