@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: verify-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     runs-on: windows-latest
@@ -19,6 +23,9 @@ jobs:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
       - name: Install frontend dependencies
         run: npm ci
       - name: TypeScript check
@@ -40,6 +47,9 @@ jobs:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
       - name: Install frontend dependencies
         run: npm ci
       - name: Build frontend assets for Tauri WebView
