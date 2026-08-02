@@ -4,12 +4,13 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const driverUrl = (process.env.TAURI_DRIVER_URL ?? 'http://127.0.0.1:4444').replace(/\/$/, '');
+const nativeDriverUrl = (process.env.TAURI_NATIVE_DRIVER_URL ?? '').replace(/\/$/, '');
 const appPath = process.env.TAURI_E2E_APP;
 const artifacts = process.env.TAURI_E2E_ARTIFACTS ?? 'e2e-artifacts';
 const webviewProfile = process.env.TAURI_WEBVIEW_PROFILE;
 
-async function request(path, init = {}) {
-  const response = await fetch(`${driverUrl}${path}`, {
+async function request(path, init = {}, baseUrl = driverUrl) {
+  const response = await fetch(`${baseUrl}${path}`, {
     headers: { 'content-type': 'application/json', ...(init.headers ?? {}) },
     ...init,
   });
@@ -20,17 +21,29 @@ async function request(path, init = {}) {
   return body.value;
 }
 
-async function requestWithRetry(path, init = {}, timeoutMs = 60_000) {
+async function requestWithRetry(path, init = {}, timeoutMs = 60_000, baseUrl = driverUrl) {
   let attempts = 0;
   return eventually(async () => {
     attempts += 1;
     try {
-      return await request(path, init);
+      return await request(path, init, baseUrl);
     } catch (error) {
       if (path === '/session' && attempts % 10 === 0) console.error(`WebDriver session attempt ${attempts}: ${error.message}`);
       throw error;
     }
   }, timeoutMs);
+}
+
+function nativeSessionRequest() {
+  const body = JSON.stringify({ capabilities: { alwaysMatch: {
+    browserName: 'webview2',
+    'ms:edgeChromium': true,
+    'ms:edgeOptions': {
+      binary: appPath,
+      ...(webviewProfile ? { webviewOptions: { userDataFolder: webviewProfile } } : {}),
+    },
+  } } });
+  return requestWithRetry('/session', { method: 'POST', body }, 90_000, nativeDriverUrl);
 }
 
 async function eventually(action, timeoutMs = 12_000) {
@@ -44,7 +57,10 @@ async function eventually(action, timeoutMs = 12_000) {
 
 test('real Tauri WebView navigates between local search, diagnostics, and task center', { timeout: 120_000 }, async (t) => {
   assert.ok(appPath, 'TAURI_E2E_APP must point to the debug Tauri executable');
-  const session = await requestWithRetry('/session', {
+  let sessionBaseUrl = driverUrl;
+  let session;
+  try {
+    session = await requestWithRetry('/session', {
     method: 'POST',
     body: JSON.stringify({
       capabilities: {
@@ -56,19 +72,25 @@ test('real Tauri WebView navigates between local search, diagnostics, and task c
         },
       },
     }),
-  }, 90_000);
+    }, 20_000);
+  } catch (error) {
+    if (!nativeDriverUrl) throw error;
+    console.warn(`Tauri driver session unavailable (${error.message}); using native EdgeDriver fallback`);
+    sessionBaseUrl = nativeDriverUrl;
+    session = await nativeSessionRequest();
+  }
   const sessionId = session.sessionId;
   const base = `/session/${sessionId}`;
-  t.after(async () => { await fetch(`${driverUrl}${base}`, { method: 'DELETE' }).catch(() => {}); });
+  t.after(async () => { await fetch(`${sessionBaseUrl}${base}`, { method: 'DELETE' }).catch(() => {}); });
 
   const find = selector => eventually(() => request(`${base}/element`, {
     method: 'POST',
     body: JSON.stringify({ using: 'css selector', value: selector }),
-  }));
+  }, sessionBaseUrl));
   const click = async selector => {
     const element = await find(selector);
     const id = element['element-6066-11e4-a52e-4f735466cecf'];
-    await request(`${base}/element/${id}/click`, { method: 'POST', body: '{}' });
+    await request(`${base}/element/${id}/click`, { method: 'POST', body: '{}' }, sessionBaseUrl);
   };
 
   await click('[data-testid="nav-search"]');
@@ -79,6 +101,6 @@ test('real Tauri WebView navigates between local search, diagnostics, and task c
   await find('[data-testid="task-list"]');
 
   await mkdir(artifacts, { recursive: true });
-  const screenshot = await request(`${base}/screenshot`);
+  const screenshot = await request(`${base}/screenshot`, {}, sessionBaseUrl);
   await writeFile(join(artifacts, 'tauri-navigation.png'), Buffer.from(screenshot, 'base64'));
 });
