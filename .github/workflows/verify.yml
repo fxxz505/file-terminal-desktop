@@ -122,15 +122,13 @@ jobs:
           using System;
           using System.Diagnostics;
           using System.IO;
-          using System.Linq;
           class EdgeDriverWrapper {
-            static string Quote(string value) => "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
             public static int Main(string[] args) {
               var real = Environment.GetEnvironmentVariable("EDGE_DRIVER_REAL_PATH");
               var log = Environment.GetEnvironmentVariable("EDGE_DRIVER_LOG_PATH");
               if (String.IsNullOrWhiteSpace(real) || !File.Exists(real)) return 2;
-              var forwarded = String.Join(" ", args.Select(Quote));
-              var extra = " --verbose" + (String.IsNullOrWhiteSpace(log) ? "" : " --log-path=" + Quote(log));
+              var forwarded = String.Join(" ", args);
+              var extra = " --verbose" + (String.IsNullOrWhiteSpace(log) ? "" : " --log-path=" + log);
               var info = new ProcessStartInfo { FileName = real, Arguments = forwarded + extra, UseShellExecute = false, CreateNoWindow = true };
               using (var process = Process.Start(info)) { process.WaitForExit(); return process.ExitCode; }
             }
