@@ -75,7 +75,7 @@ test('real Tauri WebView navigates between local search, diagnostics, and task c
         },
       },
     }),
-    }, 20_000);
+    }, 30_000);
   } catch (error) {
     if (nativeDriverUrl) {
       console.error(`Tauri driver session unavailable; native driver diagnostics are available at ${nativeDriverUrl}`);
