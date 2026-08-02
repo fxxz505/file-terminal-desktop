@@ -77,10 +77,10 @@ test('real Tauri WebView navigates between local search, diagnostics, and task c
     }),
     }, 20_000);
   } catch (error) {
-    if (!nativeDriverUrl) throw error;
-    console.warn(`Tauri driver session unavailable (${error.message}); using native EdgeDriver fallback`);
-    sessionBaseUrl = nativeDriverUrl;
-    session = await nativeSessionRequest();
+    if (nativeDriverUrl) {
+      console.error(`Tauri driver session unavailable; native driver diagnostics are available at ${nativeDriverUrl}`);
+    }
+    throw error;
   }
   const sessionId = session.sessionId;
   const base = `/session/${sessionId}`;
