@@ -80,6 +80,12 @@ jobs:
             try { Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4444/status | Out-Null; $ready = $true; break } catch { Start-Sleep -Seconds 1 }
           }
           if (-not $ready) { Get-Content $stdout, $stderr -ErrorAction SilentlyContinue; throw 'tauri-driver did not become ready on port 4444' }
+      - name: Capture desktop process diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process file-terminal-desktop, msedgedriver, tauri-driver -ErrorAction SilentlyContinue | Format-List *
+          Get-ChildItem "$env:LOCALAPPDATA\Microsoft\EdgeWebView\Application" -ErrorAction SilentlyContinue
       - name: Run real Tauri WebView automation
         shell: pwsh
         env:
