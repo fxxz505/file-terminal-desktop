@@ -64,11 +64,6 @@ jobs:
       - name: Install matching Microsoft Edge WebDriver
         shell: pwsh
         run: |
-          $existing = Get-Command msedgedriver -ErrorAction SilentlyContinue
-          if ($existing) {
-            "EDGE_DRIVER_PATH=$($existing.Source)" | Out-File -FilePath $env:GITHUB_ENV -Append
-            exit 0
-          }
           $edge = Get-ChildItem 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe', 'C:\Program Files\Microsoft\Edge\Application\msedge.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $edge) { throw 'Microsoft Edge executable was not found on the runner' }
           $version = $edge.VersionInfo.ProductVersion
@@ -79,6 +74,7 @@ jobs:
           Expand-Archive -Path $download -DestinationPath $extract -Force
           "$extract" | Out-File -FilePath $env:GITHUB_PATH -Append
           "EDGE_DRIVER_PATH=$extract\msedgedriver.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Using Edge $version with matching driver $extract\msedgedriver.exe"
       - name: Start Tauri WebDriver bridge
         shell: pwsh
         run: |
