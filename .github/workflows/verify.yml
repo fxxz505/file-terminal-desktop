@@ -182,6 +182,24 @@ jobs:
           Start-Sleep -Seconds 12
           if ($process.HasExited) { throw "Tauri application exited before WebDriver session creation. ExitCode=$($process.ExitCode)" }
           Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+      - name: Revalidate Tauri WebDriver bridge
+        shell: pwsh
+        run: |
+          $bridgeAlive = Get-NetTCPConnection -State Listen -LocalPort 4444 -ErrorAction SilentlyContinue
+          $nativeAlive = Get-NetTCPConnection -State Listen -LocalPort 4445 -ErrorAction SilentlyContinue
+          if (-not $bridgeAlive -or -not $nativeAlive) {
+            Write-Warning 'WebDriver bridge disappeared after application preflight; restarting it before E2E.'
+            if ($env:TAURI_DRIVER_PID) { Stop-Process -Id $env:TAURI_DRIVER_PID -Force -ErrorAction SilentlyContinue }
+            $stdout = Join-Path $env:RUNNER_TEMP 'tauri-driver.stdout.log'
+            $stderr = Join-Path $env:RUNNER_TEMP 'tauri-driver.stderr.log'
+            $driver = Start-Process tauri-driver -ArgumentList '--native-driver', $env:EDGE_DRIVER_PATH, '--port', '4444', '--native-port', '4445' -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
+            "TAURI_DRIVER_PID=$($driver.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            $ready = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              try { Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4444/status | Out-Null; Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4445/status | Out-Null; $ready = $true; break } catch { Start-Sleep -Seconds 1 }
+            }
+            if (-not $ready) { Get-Content $stdout, $stderr -ErrorAction SilentlyContinue; throw 'Tauri WebDriver bridge could not be restarted' }
+          }
       - name: Capture desktop process diagnostics
         if: always()
         shell: pwsh
