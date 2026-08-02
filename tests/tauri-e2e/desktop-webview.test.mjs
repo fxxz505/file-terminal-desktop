@@ -48,7 +48,6 @@ test('real Tauri WebView navigates between local search, diagnostics, and task c
     body: JSON.stringify({
       capabilities: {
         alwaysMatch: {
-          browserName: 'wry',
           'tauri:options': { application: appPath },
         },
       },
