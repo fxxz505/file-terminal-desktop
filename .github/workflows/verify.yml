@@ -45,6 +45,18 @@ jobs:
         run: npm ci
       - name: Build frontend assets for Tauri WebView
         run: npm run build
+      - name: Ensure WebView2 Runtime
+        shell: pwsh
+        run: |
+          $runtime = Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $runtime) {
+            $bootstrap = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebView2Setup.exe'
+            Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $bootstrap
+            Start-Process $bootstrap -ArgumentList '/silent', '/install' -Wait
+          }
+          $runtime = Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $runtime) { throw 'WebView2 Runtime is not available on the Windows runner' }
+          Write-Host "Using WebView2 Runtime: $($runtime.FullName)"
       - name: Build Tauri debug application
         run: cargo build --manifest-path src-tauri/Cargo.toml
       - name: Install Tauri WebDriver bridge
