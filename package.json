@@ -10,10 +10,12 @@
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build",
-    "test:tauri-e2e": "node --test tests/tauri-e2e/*.test.mjs"
+    "test:tauri-e2e": "node --test tests/tauri-e2e/*.test.mjs",
+    "test:e2e": "playwright test"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.5.0",
+    "@playwright/test": "^1.55.0",
     "typescript": "^5.8.3",
     "vite": "^6.3.5"
   },
