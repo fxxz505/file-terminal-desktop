@@ -6,6 +6,7 @@ import { join } from 'node:path';
 const driverUrl = (process.env.TAURI_DRIVER_URL ?? 'http://127.0.0.1:4444').replace(/\/$/, '');
 const appPath = process.env.TAURI_E2E_APP;
 const artifacts = process.env.TAURI_E2E_ARTIFACTS ?? 'e2e-artifacts';
+const webviewProfile = process.env.TAURI_WEBVIEW_PROFILE;
 
 async function request(path, init = {}) {
   const response = await fetch(`${driverUrl}${path}`, {
@@ -48,7 +49,10 @@ test('real Tauri WebView navigates between local search, diagnostics, and task c
     body: JSON.stringify({
       capabilities: {
         alwaysMatch: {
-          'tauri:options': { application: appPath },
+          'tauri:options': {
+            application: appPath,
+            ...(webviewProfile ? { webviewOptions: { userDataFolder: webviewProfile } } : {}),
+          },
         },
       },
     }),
