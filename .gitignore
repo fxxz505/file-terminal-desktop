@@ -9,3 +9,5 @@ src-tauri/target/
 *.sig
 e2e-artifacts/
 webdriver-logs/
+playwright-report/
+test-results/
