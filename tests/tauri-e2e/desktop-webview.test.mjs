@@ -28,7 +28,10 @@ async function requestWithRetry(path, init = {}, timeoutMs = 60_000, baseUrl = d
     try {
       return await request(path, init, baseUrl);
     } catch (error) {
-      if (path === '/session' && attempts % 10 === 0) console.error(`WebDriver session attempt ${attempts}: ${error.message}`);
+      if (path === '/session' && attempts % 10 === 0) {
+        console.error(`WebDriver session attempt ${attempts}: ${error.message}`);
+        if (error?.cause) console.error('WebDriver session cause:', error.cause);
+      }
       throw error;
     }
   }, timeoutMs);
