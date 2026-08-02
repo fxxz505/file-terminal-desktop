@@ -20,7 +20,16 @@ async function request(path, init = {}) {
 }
 
 async function requestWithRetry(path, init = {}, timeoutMs = 60_000) {
-  return eventually(() => request(path, init), timeoutMs);
+  let attempts = 0;
+  return eventually(async () => {
+    attempts += 1;
+    try {
+      return await request(path, init);
+    } catch (error) {
+      if (path === '/session' && attempts % 10 === 0) console.error(`WebDriver session attempt ${attempts}: ${error.message}`);
+      throw error;
+    }
+  }, timeoutMs);
 }
 
 async function eventually(action, timeoutMs = 12_000) {
@@ -32,7 +41,7 @@ async function eventually(action, timeoutMs = 12_000) {
   throw lastError ?? new Error('Timed out waiting for WebView state');
 }
 
-test('real Tauri WebView navigates between local search, diagnostics, and task center', { timeout: 45_000 }, async (t) => {
+test('real Tauri WebView navigates between local search, diagnostics, and task center', { timeout: 120_000 }, async (t) => {
   assert.ok(appPath, 'TAURI_E2E_APP must point to the debug Tauri executable');
   const session = await requestWithRetry('/session', {
     method: 'POST',
@@ -44,7 +53,7 @@ test('real Tauri WebView navigates between local search, diagnostics, and task c
         },
       },
     }),
-  });
+  }, 90_000);
   const sessionId = session.sessionId;
   const base = `/session/${sessionId}`;
   t.after(async () => { await fetch(`${driverUrl}${base}`, { method: 'DELETE' }).catch(() => {}); });
