@@ -70,11 +70,19 @@ jobs:
           $download = Join-Path $env:RUNNER_TEMP 'edgedriver.zip'
           $extract = Join-Path $env:RUNNER_TEMP 'edgedriver'
           New-Item -ItemType Directory -Force -Path $extract | Out-Null
-          Invoke-WebRequest -Uri "https://msedgedriver.azureedge.net/$version/edgedriver_win64.zip" -OutFile $download
-          Expand-Archive -Path $download -DestinationPath $extract -Force
-          "$extract" | Out-File -FilePath $env:GITHUB_PATH -Append
-          "EDGE_DRIVER_PATH=$extract\msedgedriver.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "Using Edge $version with matching driver $extract\msedgedriver.exe"
+          try {
+            Invoke-WebRequest -Uri "https://msedgedriver.microsoft.com/$version/edgedriver_win64.zip" -OutFile $download
+            Expand-Archive -Path $download -DestinationPath $extract -Force
+            $driverPath = Join-Path $extract 'msedgedriver.exe'
+            if (-not (Test-Path $driverPath)) { throw 'Downloaded archive did not contain msedgedriver.exe' }
+            Write-Host "Using Edge $version with matching driver $driverPath"
+          } catch {
+            $fallback = Get-Command msedgedriver -ErrorAction SilentlyContinue
+            if (-not $fallback) { throw "Unable to download matching EdgeDriver for Edge $version. $($_.Exception.Message)" }
+            $driverPath = $fallback.Source
+            Write-Warning "Matching EdgeDriver download failed; using runner-provided driver $driverPath. $($_.Exception.Message)"
+          }
+          "EDGE_DRIVER_PATH=$driverPath" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Start Tauri WebDriver bridge
         shell: pwsh
         run: |
