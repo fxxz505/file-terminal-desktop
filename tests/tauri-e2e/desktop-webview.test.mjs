@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 const driverUrl = (process.env.TAURI_DRIVER_URL ?? 'http://127.0.0.1:4444').replace(/\/$/, '');
 const nativeDriverUrl = (process.env.TAURI_NATIVE_DRIVER_URL ?? '').replace(/\/$/, '');
+const useNativeDriver = process.env.TAURI_USE_NATIVE_DRIVER === 'true';
 const appPath = process.env.TAURI_E2E_APP;
 const artifacts = process.env.TAURI_E2E_ARTIFACTS ?? 'e2e-artifacts';
 const webviewProfile = process.env.TAURI_WEBVIEW_PROFILE;
@@ -60,6 +61,7 @@ test('real Tauri WebView navigates between local search, diagnostics, and task c
   let sessionBaseUrl = driverUrl;
   let session;
   try {
+    if (useNativeDriver) throw new Error('Native EdgeDriver selected by CI');
     session = await requestWithRetry('/session', {
     method: 'POST',
     body: JSON.stringify({
