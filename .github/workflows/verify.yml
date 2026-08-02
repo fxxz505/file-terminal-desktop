@@ -1,6 +1,7 @@
 name: Verify desktop app
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -40,6 +41,7 @@ jobs:
         run: npm run build
   desktop-e2e:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -67,7 +69,7 @@ jobs:
           if (-not $runtime) { throw 'WebView2 Runtime is not available on the Windows runner' }
           Write-Host "Using WebView2 Runtime: $($runtime.FullName)"
       - name: Build Tauri debug application
-        run: cargo build --manifest-path src-tauri/Cargo.toml
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml
       - name: Install matching Microsoft Edge WebDriver
         shell: pwsh
         run: |
