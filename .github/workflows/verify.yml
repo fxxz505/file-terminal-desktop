@@ -103,6 +103,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $testData | Out-Null
           $env:FILE_TERMINAL_TEST_DATA_DIR = $testData
           "FILE_TERMINAL_TEST_DATA_DIR=$testData" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $env:TAURI_AUTOMATION = 'true'
+          $env:TAURI_WEBVIEW_AUTOMATION = 'true'
           $nativeLog = Join-Path $env:RUNNER_TEMP 'msedgedriver.log'
           $driver = Start-Process $env:EDGE_DRIVER_PATH -ArgumentList '--port=4445', '--host=127.0.0.1', '--verbose', "--log-path=$nativeLog" -PassThru -WindowStyle Hidden
           "EDGE_DRIVER_PID=$($driver.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
