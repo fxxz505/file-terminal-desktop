@@ -95,7 +95,39 @@ jobs:
             $driverPath = $fallback.Source
             Write-Warning "Matching EdgeDriver download failed; using runner-provided driver $driverPath. $($_.Exception.Message)"
           }
-          "EDGE_DRIVER_PATH=$driverPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "EDGE_DRIVER_REAL_PATH=$driverPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build verbose EdgeDriver wrapper
+        shell: pwsh
+        run: |
+          # tauri-driver starts the native driver itself and only accepts its executable path.
+          # Compile a tiny .exe wrapper so the real EdgeDriver also emits a diagnostic log.
+          $wrapperSource = Join-Path $env:RUNNER_TEMP 'edge-driver-wrapper.cs'
+          $wrapperPath = Join-Path $env:RUNNER_TEMP 'edge-driver-wrapper.exe'
+          $logPath = Join-Path $env:RUNNER_TEMP 'msedgedriver.verbose.log'
+          @'
+          using System;
+          using System.Diagnostics;
+          using System.IO;
+          using System.Linq;
+          class EdgeDriverWrapper {
+            static string Quote(string value) => "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+            public static int Main(string[] args) {
+              var real = Environment.GetEnvironmentVariable("EDGE_DRIVER_REAL_PATH");
+              var log = Environment.GetEnvironmentVariable("EDGE_DRIVER_LOG_PATH");
+              if (String.IsNullOrWhiteSpace(real) || !File.Exists(real)) return 2;
+              var forwarded = String.Join(" ", args.Select(Quote));
+              var extra = " --verbose" + (String.IsNullOrWhiteSpace(log) ? "" : " --log-path=" + Quote(log));
+              var info = new ProcessStartInfo { FileName = real, Arguments = forwarded + extra, UseShellExecute = false, CreateNoWindow = true };
+              using (var process = Process.Start(info)) { process.WaitForExit(); return process.ExitCode; }
+            }
+          }
+          '@ | Set-Content -LiteralPath $wrapperSource -Encoding UTF8
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) { $csc = (Get-Command csc.exe -ErrorAction Stop).Source }
+          & $csc /nologo /target:exe /out:$wrapperPath $wrapperSource
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $wrapperPath)) { throw 'Unable to compile EdgeDriver diagnostic wrapper' }
+          "EDGE_DRIVER_PATH=$wrapperPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "EDGE_DRIVER_LOG_PATH=$logPath" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Install Tauri WebDriver bridge
         run: cargo install tauri-driver --version 2.0.6 --locked
       - name: Start Tauri WebDriver bridge
@@ -137,6 +169,8 @@ jobs:
         shell: pwsh
         run: |
           Get-Process file-terminal-desktop, msedgedriver, tauri-driver -ErrorAction SilentlyContinue | Format-List *
+          if ($env:EDGE_DRIVER_LOG_PATH -and (Test-Path $env:EDGE_DRIVER_LOG_PATH)) { Get-Content -LiteralPath $env:EDGE_DRIVER_LOG_PATH -ErrorAction SilentlyContinue }
+          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in 4444,4445 } | Format-Table -AutoSize
           Get-ChildItem "$env:LOCALAPPDATA\Microsoft\EdgeWebView\Application" -ErrorAction SilentlyContinue
       - name: Run real Tauri WebView automation
         shell: pwsh
@@ -159,6 +193,7 @@ jobs:
           path: |
             ${{ runner.temp }}/tauri-driver.stdout.log
             ${{ runner.temp }}/tauri-driver.stderr.log
+            ${{ runner.temp }}/msedgedriver.verbose.log
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         if: always()
