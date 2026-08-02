@@ -39,6 +39,14 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
       - name: Production frontend build
         run: npm run build
+      - name: Build debug application for desktop E2E
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml
+      - name: Upload desktop E2E application
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-app
+          path: src-tauri/target/debug/file-terminal-desktop.exe
+          if-no-files-found: error
   desktop-e2e:
     needs: verify
     runs-on: windows-latest
@@ -57,6 +65,11 @@ jobs:
         run: npm ci
       - name: Build frontend assets for Tauri WebView
         run: npm run build
+      - name: Download desktop E2E application
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-e2e-app
+          path: src-tauri/target/debug
       - name: Ensure WebView2 Runtime
         shell: pwsh
         run: |
@@ -69,8 +82,6 @@ jobs:
           $runtime = Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $runtime) { throw 'WebView2 Runtime is not available on the Windows runner' }
           Write-Host "Using WebView2 Runtime: $($runtime.FullName)"
-      - name: Build Tauri debug application
-        run: cargo build --locked --manifest-path src-tauri/Cargo.toml
       - name: Install matching Microsoft Edge WebDriver
         shell: pwsh
         run: |
