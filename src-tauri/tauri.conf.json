@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' https://huggingface.co https://github.com https://api.github.com; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:"
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://huggingface.co https://github.com https://api.github.com; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:"
     }
   },
   "bundle": {

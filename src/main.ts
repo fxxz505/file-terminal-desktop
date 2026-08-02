@@ -24,6 +24,7 @@ type MediaTask = { id: string; itemId: string; name: string; kind: 'ocr' | 'tran
 type MediaSettings = { whisperModelPath: string; ocrLanguage: string };
 type LocalToolStatus = { pdfText: boolean; ffmpeg: boolean; ocr: boolean; transcription: boolean; officeConverter: boolean };
 type CloudProviderConfig = { providerId: string; displayName: string; baseUrl: string; model: string; autoCollaboration: boolean; reviewEachRequest: boolean; configured: boolean };
+type CloudDraft = { providerId: string; displayName: string; baseUrl: string; model: string; apiKey: string; autoCollaboration: boolean; reviewEachRequest: boolean };
 type CloudModel = { id: string };
 type ParsedReply = { answer: string; steps: string[]; codeBlocks: number };
 type Conversation = { id: string; title: string; providerId?: string; updatedAt: string };
@@ -81,6 +82,7 @@ let aiOutputTarget: AiOutputTarget | null = null;
 let cloudConfig: CloudProviderConfig | null = null;
 let cloudProviders: CloudProviderConfig[] = [];
 let cloudModels: CloudModel[] = [];
+let cloudDraft: CloudDraft = { providerId: '', displayName: '', baseUrl: '', model: '', apiKey: '', autoCollaboration: false, reviewEachRequest: false };
 let agentRun: AgentRun | null = null;
 let conversations: Conversation[] = [];
 let activeConversationId: string | null = null;
@@ -228,9 +230,48 @@ function conversationPage() {
   return `<section class="single-panel panel"><header><div><small>LOCAL HISTORY</small><h2>AI 对话</h2></div><button class="quiet" data-view="assistant">开始新对话</button></header><div class="conversation-page"><section class="conversation-layout standalone"><aside class="conversation-history"><header><b>本机对话记录</b><small>${conversations.length} 段</small></header>${history}</aside><section class="conversation-messages"><header><div><b>对话内容</b><span>本地与云端回答均以文本保存在本机</span></div></header>${messages}</section></section></div></section>`;
 }
 
+function cloudDraftFromConfig(config: CloudProviderConfig | null): CloudDraft {
+  return {
+    providerId: config?.providerId ?? '',
+    displayName: config?.displayName ?? '',
+    baseUrl: config?.baseUrl ?? '',
+    model: config?.model ?? '',
+    apiKey: '',
+    autoCollaboration: config?.autoCollaboration ?? false,
+    reviewEachRequest: config?.reviewEachRequest ?? false,
+  };
+}
+
+function syncCloudDraftFromDom() {
+  cloudDraft = {
+    providerId: document.querySelector<HTMLInputElement>('#cloud-provider-id')?.value.trim() ?? cloudDraft.providerId,
+    displayName: document.querySelector<HTMLInputElement>('#cloud-display-name')?.value.trim() ?? cloudDraft.displayName,
+    baseUrl: document.querySelector<HTMLInputElement>('#cloud-base-url')?.value.trim() ?? cloudDraft.baseUrl,
+    model: document.querySelector<HTMLSelectElement>('#cloud-model-select')?.value.trim() ?? cloudDraft.model,
+    apiKey: document.querySelector<HTMLInputElement>('#cloud-api-key')?.value ?? cloudDraft.apiKey,
+    autoCollaboration: document.querySelector<HTMLInputElement>('#cloud-auto')?.checked ?? cloudDraft.autoCollaboration,
+    reviewEachRequest: document.querySelector<HTMLInputElement>('#cloud-review')?.checked ?? cloudDraft.reviewEachRequest,
+  };
+}
+
+function restoreCloudDraftToDom() {
+  const fields: Array<[string, string]> = [['#cloud-provider-id', cloudDraft.providerId], ['#cloud-display-name', cloudDraft.displayName], ['#cloud-base-url', cloudDraft.baseUrl], ['#cloud-api-key', cloudDraft.apiKey]];
+  fields.forEach(([selector, value]) => { const input = document.querySelector<HTMLInputElement>(selector); if (input && value) input.value = value; });
+  const model = document.querySelector<HTMLSelectElement>('#cloud-model-select');
+  if (model && cloudDraft.model) model.value = cloudDraft.model;
+  const auto = document.querySelector<HTMLInputElement>('#cloud-auto'); if (auto) auto.checked = cloudDraft.autoCollaboration;
+  const review = document.querySelector<HTMLInputElement>('#cloud-review'); if (review) review.checked = cloudDraft.reviewEachRequest;
+}
+
 function assistantPanel() {
   const outputText = aiOutputTarget ? `本次工作区：${escapeHtml(aiOutputTarget.displayPath)}` : aiOutputFolder ? `下次写入：${escapeHtml(displayPath(aiOutputFolder))}` : '未指定时保存到软件的 AI Outputs 文件夹';
   const configLabel = cloudConfig?.configured ? `已配置：${escapeHtml(cloudConfig.providerId)} / ${escapeHtml(cloudConfig.model)}` : '未配置云端服务；复杂任务仍只在本地准备。';
+  const draftDisplayName = escapeHtml(cloudDraft.displayName);
+  const draftProviderId = escapeHtml(cloudDraft.providerId);
+  const draftBaseUrl = escapeHtml(cloudDraft.baseUrl);
+  const draftModel = escapeHtml(cloudDraft.model);
+  const draftAuto = cloudDraft.autoCollaboration ? 'checked' : '';
+  const draftReview = cloudDraft.reviewEachRequest ? 'checked' : '';
   const taskControls = !agentRun ? '' : `<div class="agent-actions">${agentRun.route === 'cloud_needs_confirmation' && agentRun.status === 'awaiting_confirmation' ? `<button class="primary" id="cloud-confirm" ${isWorking ? 'disabled' : ''}>确认发送脱敏请求</button>` : ''}${agentRun.status === 'awaiting_approval' ? `<button class="primary" id="approve-agent-step" ${isWorking ? 'disabled' : ''}>批准工作区写入</button>` : ''}${agentRun.status === 'approved' ? `<button class="primary" id="apply-agent-advice" ${!aiOutputTarget || isWorking ? 'disabled' : ''}>仅新建文件</button><button class="quiet" id="apply-agent-existing-edits" ${!aiOutputTarget || isWorking ? 'disabled' : ''}>批准后修改已有文件</button>` : ''}${['files_written', 'check_failed'].includes(agentRun.status) && aiOutputTarget ? `<button class="quiet" id="run-workspace-check" ${isWorking ? 'disabled' : ''}>运行构建检查</button><select id="workspace-check-command"><option>npm run build</option><option>npm test</option><option>cargo check</option><option>cargo test</option></select>${agentRun.route === 'cloud_auto' && agentRun.status === 'check_failed' ? `<button class="quiet" id="auto-repair-agent-run" ${isWorking ? 'disabled' : ''}>自动最小修复</button>` : ''}` : ''}${['check_failed', 'cancelled'].includes(agentRun.status) ? `<button class="quiet" id="retry-agent-run" ${isWorking ? 'disabled' : ''}>重试协作</button>` : ''}${!['cancelled', 'check_complete', 'local_complete', 'repair_complete'].includes(agentRun.status) ? `<button class="quiet danger" id="cancel-agent-run" ${isWorking ? 'disabled' : ''}>取消任务</button>` : ''}</div>`;
   const timeline = agentEvents.length ? `<ol class="agent-timeline">${agentEvents.map(event => `<li><b>${escapeHtml(event.status)}</b><span>${escapeHtml(event.message)}</span><small>${escapeHtml(event.createdAt)}</small></li>`).join('')}</ol>` : '';
   const evidence = agentEvidenceReport ? `<details class="agent-evidence-report" open><summary>最终证据报告：${escapeHtml(agentEvidenceReport.status)} · 本地受限绑定 ${agentEvidenceReport.restrictedBindings}</summary><ol>${agentEvidenceReport.finalEvidence.map(escapeHtml).map(item => `<li>${item}</li>`).join('')}</ol></details>` : '';
@@ -294,7 +335,7 @@ function aboutPage() {
   const action = updateVersion
     ? `<button class="primary" id="install-update" ${isWorking ? 'disabled' : ''}>${icons.download} 立即更新</button>`
     : `<button class="quiet" id="${updateCheckState === 'error' ? 'check-update-retry' : 'check-update'}" type="button" ${checking ? 'disabled' : ''}>${checking ? '正在检查…' : updateCheckState === 'error' ? '重试检查' : '检查更新'}</button>`;
-  return `<section class="single-panel panel about-page"><header><div><small>ABOUT</small><h2>关于资料终端</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><div class="about-content"><section class="about-identity"><span class="about-mark">${icons.mark}</span><div><h1>资料终端</h1><p>本地优先的资料管理与 AI 助手</p></div></section><section class="about-update"><div><b>软件更新</b><span>${versionText}</span><small>更新只替换程序文件；同级资料目录、模型和本机设置会保留。</small></div><div class="settings-actions">${action}</div></section>${checkingText}${progressText}<section class="about-detail"><b>更新方式</b><span>点击“检查更新”后，发现新版即可选择“立即更新”。系统会验证发布签名，自动下载、安装并重新启动，无需手动重新下载。</span></section></div></section>`;
+  return `<section class="single-panel panel about-page"><header><div><small>ABOUT</small><h2>关于资料终端</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><div class="about-content"><section class="about-identity"><span class="about-mark">${icons.mark}</span><div><h1>资料终端</h1><p>本地优先的资料管理与 AI 助手</p></div></section><section class="about-update"><div><b>软件更新</b><span>${versionText}</span><small>更新只替换程序文件；同级资料目录、模型和本机设置会保留。</small></div><div class="settings-actions">${action}</div></section>${checkingText}${progressText}<section class="about-detail"><b>更新方式</b><span>点击“检查更新”后，发现新版即可选择“立即更新”。系统会验证发布签名，自动下载、安装并重新启动，无需手动重新下载。</span></section><section class="about-diagnostics"><div class="about-section-heading"><small>LOCAL CAPABILITIES</small><h3>本机能力与隐私</h3><p>以下检查只读取本机状态，不会上传资料。</p></div>${workspaceExtras()}</section></div></section>`;
 }
 function recoveryPage() {
   const message = startupMode?.message ?? '无法解锁现有本地数据库。';
@@ -310,7 +351,7 @@ function render() {
     return;
   }
   const pages: Record<View, { title: string; subtitle: string; content: string }> = {
-    workspace: { title: '资料空间', subtitle: '原文件留在原位置 · 索引存于本机', content: `${workspaceExtras()}${workspacePanel()}` },
+    workspace: { title: '资料空间', subtitle: '原文件留在原位置 · 索引存于本机', content: workspacePanel() },
     search: { title: '本地搜索', subtitle: '按名称、路径、备注和标签查询', content: searchPanel() },
     assistant: { title: 'AI 助手', subtitle: '理解问题后，以本地索引给出结果', content: assistantPanel() },
     conversations: { title: 'AI 对话', subtitle: '本机保存的问答记录与结构化步骤', content: conversationPage() },
@@ -323,10 +364,16 @@ function render() {
   const menu = contextTarget ? `<div class="context-menu" style="left:${contextPosition.x}px;top:${contextPosition.y}px" role="menu"><b>${escapeHtml(contextTarget.name)}</b><button data-metadata-action="note">编辑备注</button><button data-metadata-action="tags">编辑标签</button><button data-metadata-action="local_only">云端：禁止上传</button><button data-metadata-action="cloud_allowed">云端：允许上传</button><button data-metadata-action="ask_each_time">云端：每次询问</button></div>` : '';
   app.style.setProperty('--user-font-scale', `${fontScale / 100}`);
   app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-testid="nav-workspace" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-testid="nav-search" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-testid="nav-assistant" data-view="assistant">${icons.spark}<span>AI 助手</span></button><button class="nav ${activeView === 'conversations' ? 'active' : ''}" data-testid="nav-conversations" data-view="conversations">${icons.file}<span>AI 对话</span></button><button class="nav ${activeView === 'diagnostics' ? 'active' : ''}" data-testid="nav-diagnostics" data-view="diagnostics">${icons.file}<span>索引诊断</span></button><button class="nav ${activeView === 'tasks' ? 'active' : ''}" data-testid="nav-tasks" data-view="tasks">${icons.settings}<span>后台任务</span></button></nav><div class="sidebar-bottom"><button class="nav ${activeView === 'settings' ? 'active' : ''}" data-testid="nav-settings" data-view="settings">${icons.settings}<span>设置</span></button><button class="nav ${activeView === 'about' ? 'active' : ''}" data-testid="nav-about" data-view="about">${icons.file}<span>关于</span></button><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${folderBrowser()}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>${menu}`;
+  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-testid="nav-workspace" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-testid="nav-search" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-testid="nav-assistant" data-view="assistant">${icons.spark}<span>AI 助手</span></button><button class="nav ${activeView === 'conversations' ? 'active' : ''}" data-testid="nav-conversations" data-view="conversations">${icons.file}<span>AI 对话</span></button><button class="nav ${activeView === 'diagnostics' ? 'active' : ''}" data-testid="nav-diagnostics" data-view="diagnostics">${icons.file}<span>索引诊断</span></button><button class="nav ${activeView === 'tasks' ? 'active' : ''}" data-testid="nav-tasks" data-view="tasks">${icons.settings}<span>后台任务</span></button></nav><div class="sidebar-bottom"><button class="nav ${activeView === 'settings' ? 'active' : ''}" data-testid="nav-settings" data-view="settings">${icons.settings}<span>设置</span></button><button class="nav ${activeView === 'about' ? 'active' : ''}" data-testid="nav-about" data-view="about">${icons.file}<span>关于</span></button><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${folderBrowser()}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>${menu}`;
+  restoreCloudDraftToDom();
+  const assistant = document.querySelector<HTMLElement>('.assistant-page');
+  const output = assistant?.querySelector<HTMLElement>('.ai-output');
+  const cloud = assistant?.querySelector<HTMLElement>('.cloud-settings');
+  if (output && cloud) assistant?.insertBefore(output, cloud);
   bind();
 }
 
-async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus, recoveryNotice, indexJobs, runtimeSettings, embeddingModels, mediaTasks, mediaSettings, localTools, managedDownloadResources, downloadTasks, folderWatchStatuses] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status'), invoke<string | null>('get_startup_recovery_notice'), invoke<IndexJob[]>('list_index_jobs'), invoke<RuntimeSettings>('get_runtime_settings'), invoke<EmbeddingModel[]>('list_embedding_models'), invoke<MediaTask[]>('list_media_tasks'), invoke<MediaSettings>('get_media_settings'), invoke<LocalToolStatus>('get_local_tool_status'), invoke<ManagedDownloadResource[]>('list_managed_download_resources'), invoke<DownloadTask[]>('list_download_tasks'), invoke<FolderWatchStatus[]>('list_folder_watch_status')]); render(); }
+async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus, recoveryNotice, indexJobs, runtimeSettings, embeddingModels, mediaTasks, mediaSettings, localTools, managedDownloadResources, downloadTasks, folderWatchStatuses] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status'), invoke<string | null>('get_startup_recovery_notice'), invoke<IndexJob[]>('list_index_jobs'), invoke<RuntimeSettings>('get_runtime_settings'), invoke<EmbeddingModel[]>('list_embedding_models'), invoke<MediaTask[]>('list_media_tasks'), invoke<MediaSettings>('get_media_settings'), invoke<LocalToolStatus>('get_local_tool_status'), invoke<ManagedDownloadResource[]>('list_managed_download_resources'), invoke<DownloadTask[]>('list_download_tasks'), invoke<FolderWatchStatus[]>('list_folder_watch_status')]); if (!cloudDraft.providerId && !cloudDraft.displayName && !cloudDraft.baseUrl && !cloudDraft.model) cloudDraft = cloudDraftFromConfig(cloudConfig); render(); }
 async function refreshManagedResources() { [managedDownloadResources, downloadTasks, folderWatchStatuses] = await Promise.all([invoke<ManagedDownloadResource[]>('list_managed_download_resources'), invoke<DownloadTask[]>('list_download_tasks'), invoke<FolderWatchStatus[]>('list_folder_watch_status')]); }
 async function downloadManagedResource(resourceId: string) { isWorking = true; error = ''; render(); try { await invoke('download_managed_resource', { input: { resourceId } }); await refreshManagedResources(); } catch (reason) { formWarning = { target: 'media', message: String(reason) }; } finally { isWorking = false; render(); } }
 async function retryDownloadTask(id: string) { await invoke('retry_download_task', { input: { id } }); await refreshBackgroundTasks(); }
@@ -494,9 +541,9 @@ async function ask(question: string) {
   } catch (reason) { error = String(reason); } finally { isWorking = false; render(); }
 }
 async function loadConversationHistory() { conversations = await invoke<Conversation[]>('list_conversations'); if (activeConversationId) conversationMessages = await invoke<ConversationMessage[]>('list_conversation_messages', { input: { conversationId: activeConversationId } }); }
-async function saveCloudProvider(event: SubmitEvent) { event.preventDefault(); const providerId = document.querySelector<HTMLInputElement>('#cloud-provider-id')?.value.trim() ?? ''; const displayName = document.querySelector<HTMLInputElement>('#cloud-display-name')?.value.trim() ?? ''; const baseUrl = document.querySelector<HTMLInputElement>('#cloud-base-url')?.value.trim() ?? ''; const model = document.querySelector<HTMLSelectElement>('#cloud-model-select')?.value.trim() ?? ''; const apiKey = document.querySelector<HTMLInputElement>('#cloud-api-key')?.value ?? ''; const autoCollaboration = document.querySelector<HTMLInputElement>('#cloud-auto')?.checked ?? false; const reviewEachRequest = document.querySelector<HTMLInputElement>('#cloud-review')?.checked ?? false; isWorking = true; error = ''; formWarning = null; render(); try { cloudConfig = await invoke<CloudProviderConfig>('save_cloud_provider_config', { input: { providerId, displayName, baseUrl, model, apiKey, autoCollaboration, reviewEachRequest } }); cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; } finally { isWorking = false; render(); } }
-async function fetchCloudModels() { const providerId = document.querySelector<HTMLInputElement>('#cloud-provider-id')?.value.trim() ?? ''; if (!providerId) { formWarning = { target: 'cloud', message: '请先填写并保存供应商标识、地址和 API Key。' }; render(); return; } isWorking = true; error = ''; formWarning = null; render(); try { cloudModels = await invoke<CloudModel[]>('fetch_cloud_models', { input: { providerId } }); } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; } finally { isWorking = false; render(); } }
-async function selectCloudProvider(providerId: string) { cloudConfig = providerId ? await invoke<CloudProviderConfig>('select_cloud_provider', { input: { providerId } }) : null; cloudModels = []; if (cloudConfig) cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); render(); }
+async function saveCloudProvider(event: SubmitEvent) { event.preventDefault(); syncCloudDraftFromDom(); const draft = { ...cloudDraft }; cloudConfig = { providerId: draft.providerId, displayName: draft.displayName, baseUrl: draft.baseUrl, model: draft.model, autoCollaboration: draft.autoCollaboration, reviewEachRequest: draft.reviewEachRequest, configured: Boolean(draft.apiKey || cloudConfig?.configured) }; isWorking = true; error = ''; formWarning = null; render(); try { cloudConfig = await invoke<CloudProviderConfig>('save_cloud_provider_config', { input: draft }); cloudDraft = { ...draft, apiKey: '' }; cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; } finally { isWorking = false; render(); } }
+async function fetchCloudModels() { syncCloudDraftFromDom(); const providerId = cloudDraft.providerId; if (!providerId) { formWarning = { target: 'cloud', message: '请先填写供应商标识。保存后再获取模型。' }; render(); return; } cloudConfig = { providerId, displayName: cloudDraft.displayName, baseUrl: cloudDraft.baseUrl, model: cloudDraft.model, autoCollaboration: cloudDraft.autoCollaboration, reviewEachRequest: cloudDraft.reviewEachRequest, configured: Boolean(cloudDraft.apiKey || cloudConfig?.configured) }; isWorking = true; error = ''; formWarning = null; render(); try { cloudModels = await invoke<CloudModel[]>('fetch_cloud_models', { input: { providerId } }); if (!cloudDraft.model && cloudModels[0]) cloudDraft.model = cloudModels[0].id; } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; } finally { isWorking = false; render(); } }
+async function selectCloudProvider(providerId: string) { cloudConfig = providerId ? await invoke<CloudProviderConfig>('select_cloud_provider', { input: { providerId } }) : null; cloudDraft = cloudDraftFromConfig(cloudConfig); cloudModels = []; formWarning = null; if (cloudConfig) cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); render(); }
 async function openConversation(conversationId: string) { activeConversationId = conversationId; conversationMessages = await invoke<ConversationMessage[]>('list_conversation_messages', { input: { conversationId } }); render(); }
 async function autoApplyLowRiskAdvice() {
   if (!agentRun || !aiOutputTarget || !agentPreferences.autoApplyLowRisk || agentRun.status !== 'awaiting_approval') return;
@@ -650,6 +697,10 @@ function bind() {
   document.querySelector('#create-ai-workspace')?.addEventListener('click', createAiWorkspace);
   document.querySelector<HTMLFormElement>('#cloud-provider-form')?.addEventListener('submit', saveCloudProvider);
   document.querySelector('#fetch-cloud-models')?.addEventListener('click', fetchCloudModels);
+  ['#cloud-provider-id', '#cloud-display-name', '#cloud-base-url', '#cloud-api-key'].forEach(selector => document.querySelector(selector)?.addEventListener('input', syncCloudDraftFromDom));
+  document.querySelector('#cloud-model-select')?.addEventListener('change', syncCloudDraftFromDom);
+  document.querySelector('#cloud-auto')?.addEventListener('change', syncCloudDraftFromDom);
+  document.querySelector('#cloud-review')?.addEventListener('change', syncCloudDraftFromDom);
   document.querySelector<HTMLSelectElement>('#cloud-provider-select')?.addEventListener('change', event => selectCloudProvider((event.target as HTMLSelectElement).value));
   document.querySelector('#cloud-confirm')?.addEventListener('click', runCloudCollaboration);
   document.querySelector('#approve-agent-step')?.addEventListener('click', approveAgentStep);
