@@ -33,7 +33,6 @@ jobs:
         run: npm run build
   desktop-e2e:
     runs-on: windows-latest
-    needs: verify
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
