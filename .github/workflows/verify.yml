@@ -96,7 +96,9 @@ jobs:
             Write-Warning "Matching EdgeDriver download failed; using runner-provided driver $driverPath. $($_.Exception.Message)"
           }
           "EDGE_DRIVER_PATH=$driverPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - name: Start native WebView2 WebDriver
+      - name: Install Tauri WebDriver bridge
+        run: cargo install tauri-driver --version 2.0.6 --locked
+      - name: Start Tauri WebDriver bridge
         shell: pwsh
         run: |
           $testData = Join-Path $env:RUNNER_TEMP 'file-terminal-e2e-data'
@@ -105,18 +107,20 @@ jobs:
           "FILE_TERMINAL_TEST_DATA_DIR=$testData" | Out-File -FilePath $env:GITHUB_ENV -Append
           $env:TAURI_AUTOMATION = 'true'
           $env:TAURI_WEBVIEW_AUTOMATION = 'true'
-          $nativeLog = Join-Path $env:RUNNER_TEMP 'msedgedriver.log'
-          $driver = Start-Process $env:EDGE_DRIVER_PATH -ArgumentList '--port=4445', '--host=127.0.0.1', '--verbose', "--log-path=$nativeLog" -PassThru -WindowStyle Hidden
-          "EDGE_DRIVER_PID=$($driver.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $stdout = Join-Path $env:RUNNER_TEMP 'tauri-driver.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'tauri-driver.stderr.log'
+          $driver = Start-Process tauri-driver -ArgumentList '--native-driver', $env:EDGE_DRIVER_PATH, '--port', '4444', '--native-port', '4445' -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
+          "TAURI_DRIVER_PID=$($driver.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
           $ready = $false
           for ($i = 0; $i -lt 60; $i++) {
             try {
+              Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4444/status | Out-Null
               Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4445/status | Out-Null
               $ready = $true
               break
             } catch { Start-Sleep -Seconds 1 }
           }
-          if (-not $ready) { Get-Content $nativeLog -ErrorAction SilentlyContinue; throw 'Edge WebDriver did not become ready on port 4445' }
+          if (-not $ready) { Get-Content $stdout, $stderr -ErrorAction SilentlyContinue; throw 'Tauri/Edge WebDriver did not become ready on ports 4444/4445' }
       - name: Preflight Tauri application startup
         shell: pwsh
         env:
@@ -132,7 +136,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          Get-Process file-terminal-desktop, msedgedriver -ErrorAction SilentlyContinue | Format-List *
+          Get-Process file-terminal-desktop, msedgedriver, tauri-driver -ErrorAction SilentlyContinue | Format-List *
           Get-ChildItem "$env:LOCALAPPDATA\Microsoft\EdgeWebView\Application" -ErrorAction SilentlyContinue
       - name: Run real Tauri WebView automation
         shell: pwsh
@@ -142,19 +146,19 @@ jobs:
           FILE_TERMINAL_TEST_DATA_DIR: ${{ runner.temp }}\file-terminal-e2e-data
           TAURI_WEBVIEW_PROFILE: ${{ runner.temp }}\file-terminal-webview-profile
           TAURI_NATIVE_DRIVER_URL: http://127.0.0.1:4445
-          TAURI_USE_NATIVE_DRIVER: true
         run: npm run test:tauri-e2e
-      - name: Stop native WebView2 WebDriver
+      - name: Stop Tauri WebDriver bridge
         if: always()
         shell: pwsh
-        run: if ($env:EDGE_DRIVER_PID) { Stop-Process -Id $env:EDGE_DRIVER_PID -Force -ErrorAction SilentlyContinue }
+        run: if ($env:TAURI_DRIVER_PID) { Stop-Process -Id $env:TAURI_DRIVER_PID -Force -ErrorAction SilentlyContinue }
       - name: Upload WebDriver log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: native-webdriver-log
+          name: tauri-driver-log
           path: |
-            ${{ runner.temp }}/msedgedriver.log
+            ${{ runner.temp }}/tauri-driver.stdout.log
+            ${{ runner.temp }}/tauri-driver.stderr.log
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         if: always()
