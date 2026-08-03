@@ -5768,6 +5768,16 @@ fn model_endpoint(base_url: &str) -> String {
     }
 }
 
+fn model_endpoint_candidates(base_url: &str) -> Vec<String> {
+    let root = base_url.trim_end_matches('/');
+    let mut candidates = vec![model_endpoint(root)];
+    let direct = format!("{root}/models");
+    if !candidates.iter().any(|candidate| candidate == &direct) {
+        candidates.push(direct);
+    }
+    candidates
+}
+
 fn chat_endpoint(base_url: &str) -> String {
     let root = base_url.trim_end_matches('/');
     if root.ends_with("/v1") {
@@ -5786,34 +5796,49 @@ async fn fetch_cloud_models(
     let api_key = cloud_key_entry(&config.provider_id)?
         .get_password()
         .map_err(|_| "请先保存该提供商的 API 密钥。".to_string())?;
-    let response = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
-        .map_err(|_| "无法建立安全云端连接。".to_string())?
-        .get(model_endpoint(&config.base_url))
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .map_err(|_| "获取模型列表失败；未记录密钥。".to_string())?;
-    if !response.status().is_success() {
-        return Err("上游未返回可用模型列表。".to_string());
+        .map_err(|_| "无法建立安全云端连接。".to_string())?;
+    let mut failures = Vec::new();
+    for endpoint in model_endpoint_candidates(&config.base_url) {
+        let response = match client.get(&endpoint).bearer_auth(&api_key).send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                let status = response.status();
+                let detail = response.text().await.unwrap_or_default();
+                failures.push(format!(
+                    "{endpoint} 返回 HTTP {status}：{}",
+                    detail.chars().take(180).collect::<String>()
+                ));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!("{endpoint}：{error}"));
+                continue;
+            }
+        };
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| "模型列表接口返回了无法解析的数据。".to_string())?;
+        let mut models = value
+            .get("data")
+            .and_then(|data| data.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+            .filter(|id| !id.is_empty() && id.len() <= 160)
+            .map(|id| CloudModel { id: id.to_string() })
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        models.dedup_by(|left, right| left.id == right.id);
+        return Ok(models);
     }
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|_| "模型列表格式无效。".to_string())?;
-    let mut models = value
-        .get("data")
-        .and_then(|data| data.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
-        .filter(|id| !id.is_empty() && id.len() <= 160)
-        .map(|id| CloudModel { id: id.to_string() })
-        .collect::<Vec<_>>();
-    models.sort_by(|left, right| left.id.cmp(&right.id));
-    models.dedup_by(|left, right| left.id == right.id);
-    Ok(models)
+    Err(format!(
+        "无法获取模型列表。{}。若该上游不提供模型列表，可直接填写模型名后保存。",
+        failures.join("；")
+    ))
 }
 
 fn parse_ai_reply(content: &str) -> ParsedReply {
@@ -8497,10 +8522,11 @@ mod preview_tests {
     use super::{
         cosine_similarity, create_download_task, display_path, effective_cloud_policy,
         incremental_index_folder_inner, index_content, initialize_database,
-        migrate_plaintext_database, open_encrypted_database, preview_mime,
-        read_database_key_backup, recover_incomplete_download_tasks, recovery_mode_connection,
-        restore_quarantined_database, safe_relative_path, save_database_key_backup,
-        unique_library_file_path, CloudPolicy, MediaCommandRunner, MediaTask,
+        migrate_plaintext_database, model_endpoint_candidates, open_encrypted_database,
+        preview_mime, read_database_key_backup, recover_incomplete_download_tasks,
+        recovery_mode_connection, restore_quarantined_database, safe_relative_path,
+        save_database_key_backup, unique_library_file_path, CloudPolicy, MediaCommandRunner,
+        MediaTask,
     };
     use rusqlite::{params, Connection};
     use std::{
@@ -8529,6 +8555,21 @@ mod preview_tests {
         assert_eq!(
             display_path(Path::new(r"\\?\D:\资料\模型")),
             r"D:\资料\模型"
+        );
+    }
+
+    #[test]
+    fn cloud_model_discovery_uses_openai_and_direct_compatible_endpoints() {
+        assert_eq!(
+            model_endpoint_candidates("https://api.example.com/v1"),
+            vec!["https://api.example.com/v1/models".to_string()]
+        );
+        assert_eq!(
+            model_endpoint_candidates("https://gateway.example.com/openai"),
+            vec![
+                "https://gateway.example.com/openai/v1/models".to_string(),
+                "https://gateway.example.com/openai/models".to_string(),
+            ]
         );
     }
 

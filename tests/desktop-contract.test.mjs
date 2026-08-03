@@ -263,7 +263,7 @@ test('custom providers persist safely and expose models through the compatible e
   assert.match(shell, /cloud-model-select/);
 });
 
-test('model discovery persists a complete provider setup before querying its models', async () => {
+test('model discovery keeps the entered API key in the page and supports manually supplied models', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.match(backend, /模型可在获取列表后再选择/);
@@ -271,7 +271,10 @@ test('model discovery persists a complete provider setup before querying its mod
   const fetchHandler = shell.slice(shell.indexOf('async function fetchCloudModels'), shell.indexOf('async function selectCloudProvider'));
   assert.match(fetchHandler, /save_cloud_provider_config/);
   assert.match(fetchHandler, /fetch_cloud_models/);
-  assert.match(fetchHandler, /cloudDraft = \{ \.\.\.draft, apiKey: '' \}/);
+  assert.doesNotMatch(fetchHandler, /cloudDraft = \{ \.\.\.draft, apiKey: '' \}/);
+  assert.match(shell, /id="cloud-model-input"/);
+  assert.match(backend, /model_endpoint_candidates/);
+  assert.match(backend, /模型列表接口返回/);
 });
 
 test('local and cloud conversations are persisted and AI replies are parsed without executing them', async () => {
