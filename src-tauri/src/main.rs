@@ -5680,8 +5680,8 @@ fn save_cloud_provider_config(
     let display_name = input.display_name.trim().to_string();
     let base_url = validate_cloud_base_url(&input.base_url)?;
     let model = input.model.trim().to_string();
-    if provider_id.is_empty() || display_name.is_empty() || model.is_empty() || model.len() > 160 {
-        return Err("请填写提供商标识和模型名。".to_string());
+    if provider_id.is_empty() || display_name.is_empty() || model.len() > 160 {
+        return Err("请填写提供商标识和名称。模型可在获取列表后再选择。".to_string());
     }
     if let Some(api_key) = input.api_key.filter(|value| !value.trim().is_empty()) {
         cloud_key_entry(&provider_id)?
