@@ -749,6 +749,7 @@ struct CloudProviderConfig {
 #[serde(rename_all = "camelCase")]
 struct CloudProviderConfigInput {
     provider_id: String,
+    previous_provider_id: Option<String>,
     display_name: String,
     base_url: String,
     model: String,
@@ -5677,26 +5678,79 @@ fn save_cloud_provider_config(
     state: State<'_, AppState>,
 ) -> Result<CloudProviderConfig, String> {
     let provider_id = input.provider_id.trim().to_string();
+    let previous_provider_id = input
+        .previous_provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let display_name = input.display_name.trim().to_string();
     let base_url = validate_cloud_base_url(&input.base_url)?;
     let model = input.model.trim().to_string();
     if provider_id.is_empty() || display_name.is_empty() || model.len() > 160 {
         return Err("请填写提供商标识和名称。模型可在获取列表后再选择。".to_string());
     }
-    if let Some(api_key) = input.api_key.filter(|value| !value.trim().is_empty()) {
-        cloud_key_entry(&provider_id)?
-            .set_password(api_key.trim())
-            .map_err(|_| "无法将密钥保存到 Windows 凭据库。".to_string())?;
-    }
-    let has_key = cloud_key_entry(&provider_id)?.get_password().is_ok();
     let connection = state
         .database
         .lock()
         .map_err(|_| "本地数据库被占用。".to_string())?;
-    connection.execute(
-        "INSERT INTO cloud_provider_config (provider_id, display_name, base_url, model, auto_collaboration, review_each_request, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now')) ON CONFLICT(provider_id) DO UPDATE SET display_name = excluded.display_name, base_url = excluded.base_url, model = excluded.model, auto_collaboration = excluded.auto_collaboration, review_each_request = excluded.review_each_request, updated_at = datetime('now')",
-        params![provider_id, display_name, base_url, model, input.auto_collaboration, input.review_each_request],
-    ).map_err(|error| error.to_string())?;
+    let rename_from = previous_provider_id.filter(|previous| previous != &provider_id);
+    if let Some(previous_provider_id) = rename_from {
+        let destination_exists = connection
+            .query_row(
+                "SELECT 1 FROM cloud_provider_config WHERE provider_id = ?1",
+                params![provider_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some();
+        if destination_exists {
+            return Err("该提供商标识已被其他配置使用；请换一个标识，避免覆盖其密钥。".to_string());
+        }
+
+        // 迁移云端提供商密钥：新凭据写入成功后才更新资料库，最后才清理旧凭据。
+        let api_key = input
+            .api_key
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_string())
+            .or_else(|| {
+                cloud_key_entry(&previous_provider_id)
+                    .ok()
+                    .and_then(|entry| entry.get_password().ok())
+            })
+            .ok_or_else(|| {
+                "修改标识前，请输入 API Key，或先选择保存过密钥的供应商。".to_string()
+            })?;
+        cloud_key_entry(&provider_id)?
+            .set_password(&api_key)
+            .map_err(|_| "无法将迁移后的密钥保存到 Windows 凭据库。".to_string())?;
+        let changed = connection
+            .execute(
+                "UPDATE cloud_provider_config SET provider_id = ?1, display_name = ?2, base_url = ?3, model = ?4, auto_collaboration = ?5, review_each_request = ?6, updated_at = datetime('now') WHERE provider_id = ?7",
+                params![provider_id, display_name, base_url, model, input.auto_collaboration, input.review_each_request, previous_provider_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("原供应商配置不存在，未修改任何现有配置。".to_string());
+        }
+        let _ = cloud_key_entry(&previous_provider_id).and_then(|entry| {
+            entry
+                .delete_credential()
+                .map_err(|_| "无法删除旧 Windows 凭据。".to_string())
+        });
+    } else {
+        if let Some(api_key) = input.api_key.filter(|value| !value.trim().is_empty()) {
+            cloud_key_entry(&provider_id)?
+                .set_password(api_key.trim())
+                .map_err(|_| "无法将密钥保存到 Windows 凭据库。".to_string())?;
+        }
+        connection.execute(
+            "INSERT INTO cloud_provider_config (provider_id, display_name, base_url, model, auto_collaboration, review_each_request, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now')) ON CONFLICT(provider_id) DO UPDATE SET display_name = excluded.display_name, base_url = excluded.base_url, model = excluded.model, auto_collaboration = excluded.auto_collaboration, review_each_request = excluded.review_each_request, updated_at = datetime('now')",
+            params![provider_id, display_name, base_url, model, input.auto_collaboration, input.review_each_request],
+        ).map_err(|error| error.to_string())?;
+    }
+    let has_key = cloud_key_entry(&provider_id)?.get_password().is_ok();
     Ok(CloudProviderConfig {
         provider_id,
         display_name,

@@ -24,7 +24,7 @@ type MediaTask = { id: string; itemId: string; name: string; kind: 'ocr' | 'tran
 type MediaSettings = { whisperModelPath: string; ocrLanguage: string };
 type LocalToolStatus = { pdfText: boolean; ffmpeg: boolean; ocr: boolean; transcription: boolean; officeConverter: boolean };
 type CloudProviderConfig = { providerId: string; displayName: string; baseUrl: string; model: string; autoCollaboration: boolean; reviewEachRequest: boolean; configured: boolean };
-type CloudDraft = { providerId: string; displayName: string; baseUrl: string; model: string; apiKey: string; autoCollaboration: boolean; reviewEachRequest: boolean };
+type CloudDraft = { providerId: string; previousProviderId?: string; displayName: string; baseUrl: string; model: string; apiKey: string; autoCollaboration: boolean; reviewEachRequest: boolean };
 type CloudModel = { id: string };
 type ParsedReply = { answer: string; steps: string[]; codeBlocks: number };
 type Conversation = { id: string; title: string; providerId?: string; updatedAt: string };
@@ -83,6 +83,8 @@ let cloudConfig: CloudProviderConfig | null = null;
 let cloudProviders: CloudProviderConfig[] = [];
 let cloudModels: CloudModel[] = [];
 let cloudDraft: CloudDraft = { providerId: '', displayName: '', baseUrl: '', model: '', apiKey: '', autoCollaboration: false, reviewEachRequest: false };
+let cloudOriginalProviderId: string | null = null;
+let cloudApiKeyVisible = false;
 let agentRun: AgentRun | null = null;
 let conversations: Conversation[] = [];
 let activeConversationId: string | null = null;
@@ -241,6 +243,7 @@ function conversationPage() {
 function cloudDraftFromConfig(config: CloudProviderConfig | null): CloudDraft {
   return {
     providerId: config?.providerId ?? '',
+    previousProviderId: config?.providerId,
     displayName: config?.displayName ?? '',
     baseUrl: config?.baseUrl ?? '',
     model: config?.model ?? '',
@@ -259,7 +262,61 @@ function syncCloudDraftFromDom() {
     apiKey: document.querySelector<HTMLInputElement>('#cloud-api-key')?.value ?? cloudDraft.apiKey,
     autoCollaboration: document.querySelector<HTMLInputElement>('#cloud-auto')?.checked ?? cloudDraft.autoCollaboration,
     reviewEachRequest: document.querySelector<HTMLInputElement>('#cloud-review')?.checked ?? cloudDraft.reviewEachRequest,
+    previousProviderId: cloudOriginalProviderId ?? undefined,
   };
+}
+
+function refreshCloudCredentialHint() {
+  const hint = document.querySelector<HTMLElement>('#cloud-credential-status');
+  const input = document.querySelector<HTMLInputElement>('#cloud-api-key');
+  const savedForDraft = cloudConfig?.providerId === cloudDraft.providerId && cloudConfig.configured;
+  if (!hint) return;
+  if (input?.value) {
+    hint.textContent = '本次输入尚未保存；保存后将只写入 Windows 凭据管理器。';
+    hint.dataset.state = 'pending';
+  } else if (savedForDraft) {
+    hint.textContent = '已保存到 Windows 凭据管理器；留空会继续使用该密钥。';
+    hint.dataset.state = 'saved';
+  } else {
+    hint.textContent = '尚未保存密钥。输入后点击“保存供应商”或“保存并获取模型”。';
+    hint.dataset.state = 'missing';
+  }
+}
+
+function setupCloudProviderForm() {
+  const cloud = document.querySelector<HTMLElement>('.cloud-settings');
+  const heading = cloud?.querySelector<HTMLElement>('.cloud-settings-heading');
+  cloud?.classList.add('cloud-provider-card');
+  heading?.classList.add('cloud-provider-heading');
+  document.querySelector('#cloud-provider-select')?.closest('label')?.classList.add('cloud-saved-provider-field');
+  document.querySelector('#cloud-display-name')?.closest('label')?.classList.add('cloud-provider-name-field');
+  document.querySelector('#cloud-provider-id')?.closest('label')?.classList.add('cloud-provider-id-field');
+  document.querySelector('#cloud-model-input')?.closest('label')?.classList.add('cloud-model-field');
+  const apiKey = document.querySelector<HTMLInputElement>('#cloud-api-key');
+  const apiKeyLabel = apiKey?.closest('label');
+  apiKeyLabel?.classList.add('cloud-secret-control');
+  if (!apiKey || !apiKeyLabel || document.querySelector('#cloud-credential-status')) return;
+  apiKey.type = cloudApiKeyVisible ? 'text' : 'password';
+  const secretRow = document.createElement('div');
+  secretRow.className = 'cloud-secret-meta';
+  const hint = document.createElement('small');
+  hint.id = 'cloud-credential-status';
+  hint.setAttribute('aria-live', 'polite');
+  const toggle = document.createElement('button');
+  toggle.id = 'cloud-api-key-visibility';
+  toggle.type = 'button';
+  toggle.className = 'quiet cloud-api-key-visibility';
+  toggle.setAttribute('aria-label', cloudApiKeyVisible ? '隐藏 API Key' : '显示 API Key');
+  toggle.textContent = cloudApiKeyVisible ? '隐藏' : '显示';
+  toggle.addEventListener('click', () => {
+    cloudApiKeyVisible = !cloudApiKeyVisible;
+    apiKey.type = cloudApiKeyVisible ? 'text' : 'password';
+    toggle.textContent = cloudApiKeyVisible ? '隐藏' : '显示';
+    toggle.setAttribute('aria-label', cloudApiKeyVisible ? '隐藏 API Key' : '显示 API Key');
+  });
+  secretRow.append(hint, toggle);
+  apiKeyLabel.append(secretRow);
+  refreshCloudCredentialHint();
 }
 
 function restoreCloudDraftToDom() {
@@ -379,6 +436,7 @@ function render() {
   app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-testid="nav-workspace" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-testid="nav-search" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-testid="nav-assistant" data-view="assistant">${icons.spark}<span>AI 助手</span></button><button class="nav ${activeView === 'conversations' ? 'active' : ''}" data-testid="nav-conversations" data-view="conversations">${icons.file}<span>AI 对话</span></button><button class="nav ${activeView === 'diagnostics' ? 'active' : ''}" data-testid="nav-diagnostics" data-view="diagnostics">${icons.file}<span>索引诊断</span></button><button class="nav ${activeView === 'tasks' ? 'active' : ''}" data-testid="nav-tasks" data-view="tasks">${icons.settings}<span>后台任务</span></button></nav><div class="sidebar-bottom"><button class="nav ${activeView === 'settings' ? 'active' : ''}" data-testid="nav-settings" data-view="settings">${icons.settings}<span>设置</span></button><button class="nav ${activeView === 'about' ? 'active' : ''}" data-testid="nav-about" data-view="about">${icons.file}<span>关于</span></button><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${folderBrowser()}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>${menu}`;
   app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL FILE ASSISTANT</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-testid="nav-workspace" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-testid="nav-search" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-testid="nav-assistant" data-view="assistant">${icons.spark}<span>AI 助手</span></button><button class="nav ${activeView === 'conversations' ? 'active' : ''}" data-testid="nav-conversations" data-view="conversations">${icons.file}<span>AI 对话</span></button><button class="nav ${activeView === 'diagnostics' ? 'active' : ''}" data-testid="nav-diagnostics" data-view="diagnostics">${icons.file}<span>索引诊断</span></button><button class="nav ${activeView === 'tasks' ? 'active' : ''}" data-testid="nav-tasks" data-view="tasks">${icons.settings}<span>后台任务</span></button></nav><div class="sidebar-bottom"><button class="nav ${activeView === 'settings' ? 'active' : ''}" data-testid="nav-settings" data-view="settings">${icons.settings}<span>设置</span></button><button class="nav ${activeView === 'about' ? 'active' : ''}" data-testid="nav-about" data-view="about">${icons.file}<span>关于</span></button><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${folderBrowser()}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>${menu}`;
   restoreCloudDraftToDom();
+  setupCloudProviderForm();
   const assistant = document.querySelector<HTMLElement>('.assistant-page');
   const output = assistant?.querySelector<HTMLElement>('.ai-output');
   const cloud = assistant?.querySelector<HTMLElement>('.cloud-settings');
@@ -386,7 +444,7 @@ function render() {
   bind();
 }
 
-async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus, recoveryNotice, indexJobs, runtimeSettings, embeddingModels, mediaTasks, mediaSettings, localTools, managedDownloadResources, downloadTasks, folderWatchStatuses] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status'), invoke<string | null>('get_startup_recovery_notice'), invoke<IndexJob[]>('list_index_jobs'), invoke<RuntimeSettings>('get_runtime_settings'), invoke<EmbeddingModel[]>('list_embedding_models'), invoke<MediaTask[]>('list_media_tasks'), invoke<MediaSettings>('get_media_settings'), invoke<LocalToolStatus>('get_local_tool_status'), invoke<ManagedDownloadResource[]>('list_managed_download_resources'), invoke<DownloadTask[]>('list_download_tasks'), invoke<FolderWatchStatus[]>('list_folder_watch_status')]); if (!cloudDraft.providerId && !cloudDraft.displayName && !cloudDraft.baseUrl && !cloudDraft.model) cloudDraft = cloudDraftFromConfig(cloudConfig); render(); }
+async function refreshStatus() { [status, folderRefs, cloudConfig, cloudProviders, conversations, sensitiveRules, localModels, agentPreferences, privacyStatus, recoveryNotice, indexJobs, runtimeSettings, embeddingModels, mediaTasks, mediaSettings, localTools, managedDownloadResources, downloadTasks, folderWatchStatuses] = await Promise.all([invoke<RuntimeStatus>('get_runtime_status'), invoke<FolderRef[]>('list_folder_refs'), invoke<CloudProviderConfig | null>('get_cloud_provider_config'), invoke<CloudProviderConfig[]>('list_cloud_providers'), invoke<Conversation[]>('list_conversations'), invoke<SensitiveRule[]>('list_sensitive_rules'), invoke<LocalModel[]>('list_local_models'), invoke<AgentPreferences>('get_agent_preferences'), invoke<PrivacyStatus>('get_privacy_status'), invoke<string | null>('get_startup_recovery_notice'), invoke<IndexJob[]>('list_index_jobs'), invoke<RuntimeSettings>('get_runtime_settings'), invoke<EmbeddingModel[]>('list_embedding_models'), invoke<MediaTask[]>('list_media_tasks'), invoke<MediaSettings>('get_media_settings'), invoke<LocalToolStatus>('get_local_tool_status'), invoke<ManagedDownloadResource[]>('list_managed_download_resources'), invoke<DownloadTask[]>('list_download_tasks'), invoke<FolderWatchStatus[]>('list_folder_watch_status')]); if (!cloudDraft.providerId && !cloudDraft.displayName && !cloudDraft.baseUrl && !cloudDraft.model) { cloudDraft = cloudDraftFromConfig(cloudConfig); cloudOriginalProviderId = cloudConfig?.providerId ?? null; } render(); }
 async function refreshManagedResources() { [managedDownloadResources, downloadTasks, folderWatchStatuses] = await Promise.all([invoke<ManagedDownloadResource[]>('list_managed_download_resources'), invoke<DownloadTask[]>('list_download_tasks'), invoke<FolderWatchStatus[]>('list_folder_watch_status')]); }
 async function downloadManagedResource(resourceId: string) { isWorking = true; error = ''; render(); try { await invoke('download_managed_resource', { input: { resourceId } }); await refreshManagedResources(); } catch (reason) { formWarning = { target: 'media', message: String(reason) }; } finally { isWorking = false; render(); } }
 async function retryDownloadTask(id: string) { await invoke('retry_download_task', { input: { id } }); await refreshBackgroundTasks(); }
@@ -554,9 +612,9 @@ async function ask(question: string) {
   } catch (reason) { error = String(reason); } finally { isWorking = false; render(); }
 }
 async function loadConversationHistory() { conversations = await invoke<Conversation[]>('list_conversations'); if (activeConversationId) conversationMessages = await invoke<ConversationMessage[]>('list_conversation_messages', { input: { conversationId: activeConversationId } }); }
-async function saveCloudProvider(event: SubmitEvent) { event.preventDefault(); syncCloudDraftFromDom(); const draft = { ...cloudDraft }; cloudConfig = { providerId: draft.providerId, displayName: draft.displayName, baseUrl: draft.baseUrl, model: draft.model, autoCollaboration: draft.autoCollaboration, reviewEachRequest: draft.reviewEachRequest, configured: Boolean(draft.apiKey || cloudConfig?.configured) }; isWorking = true; error = ''; formWarning = null; render(); try { cloudConfig = await invoke<CloudProviderConfig>('save_cloud_provider_config', { input: draft }); cloudDraft = draft; cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; } finally { isWorking = false; render(); } }
-async function fetchCloudModels() { syncCloudDraftFromDom(); const draft = { ...cloudDraft }; if (!draft.providerId || !draft.displayName || !draft.baseUrl || (!draft.apiKey && !cloudConfig?.configured)) { formWarning = { target: 'cloud', message: '请先填写名称、标识、基础地址和 API Key；已保存过密钥的供应商可留空。' }; render(); return; } isWorking = true; error = ''; formWarning = null; render(); try { cloudConfig = await invoke<CloudProviderConfig>('save_cloud_provider_config', { input: draft }); cloudDraft = draft; cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); cloudModels = await invoke<CloudModel[]>('fetch_cloud_models', { input: { providerId: draft.providerId } }); if (!cloudDraft.model && cloudModels[0]) cloudDraft.model = cloudModels[0].id; } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; } finally { isWorking = false; render(); } }
-async function selectCloudProvider(providerId: string) { cloudConfig = providerId ? await invoke<CloudProviderConfig>('select_cloud_provider', { input: { providerId } }) : null; cloudDraft = cloudDraftFromConfig(cloudConfig); cloudModels = []; formWarning = null; if (cloudConfig) cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); render(); }
+async function saveCloudProvider(event: SubmitEvent) { event.preventDefault(); syncCloudDraftFromDom(); const draft = { ...cloudDraft }; isWorking = true; error = ''; formWarning = null; render(); try { cloudConfig = await invoke<CloudProviderConfig>('save_cloud_provider_config', { input: draft }); cloudOriginalProviderId = cloudConfig.providerId; cloudDraft = { ...cloudDraftFromConfig(cloudConfig), apiKey: '' }; cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; } finally { isWorking = false; render(); } }
+async function fetchCloudModels() { syncCloudDraftFromDom(); const draft = { ...cloudDraft }; const savedForDraft = cloudConfig?.providerId === draft.providerId && cloudConfig.configured; if (!draft.providerId || !draft.displayName || !draft.baseUrl || (!draft.apiKey && !savedForDraft)) { formWarning = { target: 'cloud', message: '请先填写名称、标识、基础地址和 API Key；已保存过密钥的供应商可留空。' }; render(); return; } isWorking = true; error = ''; formWarning = null; render(); try { cloudConfig = await invoke<CloudProviderConfig>('save_cloud_provider_config', { input: draft }); cloudOriginalProviderId = cloudConfig.providerId; cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); cloudModels = await invoke<CloudModel[]>('fetch_cloud_models', { input: { providerId: cloudConfig.providerId } }); cloudDraft = { ...cloudDraftFromConfig(cloudConfig), apiKey: '' }; if (!cloudDraft.model && cloudModels[0]) cloudDraft.model = cloudModels[0].id; } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; } finally { isWorking = false; render(); } }
+async function selectCloudProvider(providerId: string) { cloudConfig = providerId ? await invoke<CloudProviderConfig>('select_cloud_provider', { input: { providerId } }) : null; cloudOriginalProviderId = cloudConfig?.providerId ?? null; cloudDraft = cloudDraftFromConfig(cloudConfig); cloudModels = []; formWarning = null; if (cloudConfig) cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); render(); }
 async function openConversation(conversationId: string) { activeConversationId = conversationId; conversationMessages = await invoke<ConversationMessage[]>('list_conversation_messages', { input: { conversationId } }); render(); }
 async function autoApplyLowRiskAdvice() {
   if (!agentRun || !aiOutputTarget || !agentPreferences.autoApplyLowRisk || agentRun.status !== 'awaiting_approval') return;
@@ -578,7 +636,7 @@ async function runWorkspaceCheck() { if (!aiOutputTarget) return; const command 
 async function autoRepairAgentRun() { if (!agentRun || !aiOutputTarget) return; const command = document.querySelector<HTMLSelectElement>('#workspace-check-command')?.value ?? 'npm run build'; isWorking = true; error = ''; workspaceAction = null; render(); try { workspaceAction = await invoke<WorkspaceActionResult>('auto_repair_agent_run', { input: { runId: agentRun.id, workspaceId: aiOutputTarget.workspaceId, command } }); agentRun = { ...agentRun, status: workspaceAction.status, feedback: workspaceAction.status === 'repair_complete' ? '自动最小修复已通过固定检查。' : '自动最小修复后检查仍失败，已停止自动循环。' }; agentEvents = await invoke<AgentEvent[]>('list_agent_events', { input: { runId: agentRun.id } }); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function retryAgentRun() { if (!agentRun) return; isWorking = true; error = ''; render(); try { agentRun = await invoke<AgentRun>('retry_agent_run', { input: { runId: agentRun.id } }); if (agentRun.route === 'cloud_auto') { await ensureAiWorkspace(); agentRun = await invoke<AgentRun>('run_cloud_collaboration', { runId: agentRun.id }); await autoApplyLowRiskAdvice(); } agentEvents = await invoke<AgentEvent[]>('list_agent_events', { input: { runId: agentRun.id } }); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function deleteConversation(conversationId: string) { if (!window.confirm('删除该本地对话记录？此操作无法撤销。')) return; isWorking = true; error = ''; render(); try { await invoke('delete_conversation', { input: { conversationId } }); if (activeConversationId === conversationId) { activeConversationId = null; conversationMessages = []; } await loadConversationHistory(); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
-async function deleteCloudProvider() { if (!cloudConfig || !window.confirm(`删除供应商“${cloudConfig.displayName}”及其 Windows 凭据？`)) return; isWorking = true; error = ''; render(); try { await invoke('delete_cloud_provider', { input: { providerId: cloudConfig.providerId } }); cloudConfig = null; cloudModels = []; cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
+async function deleteCloudProvider() { if (!cloudConfig || !window.confirm(`删除供应商“${cloudConfig.displayName}”及其 Windows 凭据？`)) return; isWorking = true; error = ''; render(); try { await invoke('delete_cloud_provider', { input: { providerId: cloudConfig.providerId } }); cloudConfig = null; cloudOriginalProviderId = null; cloudDraft = cloudDraftFromConfig(null); cloudModels = []; cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function saveSensitiveRule(event: SubmitEvent) { event.preventDefault(); const name = document.querySelector<HTMLInputElement>('#sensitive-rule-name')?.value.trim() ?? ''; const pattern = document.querySelector<HTMLInputElement>('#sensitive-rule-pattern')?.value.trim() ?? ''; isWorking = true; error = ''; formWarning = null; render(); try { await invoke<SensitiveRule>('save_sensitive_rule', { input: { name, pattern, enabled: true } }); sensitiveRules = await invoke<SensitiveRule[]>('list_sensitive_rules'); } catch (reason) { formWarning = { target: 'rules', message: String(reason) }; } finally { isWorking = false; render(); } }
 async function updateSensitiveRule(rule: SensitiveRule, enabled: boolean) { isWorking = true; error = ''; render(); try { await invoke<SensitiveRule>('save_sensitive_rule', { input: { id: rule.id, name: rule.name, pattern: rule.pattern, enabled } }); sensitiveRules = await invoke<SensitiveRule[]>('list_sensitive_rules'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
 async function deleteSensitiveRule(id: string) { if (!window.confirm('删除这条本地敏感规则？')) return; isWorking = true; error = ''; render(); try { await invoke('delete_sensitive_rule', { input: { id } }); sensitiveRules = await invoke<SensitiveRule[]>('list_sensitive_rules'); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); } }
@@ -710,7 +768,7 @@ function bind() {
   document.querySelector('#create-ai-workspace')?.addEventListener('click', createAiWorkspace);
   document.querySelector<HTMLFormElement>('#cloud-provider-form')?.addEventListener('submit', saveCloudProvider);
   document.querySelector('#fetch-cloud-models')?.addEventListener('click', fetchCloudModels);
-  ['#cloud-provider-id', '#cloud-display-name', '#cloud-base-url', '#cloud-api-key', '#cloud-model-input'].forEach(selector => document.querySelector(selector)?.addEventListener('input', syncCloudDraftFromDom));
+  ['#cloud-provider-id', '#cloud-display-name', '#cloud-base-url', '#cloud-api-key', '#cloud-model-input'].forEach(selector => document.querySelector(selector)?.addEventListener('input', () => { syncCloudDraftFromDom(); refreshCloudCredentialHint(); }));
   document.querySelector<HTMLSelectElement>('#cloud-model-select')?.addEventListener('change', event => { const model = (event.target as HTMLSelectElement).value; const input = document.querySelector<HTMLInputElement>('#cloud-model-input'); if (input && model) input.value = model; syncCloudDraftFromDom(); });
   document.querySelector('#cloud-auto')?.addEventListener('change', syncCloudDraftFromDom);
   document.querySelector('#cloud-review')?.addEventListener('change', syncCloudDraftFromDom);

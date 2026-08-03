@@ -276,6 +276,29 @@ test('custom providers persist safely and expose models through the compatible e
   assert.match(shell, /cloud-model-select/);
 });
 
+test('renaming a saved provider keeps its credential bound to the edited provider without storing secrets in SQLite', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /previous_provider_id/);
+  assert.match(backend, /迁移云端提供商密钥/);
+  assert.match(backend, /UPDATE cloud_provider_config SET provider_id/);
+  assert.match(backend, /delete_credential/);
+  assert.doesNotMatch(backend, /api_key TEXT/);
+  assert.match(shell, /previousProviderId/);
+  assert.match(shell, /cloudOriginalProviderId/);
+});
+
+test('cloud provider form distinguishes saved credentials from unsaved input and provides an accessible visibility toggle', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const css = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(shell, /已保存到 Windows 凭据管理器/);
+  assert.match(shell, /本次输入尚未保存/);
+  assert.match(shell, /cloud-api-key-visibility/);
+  assert.match(shell, /setAttribute\('aria-label'.*显示 API Key/);
+  assert.match(css, /cloud-provider-card/);
+  assert.match(css, /cloud-secret-control/);
+});
+
 test('model discovery keeps the entered API key in the page and supports manually supplied models', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
