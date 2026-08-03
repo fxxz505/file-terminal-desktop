@@ -215,6 +215,9 @@ test('each supported branch push publishes a strictly newer signed in-app update
   assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY/);
   assert.match(workflow, /uploadUpdaterJson:\s*true/);
   assert.match(workflow, /updaterJsonPreferNsis:\s*true/);
+  assert.match(workflow, /Rewrite updater manifest with browser download URL/);
+  assert.match(workflow, /gh release upload/);
+  assert.match(workflow, /releases\/download/);
 });
 
 test('release versions stay aligned so the updater can detect a newer build', async () => {

@@ -99,6 +99,22 @@ jobs:
           prerelease: false
           uploadUpdaterJson: true
           updaterJsonPreferNsis: true
+      - name: Rewrite updater manifest with browser download URL
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:RELEASE_VERSION"
+          $release = gh release view $tag --json assets | ConvertFrom-Json
+          $installer = $release.assets | Where-Object { $_.name -match '-setup\.exe$' } | Select-Object -First 1
+          if (-not $installer) { throw 'Signed NSIS installer asset was not found.' }
+          gh release download $tag --pattern latest.json --dir . --clobber
+          $manifest = Get-Content -Raw latest.json | ConvertFrom-Json
+          $browserUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases/download/$tag/$($installer.name)"
+          $manifest.platforms.'windows-x86_64'.url = $browserUrl
+          $manifest.platforms.'windows-x86_64-nsis'.url = $browserUrl
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath latest.json -Encoding utf8
+          gh release upload $tag latest.json --clobber
       - name: Package portable bundle
         shell: pwsh
         run: |
