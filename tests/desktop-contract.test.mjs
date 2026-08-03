@@ -207,6 +207,16 @@ test('release builds cache Rust artifacts while retaining signed updater publica
   assert.match(workflow, /uploadUpdaterJson:\s*true/);
 });
 
+test('each supported branch push publishes a strictly newer signed in-app update', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /branches:\s*\['\*\*'\]/);
+  assert.match(workflow, /GITHUB_RUN_NUMBER/);
+  assert.match(workflow, /needs:\s*verify/);
+  assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY/);
+  assert.match(workflow, /uploadUpdaterJson:\s*true/);
+  assert.match(workflow, /updaterJsonPreferNsis:\s*true/);
+});
+
 test('release versions stay aligned so the updater can detect a newer build', async () => {
   const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   const lockJson = JSON.parse(await readFile(new URL('../package-lock.json', import.meta.url), 'utf8'));

@@ -1,55 +1,104 @@
-name: Release desktop app
+name: Build and publish desktop update
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: ['**']
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: publish-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  release-windows:
+  verify:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
-
       - name: Install frontend dependencies
         run: npm ci
-
-      - name: Run frontend contract tests
+      - name: TypeScript check
+        run: npx tsc --noEmit
+      - name: Frontend tests
         run: npm test
+      - name: Rust format check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Rust unit and integration tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Production frontend build
+        run: npm run build
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+      - name: Browser E2E with mocked Tauri IPC
+        run: npm run test:e2e
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
 
-      - name: Run Rust tests
-        working-directory: src-tauri
-        run: cargo test
-
-      - name: Build signed release and publish assets
+  release-windows:
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Create a strictly newer release version
+        shell: pwsh
+        run: |
+          $package = Get-Content -Raw package.json | ConvertFrom-Json
+          $parts = $package.version.Split('.')
+          if ($parts.Count -ne 3) { throw "Expected a three-part semantic version, got $($package.version)." }
+          $releaseVersion = "$($parts[0]).$($parts[1]).$([int]$env:GITHUB_RUN_NUMBER + 100000)"
+          $releaseVersion | Set-Content -LiteralPath release-version.txt -NoNewline -Encoding utf8
+          "RELEASE_VERSION=$releaseVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Apply generated version to build metadata
+        shell: pwsh
+        run: |
+          $version = Get-Content -Raw release-version.txt
+          node -e "const fs=require('fs'); for (const file of ['package.json','package-lock.json','src-tauri/tauri.conf.json']) { const json=JSON.parse(fs.readFileSync(file,'utf8')); json.version=process.env.RELEASE_VERSION; if (file==='package-lock.json') json.packages[''].version=process.env.RELEASE_VERSION; fs.writeFileSync(file, JSON.stringify(json,null,2)+'\n'); }"
+          $cargo = Get-Content -Raw src-tauri/Cargo.toml
+          $cargo = $cargo -replace '(?m)^(version = )"[^"]+"', "`${1}`"$version`""
+          Set-Content -LiteralPath src-tauri/Cargo.toml -Value $cargo -NoNewline -Encoding utf8
+          $lock = Get-Content -Raw src-tauri/Cargo.lock
+          $lock = $lock -replace '(?ms)(name = "file-terminal-desktop"\s+version = )"[^"]+"', "`${1}`"$version`""
+          Set-Content -LiteralPath src-tauri/Cargo.lock -Value $lock -NoNewline -Encoding utf8
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build signed release and publish updater assets
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: '资料终端 ${{ github.ref_name }}'
-          releaseBody: 'Windows 安装包与应用内自动更新发布。'
+          tagName: v${{ env.RELEASE_VERSION }}
+          releaseName: '资料终端 v${{ env.RELEASE_VERSION }}'
+          releaseBody: '通过 GitHub 构建并签名的 Windows 自动更新。应用内可在“关于”中检查、下载、安装并重启。'
           releaseDraft: false
           prerelease: false
           uploadUpdaterJson: true
           updaterJsonPreferNsis: true
-
       - name: Package portable bundle
         shell: pwsh
         run: |
@@ -64,9 +113,8 @@ jobs:
           更新时请只替换 exe 文件，不要删除“资料终端数据”。
           "@ | Set-Content -LiteralPath (Join-Path $portableRoot '使用说明.txt') -Encoding utf8
           Compress-Archive -Path $portableRoot -DestinationPath (Join-Path $env:RUNNER_TEMP '资料终端便携版-win-x64.zip') -Force
-
       - name: Upload portable bundle to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: v${{ env.RELEASE_VERSION }}
           files: ${{ runner.temp }}/资料终端便携版-win-x64.zip
