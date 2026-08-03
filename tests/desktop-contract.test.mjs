@@ -165,6 +165,19 @@ test('sidebar navigation controls real workspace, search, and assistant views', 
   assert.match(source, /\[data-view\]/);
 });
 
+test('diagnostics and background tasks provide compact, actionable empty states', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(shell, /diagnostic-empty/);
+  assert.match(shell, /task-empty/);
+  assert.match(shell, /data-view="workspace"/);
+  assert.match(shell, /data-testid="task-list"/);
+  assert.match(shell, /refresh-diagnostics/);
+  assert.match(shell, /refresh-background-tasks/);
+  assert.match(styles, /\.diagnostics-page,\.tasks-page\{min-height:0/);
+  assert.match(styles, /\.diagnostic-empty,\.task-empty\{/);
+});
+
 test('model status badges occupy their own grid row rather than the action column', async () => {
   const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
   assert.match(styles, /\.setup-state\{grid-column:2;grid-row:2/);
