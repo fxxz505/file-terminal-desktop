@@ -198,6 +198,15 @@ test('desktop updater verifies signed GitHub release updates before installation
   assert.match(backend, /tauri_plugin_updater/);
 });
 
+test('release builds cache Rust artifacts while retaining signed updater publication', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /dtolnay\/rust-toolchain@stable/);
+  assert.match(workflow, /Swatinem\/rust-cache@v2/);
+  assert.match(workflow, /workspaces:\s*src-tauri\s*->\s*target/);
+  assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY/);
+  assert.match(workflow, /uploadUpdaterJson:\s*true/);
+});
+
 test('release versions stay aligned so the updater can detect a newer build', async () => {
   const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   const lockJson = JSON.parse(await readFile(new URL('../package-lock.json', import.meta.url), 'utf8'));
