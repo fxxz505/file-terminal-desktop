@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 test('desktop application declares a Tauri window and local data backend', async () => {
   const config = await readFile(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8');
   const cargo = await readFile(new URL('../src-tauri/Cargo.toml', import.meta.url), 'utf8');
-  assert.match(config, /"productName": "????"/);
+  assert.equal(JSON.parse(config).productName, '\u8d44\u6599\u7ec8\u7aef');
   assert.match(config, /"frontendDist": "\.\.\/dist"/);
   assert.match(cargo, /rusqlite/);
   assert.match(cargo, /reqwest/);
