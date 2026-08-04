@@ -262,16 +262,20 @@ test('assistant view exposes cloud settings, safe routing feedback, and a confir
   assert.match(shell, /agentRun\.route === 'cloud_auto'/);
 });
 
-test('custom providers persist safely and expose models through the compatible endpoint', async () => {
+test('custom providers use temporary compatibility checks without persisting secrets', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.match(backend, /fn list_cloud_providers/);
-  assert.match(backend, /async fn fetch_cloud_models/);
+  assert.match(backend, /struct CloudConnectionProbeInput/);
+  assert.match(backend, /async fn test_cloud_connection/);
+  assert.match(backend, /async fn discover_cloud_models/);
+  assert.match(backend, /fn cloud_http_error_message/);
   assert.match(backend, /fn select_cloud_provider/);
   assert.match(backend, /\/v1\/models/);
   assert.match(backend, /cloud_provider_config/);
   assert.match(shell, /cloud-provider-form/);
-  assert.match(shell, /fetch_cloud_models/);
+  assert.match(shell, /test_cloud_connection/);
+  assert.match(shell, /discover_cloud_models/);
   assert.match(shell, /select_cloud_provider/);
   assert.match(shell, /cloud-model-select/);
 });
@@ -288,26 +292,28 @@ test('renaming a saved provider keeps its credential bound to the edited provide
   assert.match(shell, /cloudOriginalProviderId/);
 });
 
-test('cloud provider form distinguishes saved credentials from unsaved input and provides an accessible visibility toggle', async () => {
+test('cloud provider form hides the internal identifier and distinguishes saved credentials from temporary input', async () => {
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   const css = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
   assert.match(shell, /已保存到 Windows 凭据管理器/);
   assert.match(shell, /本次输入尚未保存/);
   assert.match(shell, /cloud-api-key-visibility/);
   assert.match(shell, /setAttribute\('aria-label'.*显示 API Key/);
+  assert.match(shell, /crypto\.randomUUID/);
+  assert.doesNotMatch(shell, /id="cloud-provider-id"/);
   assert.match(css, /cloud-provider-card/);
   assert.match(css, /cloud-secret-control/);
 });
 
-test('model discovery keeps the entered API key in the page and supports manually supplied models', async () => {
+test('temporary connection checks keep the entered API key in the page and manual models remain valid', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.match(backend, /模型可在获取列表后再选择/);
   assert.doesNotMatch(backend, /model\.is_empty\(\)/);
-  const fetchHandler = shell.slice(shell.indexOf('async function fetchCloudModels'), shell.indexOf('async function selectCloudProvider'));
-  assert.match(fetchHandler, /save_cloud_provider_config/);
-  assert.match(fetchHandler, /fetch_cloud_models/);
-  assert.doesNotMatch(fetchHandler, /cloudDraft = \{ \.\.\.draft, apiKey: '' \}/);
+  const discoveryHandler = shell.slice(shell.indexOf('async function fetchCloudModels'), shell.indexOf('async function selectCloudProvider'));
+  assert.match(discoveryHandler, /discover_cloud_models/);
+  assert.doesNotMatch(discoveryHandler, /save_cloud_provider_config/);
+  assert.doesNotMatch(discoveryHandler, /cloudDraft = \{ \.\.\.draft, apiKey: '' \}/);
   assert.match(shell, /id="cloud-model-input"/);
   assert.match(backend, /model_endpoint_candidates/);
   assert.match(backend, /模型列表接口返回/);
