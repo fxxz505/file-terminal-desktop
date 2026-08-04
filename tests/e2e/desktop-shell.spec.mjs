@@ -1,1 +1,72 @@
-aW1wb3J0IHsgdGVzdCwgZXhwZWN0IH0gZnJvbSAnQHBsYXl3cmlnaHQvdGVzdCc7DQoNCmFzeW5jIGZ1bmN0aW9uIGluc3RhbGxUYXVyaU1vY2socGFnZSkgew0KICBhd2FpdCBwYWdlLmFkZEluaXRTY3JpcHQoKCkgPT4gew0KICAgIGNvbnN0IGVtcHR5ID0gW107DQogICAgY29uc3QgZGVmYXVsdHMgPSB7DQogICAgICBnZXRfc3RhcnR1cF9tb2RlOiB7IHJlY292ZXJ5UmVxdWlyZWQ6IGZhbHNlLCBkYXRhRGlyZWN0b3J5OiAnJywgcmVjb3ZlcnlEaXJlY3Rvcnk6ICcnIH0sDQogICAgICBnZXRfZGF0YV9kaXJlY3Rvcnlfc3RhdHVzOiB7IHBhdGg6ICcnLCBzb3VyY2U6ICdwb3J0YWJsZScsIHBvcnRhYmxlQXZhaWxhYmxlOiB0cnVlLCByZXN0YXJ0UmVxdWlyZWQ6IGZhbHNlIH0sDQogICAgICBnZXRfcnVudGltZV9zdGF0dXM6IHsgbW9kZWxJbnN0YWxsZWQ6IGZhbHNlLCBydW50aW1lSW5zdGFsbGVkOiBmYWxzZSwgbW9kZWxQYXRoOiAnJywgYWN0aXZlTW9kZWxOYW1lOiAnVGVzdCcgfSwNCiAgICAgIGxpc3RfZm9sZGVyX3JlZnM6IGVtcHR5LCBsaXN0X2NvbnZlcnNhdGlvbnM6IGVtcHR5LCBsaXN0X3NlbnNpdGl2ZV9ydWxlczogZW1wdHksCiAgICAgIGxpc3RfbG9jYWxfbW9kZWxzOiBbeyBpZDogJ2xvY2FsLTEnLCBkaXNwbGF5TmFtZTogJ1F3ZW4g5pys5Zyw5rWL6K+V5qih5Z6LJywgcGF0aDogJ0Q6L21vZGVscy9xd2VuLmdndWYnLCBhY3RpdmU6IHRydWUgfV0sCiAgICAgIGxpc3RfaW5kZXhfam9iczogZW1wdHksIGxpc3RfZW1iZWRkaW5nX21vZGVsczogZW1wdHksIGxpc3RfbWVkaWFfdGFza3M6IGVtcHR5LCBsaXN0X21hbmFnZWRfZG93bmxvYWRfcmVzb3VyY2VzOiBlbXB0eSwNCiAgICAgIGxpc3RfaW5kZXhfZGlhZ25vc3RpY3M6IGVtcHR5LCBsaXN0X2JhY2tncm91bmRfdGFza3M6IGVtcHR5LA0KICAgICAgbGlzdF9kb3dubG9hZF90YXNrczogZW1wdHksIGxpc3RfZm9sZGVyX3dhdGNoX3N0YXR1czogZW1wdHksCiAgICAgIGxpc3RfY2xvdWRfcHJvdmlkZXJzOiBbeyBwcm92aWRlcklkOiAnY2xvdWQtMScsIGRpc3BsYXlOYW1lOiAn5rWL6K+V5LqR56uvJywgYmFzZVVybDogJ2h0dHBzOi8vZXhhbXBsZS50ZXN0JywgbW9kZWw6ICd0ZXN0LW1vZGVsJywgYXV0b0NvbGxhYm9yYXRpb246IGZhbHNlLCByZXZpZXdFYWNoUmVxdWVzdDogZmFsc2UsIGNvbmZpZ3VyZWQ6IHRydWUgfV0sCiAgICAgIGdldF9jbG91ZF9wcm92aWRlcl9jb25maWc6IHsgcHJvdmlkZXJJZDogJ2Nsb3VkLTEnLCBkaXNwbGF5TmFtZTogJ+a1i+ivleS6keerrycsIGJhc2VVcmw6ICdodHRwczovL2V4YW1wbGUudGVzdCcsIG1vZGVsOiAndGVzdC1tb2RlbCcsIGF1dG9Db2xsYWJvcmF0aW9uOiBmYWxzZSwgcmV2aWV3RWFjaFJlcXVlc3Q6IGZhbHNlLCBjb25maWd1cmVkOiB0cnVlIH0sIGdldF9hZ2VudF9wcmVmZXJlbmNlczogeyBhdXRvQXBwbHlMb3dSaXNrOiBmYWxzZSB9LAogICAgICBnZXRfcHJpdmFjeV9zdGF0dXM6IHsgZGF0YWJhc2VFbmNyeXB0ZWQ6IHRydWUsIG1lc3NhZ2U6ICd0ZXN0JywgcmVjb21tZW5kYXRpb246ICcnIH0sDQogICAgICBnZXRfc3RhcnR1cF9yZWNvdmVyeV9ub3RpY2U6IG51bGwsIGdldF9ydW50aW1lX3NldHRpbmdzOiB7IGV4ZWN1dGlvbk1vZGU6ICdhdXRvJywgdGhyZWFkczogNCwgY29udGV4dFNpemU6IDQwOTYgfSwNCiAgICAgIGdldF9tZWRpYV9zZXR0aW5nczogeyB3aGlzcGVyTW9kZWxQYXRoOiAnJywgb2NyTGFuZ3VhZ2U6ICdjaGlfc2ltK2VuZycgfSwNCiAgICAgIGdldF9sb2NhbF90b29sX3N0YXR1czogeyBwZGZUZXh0OiB0cnVlLCBmZm1wZWc6IGZhbHNlLCBvY3I6IGZhbHNlLCB0cmFuc2NyaXB0aW9uOiBmYWxzZSwgb2ZmaWNlQ29udmVydGVyOiBmYWxzZSB9LA0KICAgIH07DQogICAgbGV0IGNhbGxiYWNrSWQgPSAxMDsNCiAgICB3aW5kb3cuaXNUYXVyaSA9IHRydWU7DQogICAgd2luZG93Ll9fVEFVUklfSU5URVJOQUxTX18gPSB7DQogICAgICBtZXRhZGF0YTogeyBjdXJyZW50V2luZG93OiB7IGxhYmVsOiAnbWFpbicgfSB9LA0KICAgICAgdHJhbnNmb3JtQ2FsbGJhY2s6ICgpID0+IGNhbGxiYWNrSWQrKywNCiAgICAgIHVucmVnaXN0ZXJDYWxsYmFjazogKCkgPT4ge30sDQogICAgICBjb252ZXJ0RmlsZVNyYzogcGF0aCA9PiBwYXRoLA0KICAgICAgaW52b2tlOiBhc3luYyAoY29tbWFuZCkgPT4gew0KICAgICAgICBjb25zdCBuYW1lID0gU3RyaW5nKGNvbW1hbmQpLmluY2x1ZGVzKCd8JykgPyBTdHJpbmcoY29tbWFuZCkuc3BsaXQoJ3wnKS5wb3AoKSA6IGNvbW1hbmQ7DQogICAgICAgIGlmIChuYW1lID09PSAncmVnaXN0ZXJfbGlzdGVuZXInIHx8IG5hbWUgPT09ICdsaXN0ZW4nKSByZXR1cm4gY2FsbGJhY2tJZCsrOw0KICAgICAgICBpZiAoT2JqZWN0LnByb3RvdHlwZS5oYXNPd25Qcm9wZXJ0eS5jYWxsKGRlZmF1bHRzLCBuYW1lKSkgcmV0dXJuIGRlZmF1bHRzW25hbWVdOw0KICAgICAgICByZXR1cm4gbnVsbDsNCiAgICAgIH0sDQogICAgfTsNCiAgICB3aW5kb3cuX19UQVVSSV9FVkVOVF9QTFVHSU5fSU5URVJOQUxTX18gPSB7IHVucmVnaXN0ZXJMaXN0ZW5lcjogKCkgPT4ge30gfTsNCiAgfSk7DQp9DQoNCnRlc3QuYmVmb3JlRWFjaChhc3luYyAoeyBwYWdlIH0pID0+IHsNCiAgYXdhaXQgaW5zdGFsbFRhdXJpTW9jayhwYWdlKTsNCiAgYXdhaXQgcGFnZS5nb3RvKCcvJyk7DQogIGF3YWl0IGV4cGVjdChwYWdlLmxvY2F0b3IoJ1tkYXRhLXRlc3RpZD0ibmF2LXdvcmtzcGFjZSJdJykpLnRvQmVWaXNpYmxlKCk7DQp9KTsNCg0KdGVzdCgnbmF2aWdhdGVzIGFjcm9zcyBjb3JlIGRlc2t0b3Agdmlld3MnLCBhc3luYyAoeyBwYWdlIH0pID0+IHsNCiAgYXdhaXQgcGFnZS5sb2NhdG9yKCdbZGF0YS10ZXN0aWQ9Im5hdi1zZWFyY2giXScpLmNsaWNrKCk7DQogIGF3YWl0IGV4cGVjdChwYWdlLmxvY2F0b3IoJ1tkYXRhLXRlc3RpZD0ic2VhcmNoLXF1ZXN0aW9uIl0nKSkudG9CZVZpc2libGUoKTsNCiAgYXdhaXQgcGFnZS5sb2NhdG9yKCdbZGF0YS10ZXN0aWQ9Im5hdi1kaWFnbm9zdGljcyJdJykuY2xpY2soKTsNCiAgYXdhaXQgZXhwZWN0KHBhZ2UubG9jYXRvcignLmRpYWdub3N0aWNzLXBhZ2UnKSkudG9CZVZpc2libGUoKTsNCiAgYXdhaXQgcGFnZS5sb2NhdG9yKCdbZGF0YS10ZXN0aWQ9Im5hdi1hc3Npc3RhbnQiXScpLmNsaWNrKCk7DQogIGF3YWl0IGV4cGVjdChwYWdlLmxvY2F0b3IoJy5hc3Npc3RhbnQtd29ya2JlbmNoJykpLnRvQmVWaXNpYmxlKCk7DQogIGF3YWl0IHBhZ2UubG9jYXRvcignW2RhdGEtdGVzdGlkPSJuYXYtc2V0dGluZ3MiXScpLmNsaWNrKCk7DQogIGF3YWl0IGV4cGVjdChwYWdlLmxvY2F0b3IoJ1tkYXRhLXRlc3RpZD0ibmF2LXNldHRpbmdzIl0nKSkudG9IYXZlQ2xhc3MoL2FjdGl2ZS8pOw0KfSk7DQoNCnRlc3QoJ2V4cG9zZXMgdXBsb2FkIGRyb3Agem9uZSBhbmQgZmlsZSBjaG9vc2VyIGVudHJ5IHBvaW50JywgYXN5bmMgKHsgcGFnZSB9KSA9PiB7CiAgYXdhaXQgZXhwZWN0KHBhZ2UubG9jYXRvcignI2ZpbGUtdXBsb2FkLWRyb3AnKSkudG9CZVZpc2libGUoKTsNCiAgYXdhaXQgZXhwZWN0KHBhZ2UubG9jYXRvcignW2RhdGEtaW1wb3J0LWZpbGVzXScpKS50b0JlVmlzaWJsZSgpOw0KfSk7Cgp0ZXN0KCdzaG93cyBhIGNlbnRlcmVkIEFJIHdvcmtiZW5jaCB3aXRoIGxvY2FsIGFuZCBjbG91ZCBtb2RlbCBjaG9pY2VzIGFuZCBhIHJpZ2h0IGluc3BlY3RvcicsIGFzeW5jICh7IHBhZ2UgfSkgPT4gewogIGF3YWl0IHBhZ2UubG9jYXRvcignW2RhdGEtdGVzdGlkPSJuYXYtYXNzaXN0YW50Il0nKS5jbGljaygpOwogIGF3YWl0IGV4cGVjdChwYWdlLmxvY2F0b3IoJy5hc3Npc3RhbnQtc2hlbGwnKSkudG9CZVZpc2libGUoKTsKICBhd2FpdCBleHBlY3QocGFnZS5sb2NhdG9yKCcuYXNzaXN0YW50LWhpc3RvcnknKSkudG9CZVZpc2libGUoKTsKICBhd2FpdCBleHBlY3QocGFnZS5sb2NhdG9yKCcuYXNzaXN0YW50LWhpc3RvcnktbmV3JykpLnRvQ29udGFpblRleHQoJ+aWsOW7uuWvueivnScpOwogIGF3YWl0IGV4cGVjdChwYWdlLmxvY2F0b3IoJy5hc3Npc3RhbnQtaGlzdG9yeS1zZWN0aW9uJykpLnRvQ29udGFpblRleHQoJ+WvueivnScpOwogIGF3YWl0IGV4cGVjdChwYWdlLmxvY2F0b3IoJyNhc3Npc3RhbnQtbW9kZWwtY2hvaWNlJykpLnRvQmVWaXNpYmxlKCk7CiAgYXdhaXQgZXhwZWN0KHBhZ2UubG9jYXRvcignI2Fzc2lzdGFudC1tb2RlbC1jaG9pY2Ugb3B0Z3JvdXBbbGFiZWw9IuacrOWcsOaooeWeiyJdJykpLnRvQmVBdHRhY2hlZCgpOwogIGF3YWl0IGV4cGVjdChwYWdlLmxvY2F0b3IoJyNhc3Npc3RhbnQtbW9kZWwtY2hvaWNlIG9wdGdyb3VwW2xhYmVsPSLkupHnq6/mqKHlnosiXScpKS50b0JlQXR0YWNoZWQoKTsKICBhd2FpdCBleHBlY3QocGFnZS5sb2NhdG9yKCcucmlnaHQtaW5zcGVjdG9yJykpLnRvQ29udGFpblRleHQoJ+WcqOatpOafpeeci+aWh+S7ticpOwp9KTsK
+import { test, expect } from '@playwright/test';
+
+async function installTauriMock(page) {
+  await page.addInitScript(() => {
+    const empty = [];
+    const defaults = {
+      get_startup_mode: { recoveryRequired: false, dataDirectory: '', recoveryDirectory: '' },
+      get_data_directory_status: { path: '', source: 'portable', portableAvailable: true, restartRequired: false },
+      get_runtime_status: { modelInstalled: false, runtimeInstalled: false, modelPath: '', activeModelName: 'Test' },
+      list_folder_refs: empty, list_conversations: empty, list_sensitive_rules: empty,
+      list_local_models: [{ id: 'local-1', displayName: 'Qwen ??????', path: 'D:/models/qwen.gguf', active: true }],
+      list_index_jobs: empty, list_embedding_models: empty, list_media_tasks: empty, list_managed_download_resources: empty,
+      list_index_diagnostics: empty, list_background_tasks: empty,
+      list_download_tasks: empty, list_folder_watch_status: empty,
+      list_cloud_providers: [{ providerId: 'cloud-1', displayName: '????', baseUrl: 'https://example.test', model: 'test-model', autoCollaboration: false, reviewEachRequest: false, configured: true }],
+      get_cloud_provider_config: { providerId: 'cloud-1', displayName: '????', baseUrl: 'https://example.test', model: 'test-model', autoCollaboration: false, reviewEachRequest: false, configured: true }, get_agent_preferences: { autoApplyLowRisk: false },
+      get_privacy_status: { databaseEncrypted: true, message: 'test', recommendation: '' },
+      get_startup_recovery_notice: null, get_runtime_settings: { executionMode: 'auto', threads: 4, contextSize: 4096 },
+      get_media_settings: { whisperModelPath: '', ocrLanguage: 'chi_sim+eng' },
+      get_local_tool_status: { pdfText: true, ffmpeg: false, ocr: false, transcription: false, officeConverter: false },
+    };
+    let callbackId = 10;
+    window.isTauri = true;
+    window.__TAURI_INTERNALS__ = {
+      metadata: { currentWindow: { label: 'main' } },
+      transformCallback: () => callbackId++,
+      unregisterCallback: () => {},
+      convertFileSrc: path => path,
+      invoke: async (command) => {
+        const name = String(command).includes('|') ? String(command).split('|').pop() : command;
+        if (name === 'register_listener' || name === 'listen') return callbackId++;
+        if (Object.prototype.hasOwnProperty.call(defaults, name)) return defaults[name];
+        return null;
+      },
+    };
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
+  });
+}
+
+test.beforeEach(async ({ page }) => {
+  await installTauriMock(page);
+  await page.goto('/');
+  await expect(page.locator('[data-testid="nav-workspace"]')).toBeVisible();
+});
+
+test('navigates across core desktop views', async ({ page }) => {
+  await page.locator('[data-testid="nav-search"]').click();
+  await expect(page.locator('[data-testid="search-question"]')).toBeVisible();
+  await page.locator('[data-testid="nav-diagnostics"]').click();
+  await expect(page.locator('.diagnostics-page')).toBeVisible();
+  await page.locator('[data-testid="nav-assistant"]').click();
+  await expect(page.locator('.assistant-workbench')).toBeVisible();
+  await page.locator('[data-testid="nav-settings"]').click();
+  await expect(page.locator('[data-testid="nav-settings"]')).toHaveClass(/active/);
+});
+
+test('exposes upload drop zone and file chooser entry point', async ({ page }) => {
+  await expect(page.locator('#file-upload-drop')).toBeVisible();
+  await expect(page.locator('[data-import-files]')).toBeVisible();
+});
+
+test('shows a centered AI workbench with local and cloud model choices and a right inspector', async ({ page }) => {
+  await page.locator('[data-testid="nav-assistant"]').click();
+  await expect(page.locator('.assistant-shell')).toBeVisible();
+  await expect(page.locator('.assistant-history')).toBeVisible();
+  await expect(page.locator('.assistant-history-new')).toContainText('????');
+  await expect(page.locator('.assistant-history-section')).toContainText('??');
+  await expect(page.locator('#assistant-model-choice')).toBeVisible();
+  await expect(page.locator('#assistant-model-choice optgroup[label="????"]')).toBeAttached();
+  await expect(page.locator('#assistant-model-choice optgroup[label="????"]')).toBeAttached();
+  await expect(page.locator('.right-inspector')).toContainText('??????');
+});
