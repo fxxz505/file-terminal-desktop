@@ -638,6 +638,37 @@ test('runtime provisioning uses a versioned manifest with archive hashes and exp
   assert.match(backend, /verify_sha256\(&archive/);
 });
 
+test('runtime provisioning extracts llama runtime DLL dependencies beside the executables', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const downloadRuntime = backend.slice(backend.indexOf('async fn download_runtime'), backend.indexOf('fn import_folder'));
+  assert.match(downloadRuntime, /runtime_is_ready\(&runtime_dir\)/);
+  assert.match(downloadRuntime, /ends_with\("\.exe"\) \|\| file_name\.ends_with\("\.dll"\)/);
+  assert.match(backend, /runtime_dir\.join\("llama-cli-impl\.dll"\)/);
+  assert.match(backend, /runtime_dir\.join\("llama\.dll"\)/);
+});
+
+test('local agent has a deterministic image-gallery fallback when llama runtime is unavailable', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  assert.match(backend, /fn deterministic_image_gallery_advice/);
+  assert.match(backend, /fn deterministic_image_gallery_from_request/);
+  assert.match(backend, /可点击切换图片|切换图片/);
+  assert.match(backend, /deterministic_image_gallery_from_request/);
+  assert.match(backend, /fn local_file_uri/);
+  assert.match(backend, /file:\/\/\//);
+  assert.match(backend, /is_ascii_alphanumeric/);
+});
+
+test('AI output workspace can be opened in the inline browser', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(backend, /fn list_ai_workspace_children/);
+  assert.match(backend, /list_ai_workspace_children,/);
+  assert.match(shell, /id="open-ai-output-folder"/);
+  assert.match(shell, /list_ai_workspace_children/);
+  assert.match(backend, /path: Option<String>/);
+  assert.match(shell, /path: button\.dataset\.path/);
+});
+
 test('incremental indexing stores bounded content hashes and keeps metadata through rename, delete, and unavailable roots', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   assert.match(backend, /source_sha256/);
@@ -889,6 +920,22 @@ test('update installation reuses the checked signed update instead of decoding l
   const installHandler = shell.slice(shell.indexOf('async function installUpdate'), shell.indexOf('function bind'));
   assert.match(installHandler, /const update = pendingUpdate \?\? await check/);
   assert.match(config, /latest\.json\?cache=\{\{current_version\}\}/);
+});
+
+test('updater requests an uncompressed response for proxy-safe GitHub downloads', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(shell, /Accept-Encoding': 'identity'/);
+  assert.match(shell, /check\(updaterRequestOptions\)/);
+  assert.match(shell, /\}, updaterRequestOptions\);/);
+  assert.match(shell, /for \(let attempt = 0; attempt < 2; attempt \+= 1\)/);
+});
+
+test('start-task control exposes an immediate in-progress label while local planning starts', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(shell, /isWorking \? '正在启动任务…' : '开始任务'/);
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(styles, /\.task-starting/);
+  assert.match(styles, /\.assistant-workbench \.chat-message\.user/);
 });
 
 test('desktop layout keeps wide pages readable and responsive', async () => {

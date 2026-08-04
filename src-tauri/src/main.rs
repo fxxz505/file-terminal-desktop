@@ -676,6 +676,14 @@ struct AiFileWrite {
     content: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceChildrenInput {
+    workspace_id: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AiOutputTarget {
@@ -2599,6 +2607,128 @@ fn active_model_path(state: &AppState) -> PathBuf {
     selected.unwrap_or_else(|| state.data_dir.join("models").join(MODEL_FILE))
 }
 
+fn runtime_is_ready(runtime_dir: &Path) -> bool {
+    runtime_dir.join("llama-cli.exe").is_file()
+        && runtime_dir.join("llama-cli-impl.dll").is_file()
+        && runtime_dir.join("llama.dll").is_file()
+        && runtime_dir.join("ggml.dll").is_file()
+        && runtime_dir
+            .read_dir()
+            .ok()
+            .into_iter()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| entry.path().file_name().map(|name| name.to_owned()))
+                    .is_some_and(|name| name.to_string_lossy().starts_with("ggml-cpu-"))
+            })
+}
+
+/// Convert a native Windows path into a file URI that can safely be assigned
+/// to an `<img src>` in a generated local HTML file. Raw `D:\\...` paths are
+/// not valid URL values and backslashes are interpreted as escape characters
+/// by the browser. The generated page stays local; no network URL is created.
+fn local_file_uri(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let mut encoded = String::with_capacity(normalized.len() + 8);
+    for byte in normalized.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.' | b'_' | b'/' | b':') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
+
+fn deterministic_image_gallery_advice(question: &str, sources: &[IndexItem]) -> Option<String> {
+    let lower = question.to_ascii_lowercase();
+    let image_task = (question.contains("图片") || lower.contains("image"))
+        && (question.contains("html") || question.contains("网页"));
+    if !image_task {
+        return None;
+    }
+    let images = sources
+        .iter()
+        .filter(|item| item.item_type == "file")
+        .filter(|item| {
+            matches!(
+                Path::new(&item.name)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .as_deref(),
+                Some("jpg" | "jpeg" | "png" | "webp" | "gif")
+            )
+        })
+        .take(64)
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return None;
+    }
+    let json_images = images
+        .iter()
+        .map(|item| serde_json::json!({"path": local_file_uri(&item.path), "sourcePath": item.display_path}))
+        .collect::<Vec<_>>();
+    let mut html = String::from(
+        r#"<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本地图片画廊</title>
+<style>body{font-family:system-ui,"Microsoft YaHei",sans-serif;margin:0;padding:24px;background:#f4f7fb;color:#20324a}main{max-width:960px;margin:auto}img{display:block;width:100%;max-height:70vh;object-fit:contain;border-radius:12px;background:#fff;box-shadow:0 4px 18px #1f3a5a22}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0}.toolbar button{padding:9px 14px;border:1px solid #b9cce1;border-radius:8px;background:#fff;color:#285d91;cursor:pointer}.toolbar button:hover{background:#eaf4ff}</style></head><body><main><h1>图片画廊</h1><div class="toolbar"><button id="prev">上一张</button><strong id="counter"></strong><button id="next">下一张</button></div><img id="gallery" alt="图片预览"><script>const images="#,
+    );
+    html.push_str(&serde_json::to_string(&json_images).ok()?);
+    html.push_str(r#";let i=0;const image=document.querySelector('#gallery'),counter=document.querySelector('#counter');function render(){const item=images[i];image.src=item.path;image.alt=item.sourcePath;counter.textContent=`${i+1} / ${images.length}`;}document.querySelector('#prev').onclick=()=>{i=(i+images.length-1)%images.length;render()};document.querySelector('#next').onclick=()=>{i=(i+1)%images.length;render()};render();</script></main></body></html>"#);
+    Some(serde_json::json!({
+        "answer": "已根据本地图片生成可点击切换图片的 HTML 网页。",
+        "assumptions": ["图片会与 HTML 文件放在同一 AI 工作区，使用相对文件名加载。"],
+        "files": [{"path": "image-gallery.html", "content": html, "purpose": "点击上一张/下一张切换本地图片"}],
+        "steps": ["打开 image-gallery.html", "点击上一张或下一张切换图片"],
+        "uncertainties": []
+    }).to_string())
+}
+
+fn deterministic_image_gallery_from_request(request: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(request).ok()?;
+    let question = value
+        .get("task")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let sources = value.get("sources")?.as_array()?;
+    let mut items = Vec::new();
+    for source in sources {
+        let name = source
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let path = source
+            .get("pathHint")
+            .and_then(|value| value.as_str())
+            .unwrap_or(name);
+        let ext = Path::new(name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif") {
+            items.push(serde_json::json!({"path": local_file_uri(path), "sourcePath": path}));
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let mut html = String::from(
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本地图片画廊</title><style>body{font-family:system-ui,"Microsoft YaHei",sans-serif;margin:0;padding:24px;background:#f4f7fb;color:#20324a}main{max-width:960px;margin:auto}img{display:block;width:100%;max-height:70vh;object-fit:contain;border-radius:12px;background:#fff;box-shadow:0 4px 18px #1f3a5a22}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0}.toolbar button{padding:9px 14px;border:1px solid #b9cce1;border-radius:8px;background:#fff;color:#285d91;cursor:pointer}</style></head><body><main><h1>图片画廊</h1><div class="toolbar"><button id="prev">上一张</button><strong id="counter"></strong><button id="next">下一张</button></div><img id="gallery" alt="图片预览"><script>const images="#,
+    );
+    html.push_str(&serde_json::to_string(&items).ok()?);
+    html.push_str(r#";let i=0;const image=document.querySelector('#gallery'),counter=document.querySelector('#counter');function render(){const item=images[i];image.src=item.path;image.alt=item.sourcePath;counter.textContent=`${i+1} / ${images.length}`;}document.querySelector('#prev').onclick=()=>{i=(i+images.length-1)%images.length;render()};document.querySelector('#next').onclick=()=>{i=(i+1)%images.length;render()};render();</script></main></body></html>"#);
+    Some(serde_json::json!({"answer":"已根据本地图片生成可点击切换图片的 HTML 网页。","assumptions":["图片会与 HTML 文件放在同一 AI 工作区，使用相对文件名加载。"],"files":[{"path":"image-gallery.html","content":html,"purpose":"点击上一张/下一张切换本地图片"}],"steps":["打开 image-gallery.html","点击上一张或下一张切换图片"],"uncertainties":[]}).to_string())
+}
+
 fn runtime_settings(state: &AppState) -> RuntimeSettings {
     state.database.lock().ok().and_then(|connection| connection.query_row("SELECT execution_mode, threads, context_size FROM runtime_settings WHERE id = 1", [], |row| Ok(RuntimeSettings { execution_mode: row.get(0)?, threads: row.get::<_, usize>(1)?, context_size: row.get::<_, usize>(2)? })).ok()).unwrap_or(RuntimeSettings { execution_mode: "auto".into(), threads: 4, context_size: 4096 })
 }
@@ -2663,14 +2793,14 @@ fn save_runtime_settings(
 
 #[tauri::command]
 fn run_environment_acceptance(state: State<'_, AppState>) -> Vec<AcceptanceCheck> {
-    let runtime = state.data_dir.join("runtime").join("llama-cli.exe");
+    let runtime_dir = state.data_dir.join("runtime");
     let model = active_model_path(&state);
     let tools = get_local_tool_status();
     vec![
         AcceptanceCheck {
             id: "runtime".into(),
             label: "llama.cpp 运行时".into(),
-            status: if runtime.is_file() {
+            status: if runtime_is_ready(&runtime_dir) {
                 "passed"
             } else {
                 "failed"
@@ -3009,7 +3139,7 @@ async fn start_embedding_server(
 ) -> Result<(std::process::Child, reqwest::Client, String), String> {
     const EMBEDDING_PORT: u16 = 18081;
     let runtime = llama_server_path(state);
-    if !runtime.is_file() || !Path::new(&model.path).is_file() {
+    if !runtime_is_ready(&state.data_dir.join("runtime")) || !Path::new(&model.path).is_file() {
         return Err("本地 embedding 运行时或模型文件不可用。".to_string());
     }
     let mut child = Command::new(runtime)
@@ -3345,9 +3475,10 @@ fn start_index_worker(app: AppHandle, data_dir: PathBuf) {
 }
 
 fn model_terms(question: &str, state: &AppState) -> Vec<String> {
-    let runtime = state.data_dir.join("runtime").join("llama-cli.exe");
+    let runtime_dir = state.data_dir.join("runtime");
+    let runtime = runtime_dir.join("llama-cli.exe");
     let model = active_model_path(state);
-    if !runtime.is_file() || !model.is_file() {
+    if !runtime_is_ready(&runtime_dir) || !model.is_file() {
         return extract_search_terms(question);
     }
     let prompt = format!(
@@ -3416,9 +3547,10 @@ fn local_agent_reply(
         "本地检索完成，找到 {} 项相关资料。可从下方结果打开真实位置；未向云端发送内容。",
         sources.len()
     );
-    let runtime = state.data_dir.join("runtime").join("llama-cli.exe");
+    let runtime_dir = state.data_dir.join("runtime");
+    let runtime = runtime_dir.join("llama-cli.exe");
     let model = active_model_path(state);
-    if !runtime.is_file() || !model.is_file() {
+    if !runtime_is_ready(&runtime_dir) || !model.is_file() {
         return Ok(fallback);
     }
     let context = recent_local_context(conversation_id, state)?;
@@ -3510,9 +3642,30 @@ async fn run_local_agent_task(
     if prepared.run.status != "awaiting_local_execution" {
         return Err("当前任务不在等待本地生成阶段。".to_string());
     }
-    let runtime = state.data_dir.join("runtime").join("llama-cli.exe");
+    let runtime_dir = state.data_dir.join("runtime");
+    let runtime = runtime_dir.join("llama-cli.exe");
     let model = active_model_path(&state);
-    if !runtime.is_file() || !model.is_file() {
+    if !runtime_is_ready(&runtime_dir) || !model.is_file() {
+        if let Some(advice) = deterministic_image_gallery_from_request(&prepared.local_request_body)
+        {
+            update_agent_run_status(
+                &run_id,
+                "awaiting_approval",
+                "本地图片网页方案已生成；请批准后写入受控工作区。",
+                &state,
+            )?;
+            let mut runs = state
+                .prepared_runs
+                .lock()
+                .map_err(|_| "任务状态被占用。".to_string())?;
+            let run = runs
+                .get_mut(&run_id)
+                .ok_or_else(|| "本地任务已失效。".to_string())?;
+            run.run.status = "awaiting_approval".to_string();
+            run.run.advice = Some(advice);
+            run.run.feedback = "已根据已接入的本地图片生成网页方案；批准后才会写入。".to_string();
+            return Ok(run.run.clone());
+        }
         update_agent_run_status(
             &run_id,
             "needs_cloud_assistance",
@@ -4170,8 +4323,7 @@ fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
     let runtime_dir = state.data_dir.join("runtime");
     RuntimeStatus {
         model_installed: model_path.is_file(),
-        runtime_installed: runtime_dir.join("llama-server.exe").is_file()
-            || runtime_dir.join("llama-cli.exe").is_file(),
+        runtime_installed: runtime_is_ready(&runtime_dir),
         model_path: model_path.display().to_string(),
         active_model_name: model_path
             .file_name()
@@ -4521,17 +4673,18 @@ async fn download_runtime(
         let Some(file_name) = Path::new(entry.name()).file_name() else {
             continue;
         };
-        if !matches!(
-            file_name.to_string_lossy().as_ref(),
-            "llama-server.exe" | "llama-cli.exe"
-        ) {
+        let file_name = file_name.to_string_lossy().to_ascii_lowercase();
+        // llama.cpp Windows bundles keep the implementation and ggml DLLs
+        // beside the CLI. Copy the complete executable dependency set; copying
+        // only llama-cli.exe starts but immediately fails with a missing DLL.
+        if !(file_name.ends_with(".exe") || file_name.ends_with(".dll")) {
             continue;
         }
-        let output = runtime_dir.join(file_name);
+        let output = runtime_dir.join(&file_name);
         let mut writer = File::create(output).map_err(|error| error.to_string())?;
         std::io::copy(&mut entry, &mut writer).map_err(|error| error.to_string())?;
     }
-    if !runtime_dir.join(manifest.executable).is_file() {
+    if !runtime_is_ready(&runtime_dir) {
         return Err("已校验的运行时压缩包缺少预期可执行文件。".to_string());
     }
     let _ = fs::remove_file(archive);
@@ -5151,6 +5304,50 @@ fn workspace_root(workspace_id: &str, state: &AppState) -> Result<PathBuf, Strin
             .map_err(|_| "AI 工作区不存在或已失效。".to_string())?
     };
     fs::canonicalize(root_value).map_err(|_| "AI 工作区已无法访问。".to_string())
+}
+
+#[tauri::command]
+fn list_ai_workspace_children(
+    input: WorkspaceChildrenInput,
+    state: State<'_, AppState>,
+) -> Result<Vec<FolderEntry>, String> {
+    let workspace = workspace_root(&input.workspace_id, &state)?;
+    let root = match input.path.filter(|path| !path.trim().is_empty()) {
+        None => workspace.clone(),
+        Some(path) => {
+            let requested = PathBuf::from(&path);
+            let candidate = if requested.is_absolute() {
+                fs::canonicalize(requested).map_err(|_| "AI 输出子文件夹无法访问。".to_string())?
+            } else {
+                let relative = safe_relative_path(&path)?;
+                fs::canonicalize(workspace.join(relative))
+                    .map_err(|_| "AI 输出子文件夹无法访问。".to_string())?
+            };
+            if !candidate.starts_with(&workspace) || !candidate.is_dir() {
+                return Err("AI 输出子文件夹超出当前工作区。".to_string());
+            }
+            candidate
+        }
+    };
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let metadata = entry.metadata().map_err(|error| error.to_string())?;
+        let item_type = if metadata.is_dir() { "folder" } else { "file" };
+        entries.push(FolderEntry {
+            id: format!("workspace:{}", path.display()),
+            name: entry.file_name().to_string_lossy().to_string(),
+            path: path.display().to_string(),
+            display_path: display_path(&path),
+            item_type: item_type.to_string(),
+            note: "AI 输出文件".to_string(),
+            tags: vec!["AI 输出".to_string()],
+            cloud_policy: CloudPolicy::LocalOnly,
+        });
+    }
+    entries.sort_by_key(|entry| (entry.item_type != "folder", entry.name.to_ascii_lowercase()));
+    Ok(entries)
 }
 
 fn extract_generated_files(advice: &str) -> Vec<GeneratedFile> {
@@ -8819,6 +9016,7 @@ fn main() {
             list_agent_events,
             get_agent_evidence_report,
             prepare_ai_output,
+            list_ai_workspace_children,
             write_ai_file,
             apply_agent_advice,
             auto_apply_low_risk_agent_advice,

@@ -77,6 +77,16 @@ let updateProgress: DownloadProgress | null = null;
 let updateCheckState: UpdateCheckState = 'idle';
 let updateStatus = '尚未检查更新';
 let pendingUpdate: Update | null = null;
+// GitHub release assets may be served through a proxy with an invalid compressed
+// response. Asking for an identity response keeps reqwest from failing while
+// decoding the body; the updater still verifies the downloaded signature.
+const updaterRequestOptions = {
+  timeout: 30000,
+  headers: {
+    Accept: 'application/json, application/octet-stream',
+    'Accept-Encoding': 'identity',
+  },
+};
 let contextTarget: MetadataTarget | null = null;
 let contextPosition = { x: 0, y: 0 };
 let metadataEditor: MetadataTarget | null = null;
@@ -351,6 +361,7 @@ function defaultCloudDisplayName(baseUrl: string) {
 
 function assistantPanel() {
   const outputText = aiOutputTarget ? `本次工作区：${escapeHtml(aiOutputTarget.displayPath)}` : aiOutputFolder ? `下次写入：${escapeHtml(displayPath(aiOutputFolder))}` : '未指定时保存到软件的 AI Outputs 文件夹';
+  const workspaceActions = aiOutputTarget ? `<div class="workspace-output-actions"><button class="quiet" id="open-ai-output-folder">在软件中查看输出文件夹</button><button class="quiet" id="reveal-ai-output-folder">在资源管理器中打开</button></div>` : '';
   const cloudEscalation = agentRun?.status === 'needs_cloud_assistance'
     ? agentRun.route === 'cloud_auto'
       ? `<button class="quiet" id="retry-agent-run" ${isWorking ? 'disabled' : ''}>请求云端协作</button>`
@@ -370,7 +381,9 @@ function assistantPanel() {
   const sensitiveReport = sensitiveFindings.length ? `<ul class="audit-list">${sensitiveFindings.map(item => `<li><b>${escapeHtml(item.category)}</b> · ${escapeHtml(item.name)} · ${item.matchCount} 处 <small>${escapeHtml(item.displayPath)}</small></li>`).join('')}</ul>` : '<p>尚未扫描，或未在已提取正文中发现内置规则匹配项。</p>';
   const auditReport = auditEntries.length ? `<ul class="audit-list">${auditEntries.map(item => `<li><b>${escapeHtml(item.targetType)}</b> · ${escapeHtml(item.action)} · ${escapeHtml(item.createdAt)} <small>${escapeHtml(item.oldPolicy ?? '-')} → ${escapeHtml(item.newPolicy ?? '-')}</small></li>`).join('')}</ul>` : '<p>尚未加载审计记录。</p>';
   const rulesWarning = formWarning?.target === 'rules' ? `<p class="form-warning" role="alert">${escapeHtml(formWarning.message)}</p>` : '';
-  return `<section class="single-panel panel"><header><div><small>LOCAL / CLOUD COLLABORATION</small><h2>AI 协作台</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><div class="assistant-page"><div class="assistant-intro"><span>${icons.spark}</span><div><h1>把任务交给 AI 协作</h1><p>本地 AI 先检索、理解和生成；能力不足时按云端权限策略协作，所有写入均在受控工作区内。</p></div></div><form id="ask-form"><label>你想完成什么？<div class="ask-row"><input id="question" maxlength="180" placeholder="例如：使用已接入图片制作可点击切换的 HTML 网页"><button ${isWorking ? 'disabled' : ''} type="submit">${icons.spark} 开始任务</button></div></label></form><section class="ai-output"><div><b>AI 写入位置</b><span>${outputText}</span></div><button class="quiet" id="choose-ai-output">选择 AI 写入文件夹</button><button class="quiet" id="create-ai-workspace">创建 AI 工作区</button></section>${runFeedback}<section class="assistant-workbench"><aside class="conversation-history"><header><b>任务与 AI 对话</b><small>${conversations.length} 段</small></header>${history}</aside><section class="conversation-messages"><header><div><b>当前任务对话</b><span>本地分析、云端协作与执行状态都保存在本机</span></div></header>${messages}</section></section><section class="sensitive-rules"><header><div><b>本地敏感规则</b><span>规则仅在准备云端请求时生效；无匹配的规则会阻止外发。</span></div></header>${rulesWarning}<form id="sensitive-rule-form"><input id="sensitive-rule-name" maxlength="80" placeholder="规则名称，例如：客户编号"><input id="sensitive-rule-pattern" maxlength="500" placeholder="正则表达式，例如：CLIENT-[0-9]+"><button class="quiet" type="submit">添加规则</button></form>${ruleList}</section><section class="governance-controls"><b>本地数据治理</b><span>导出不包含 API Key、云端原始请求或原始受限资料。</span><div class="control-cluster"><button class="quiet" id="create-encrypted-backup">创建加密备份</button><button class="quiet" id="restore-encrypted-backup">选择加密备份恢复</button><button class="quiet" id="scan-sensitive-index">生成敏感扫描报告</button><button class="quiet" id="load-metadata-audit">查看元数据审计</button><button class="quiet" id="export-local-governance">导出治理摘要</button><button class="quiet danger" id="clear-local-data" data-clear-scope="conversations">清理对话</button><button class="quiet danger" id="clear-local-data" data-clear-scope="audit">清理审计</button><button class="quiet danger" id="clear-local-data" data-clear-scope="rules">清理规则</button></div>${backup}${sensitiveReport}${auditReport}${governance}</section>${resultRows('完成本地检索后会显示命中资料；受限资料绝不会外发。')}</div></section>`;
+  const taskButtonLabel = isWorking ? '正在启动任务…' : '开始任务';
+  const taskStatus = isWorking ? '<p class="task-starting" role="status"><span></span>正在创建本地任务、检索素材并准备受控工作区…</p>' : '';
+  return `<section class="single-panel panel"><header><div><small>LOCAL / CLOUD COLLABORATION</small><h2>AI 协作台</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><div class="assistant-page"><div class="assistant-intro"><span>${icons.spark}</span><div><h1>把任务交给 AI 协作</h1><p>本地 AI 先检索、理解和生成；能力不足时按云端权限策略协作，所有写入均在受控工作区内。</p></div></div><form id="ask-form"><label>你想完成什么？<div class="ask-row"><input id="question" maxlength="180" placeholder="例如：使用已接入图片制作可点击切换的 HTML 网页"><button ${isWorking ? 'disabled' : ''} type="submit">${icons.spark} ${taskButtonLabel}</button></div></label>${taskStatus}</form><section class="ai-output"><div><b>AI 写入位置</b><span>${outputText}</span></div><button class="quiet" id="choose-ai-output">选择 AI 写入文件夹</button><button class="quiet" id="create-ai-workspace">创建 AI 工作区</button>${workspaceActions}</section>${runFeedback}<section class="assistant-workbench"><aside class="conversation-history"><header><b>任务与 AI 对话</b><small>${conversations.length} 段</small></header>${history}</aside><section class="conversation-messages"><header><div><b>当前任务对话</b><span>本地分析、云端协作与执行状态都保存在本机</span></div></header>${messages}</section></section><section class="sensitive-rules"><header><div><b>本地敏感规则</b><span>规则仅在准备云端请求时生效；无匹配的规则会阻止外发。</span></div></header>${rulesWarning}<form id="sensitive-rule-form"><input id="sensitive-rule-name" maxlength="80" placeholder="规则名称，例如：客户编号"><input id="sensitive-rule-pattern" maxlength="500" placeholder="正则表达式，例如：CLIENT-[0-9]+"><button class="quiet" type="submit">添加规则</button></form>${ruleList}</section><section class="governance-controls"><b>本地数据治理</b><span>导出不包含 API Key、云端原始请求或原始受限资料。</span><div class="control-cluster"><button class="quiet" id="create-encrypted-backup">创建加密备份</button><button class="quiet" id="restore-encrypted-backup">选择加密备份恢复</button><button class="quiet" id="scan-sensitive-index">生成敏感扫描报告</button><button class="quiet" id="load-metadata-audit">查看元数据审计</button><button class="quiet" id="export-local-governance">导出治理摘要</button><button class="quiet danger" id="clear-local-data" data-clear-scope="conversations">清理对话</button><button class="quiet danger" id="clear-local-data" data-clear-scope="audit">清理审计</button><button class="quiet danger" id="clear-local-data" data-clear-scope="rules">清理规则</button></div>${backup}${sensitiveReport}${auditReport}${governance}</section>${resultRows('完成本地检索后会显示命中资料；受限资料绝不会外发。')}</div></section>`;
 }
 
 function folderList() {
@@ -472,8 +485,33 @@ async function startFreshDatabase() {
 async function loadFolderRefs() { folderRefs = await invoke<FolderRef[]>('list_folder_refs'); }
 async function openFolder(folderId: string, path?: string) { const folder = folderRefs.find(item => item.id === folderId); if (!folder) return; activeFolder = folder; browserPath = path ?? folder.path; folderEntries = await invoke<FolderEntry[]>('list_folder_children', { folderId, path: browserPath }); render(); }
 async function navigateFolder(path: string) { if (!activeFolder) return; browserHistory.push(browserPath ?? activeFolder.path); await openFolder(activeFolder.id, path); }
-async function browserBack() { if (!activeFolder || !browserHistory.length) return; const previous = browserHistory.pop(); await openFolder(activeFolder.id, previous); }
+async function browserBack() {
+  if (!activeFolder || !browserHistory.length) return;
+  const previous = browserHistory.pop();
+  if (aiOutputTarget && activeFolder.id === aiOutputTarget.workspaceId) {
+    browserPath = previous ?? aiOutputTarget.path;
+    folderEntries = await invoke<FolderEntry[]>('list_ai_workspace_children', { input: { workspaceId: aiOutputTarget.workspaceId, path: browserPath } });
+    render();
+    return;
+  }
+  await openFolder(activeFolder.id, previous);
+}
 async function revealFolder() { if (!activeFolder) return; try { await invoke('reveal_in_explorer', { path: browserPath ?? activeFolder.path }); } catch (reason) { error = `无法打开资源管理器：${String(reason)}`; render(); } }
+async function openAiOutputFolder() {
+  if (!aiOutputTarget) return;
+  try {
+    activeFolder = { id: aiOutputTarget.workspaceId, name: 'AI 输出工作区', path: aiOutputTarget.path, displayPath: aiOutputTarget.displayPath, note: 'AI 输出文件', tags: ['AI 输出'], cloudPolicy: 'local_only', itemCount: 0, sourceStatus: 'available' };
+    browserPath = aiOutputTarget.path;
+    browserHistory = [];
+    folderEntries = await invoke<FolderEntry[]>('list_ai_workspace_children', { input: { workspaceId: aiOutputTarget.workspaceId } });
+  } catch (reason) { error = `无法查看 AI 输出文件夹：${String(reason)}`; }
+  render();
+}
+async function revealAiOutputFolder() {
+  if (!aiOutputTarget) return;
+  try { await invoke('reveal_in_explorer', { path: aiOutputTarget.path }); }
+  catch (reason) { error = `无法打开 AI 输出文件夹：${String(reason)}`; render(); }
+}
 async function importFolderPath(path: string) {
   isWorking = true; error = ''; render();
   try { const indexed = await invoke<number>('import_folder', { input: { path, note: '', tags: [] } }); await loadFolderRefs(); window.alert(`已在原位置接入文件夹，并建立 ${indexed} 项本地索引。`); } catch (reason) { error = String(reason); } finally { isWorking = false; render(); }
@@ -644,13 +682,18 @@ function cloudProbeInput() {
 }
 async function runLocalAgentTask() {
   if (!agentRun) return;
-  isWorking = true; error = ''; render();
+  isWorking = true; error = ''; workspaceAction = null; render();
   try {
     await ensureAiWorkspace();
+    agentRun = { ...agentRun, status: 'running_local', feedback: '正在启动本地模型并分析已接入素材；不会写入文件。' };
+    render();
     agentRun = await invoke<AgentRun>('run_local_agent_task', { runId: agentRun.id });
     await loadConversationHistory();
     agentEvents = await invoke<AgentEvent[]>('list_agent_events', { input: { runId: agentRun.id } });
-  } catch (reason) { error = String(reason); }
+  } catch (reason) {
+    error = `本地任务未完成：${String(reason)}。请在“设置 → 本地 AI”确认 llama.cpp 运行时和模型已完整安装。`;
+    if (agentRun) agentRun = { ...agentRun, status: 'failed', feedback: error };
+  }
   finally { isWorking = false; render(); }
 }
 async function saveCloudProvider(event: SubmitEvent) {
@@ -735,7 +778,7 @@ async function checkForUpdate(showResult = false) {
     let lastReason: unknown;
     for (let attempts = 0; attempts < 3; attempts += 1) {
       try {
-        update = await check({ timeout: 30000 });
+        update = await check(updaterRequestOptions);
         break;
       } catch (reason) {
         lastReason = reason;
@@ -764,19 +807,30 @@ async function installUpdate() {
   updateProgress = { kind: 'runtime', completed: 0 };
   render();
   try {
-    const update = pendingUpdate ?? await check({ timeout: 30000 });
+    const update = pendingUpdate ?? await check(updaterRequestOptions);
     if (!update) {
       updateVersion = '';
       updateCheckState = 'success';
       return;
     }
-    let total = 0;
-    let completed = 0;
-    await update.downloadAndInstall((event: DownloadEvent) => {
-      if (event.event === 'Started') total = event.data.contentLength ?? 0;
-      if (event.event === 'Progress') completed += event.data.chunkLength;
-      updateProgress = { kind: 'runtime', completed, total: total || undefined };
-    }, { timeout: 30000 });
+    let lastDownloadError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let total = 0;
+      let completed = 0;
+      try {
+        await update.downloadAndInstall((event: DownloadEvent) => {
+          if (event.event === 'Started') total = event.data.contentLength ?? 0;
+          if (event.event === 'Progress') completed += event.data.chunkLength;
+          updateProgress = { kind: 'runtime', completed, total: total || undefined };
+        }, updaterRequestOptions);
+        lastDownloadError = undefined;
+        break;
+      } catch (reason) {
+        lastDownloadError = reason;
+        if (attempt === 0) await new Promise(resolve => window.setTimeout(resolve, 1000));
+      }
+    }
+    if (lastDownloadError) throw lastDownloadError;
     pendingUpdate = null;
     await relaunch();
   } catch (reason) {
@@ -796,7 +850,15 @@ function bind() {
   document.querySelector<HTMLFormElement>('#metadata-editor-form')?.addEventListener('submit', saveMetadataEditor);
   document.querySelector('#cancel-metadata-editor')?.addEventListener('click', () => { metadataEditor = null; metadataEditorAction = null; render(); });
   document.querySelectorAll<HTMLElement>('.folder-ref-button').forEach(button => button.addEventListener('click', () => openFolder(button.dataset.folderId ?? '').catch(reason => { error = `无法打开文件夹：${String(reason)}`; render(); })));
-  document.querySelectorAll<HTMLElement>('.browser-folder').forEach(button => button.addEventListener('click', () => navigateFolder(button.dataset.path ?? '').catch(reason => { error = `无法读取文件夹：${String(reason)}`; render(); })));
+  document.querySelectorAll<HTMLElement>('.browser-folder').forEach(button => button.addEventListener('click', () => {
+    const outputWorkspace = activeFolder && aiOutputTarget && activeFolder.id === aiOutputTarget.workspaceId ? aiOutputTarget : null;
+    if (outputWorkspace && activeFolder) {
+      browserHistory.push(browserPath ?? activeFolder.path);
+      invoke<FolderEntry[]>('list_ai_workspace_children', { input: { workspaceId: outputWorkspace.workspaceId, path: button.dataset.path ?? outputWorkspace.path } })
+        .then(entries => { browserPath = button.dataset.path ?? outputWorkspace.path; folderEntries = entries; render(); })
+        .catch(reason => { error = `无法读取 AI 输出文件夹：${String(reason)}`; render(); });
+    } else navigateFolder(button.dataset.path ?? '').catch(reason => { error = `无法读取文件夹：${String(reason)}`; render(); });
+  }));
   document.querySelector('#browser-back')?.addEventListener('click', () => browserBack().catch(reason => { error = `无法返回上级：${String(reason)}`; render(); }));
   document.querySelector('#browser-reveal')?.addEventListener('click', revealFolder);
   document.querySelector('#close-browser')?.addEventListener('click', () => { activeFolder = null; browserPath = null; browserHistory = []; folderEntries = []; render(); });
@@ -845,6 +907,8 @@ function bind() {
   document.querySelector('#install-update')?.addEventListener('click', installUpdate);
   document.querySelector('#choose-ai-output')?.addEventListener('click', chooseAiOutputFolder);
   document.querySelector('#create-ai-workspace')?.addEventListener('click', createAiWorkspace);
+  document.querySelector('#open-ai-output-folder')?.addEventListener('click', openAiOutputFolder);
+  document.querySelector('#reveal-ai-output-folder')?.addEventListener('click', revealAiOutputFolder);
   document.querySelector<HTMLFormElement>('#cloud-provider-form')?.addEventListener('submit', saveCloudProvider);
   document.querySelector('#test-cloud-connection')?.addEventListener('click', testCloudConnection);
   document.querySelector('#fetch-cloud-models')?.addEventListener('click', fetchCloudModels);
