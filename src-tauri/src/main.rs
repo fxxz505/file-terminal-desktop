@@ -983,6 +983,7 @@ struct GovernanceExport {
 struct PreparedCloudRun {
     run: AgentRun,
     request_body: String,
+    local_request_body: String,
     last_diagnostic: Option<String>,
     repair_attempts: usize,
 }
@@ -3492,6 +3493,147 @@ fn local_agent_reply(
     } else {
         Ok(answer)
     }
+}
+
+#[tauri::command]
+async fn run_local_agent_task(
+    run_id: String,
+    state: State<'_, AppState>,
+) -> Result<AgentRun, String> {
+    let prepared = state
+        .prepared_runs
+        .lock()
+        .map_err(|_| "任务状态被占用。".to_string())?
+        .get(&run_id)
+        .cloned()
+        .ok_or_else(|| "本地任务已失效；请重新发起。".to_string())?;
+    if prepared.run.status != "awaiting_local_execution" {
+        return Err("当前任务不在等待本地生成阶段。".to_string());
+    }
+    let runtime = state.data_dir.join("runtime").join("llama-cli.exe");
+    let model = active_model_path(&state);
+    if !runtime.is_file() || !model.is_file() {
+        update_agent_run_status(
+            &run_id,
+            "needs_cloud_assistance",
+            "本地模型未就绪，无法生成工作区文件；可在设置启用云端协作后继续。",
+            &state,
+        )?;
+        let mut runs = state
+            .prepared_runs
+            .lock()
+            .map_err(|_| "任务状态被占用。".to_string())?;
+        let run = runs
+            .get_mut(&run_id)
+            .ok_or_else(|| "本地任务已失效。".to_string())?;
+        run.run.status = "needs_cloud_assistance".to_string();
+        run.run.feedback = "本地模型未就绪，等待云端协作。".to_string();
+        return Ok(run.run.clone());
+    }
+    update_agent_run_status(
+        &run_id,
+        "running_local",
+        "本地 AI 正在根据已接入素材生成受控工作区方案。",
+        &state,
+    )?;
+    let settings = runtime_settings(&state);
+    let mut command = Command::new(runtime);
+    command
+        .arg("-m")
+        .arg(model)
+        .arg("-p")
+        .arg(&prepared.local_request_body)
+        .arg("-n")
+        .arg("1400")
+        .arg("--temp")
+        .arg("0.2")
+        .arg("--threads")
+        .arg(settings.threads.to_string())
+        .arg("--ctx-size")
+        .arg(settings.context_size.to_string())
+        .arg("--no-display-prompt")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if settings.execution_mode == "cpu" {
+        command.arg("-ngl").arg("0");
+    }
+    let output = tokio::task::spawn_blocking(move || {
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("无法启动本地 AI：{error}"))?;
+        let started = SystemTime::now();
+        loop {
+            if child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return child.wait_with_output().map_err(|error| error.to_string());
+            }
+            if started.elapsed().unwrap_or_default() > Duration::from_secs(90) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("本地 AI 生成超时，未写入任何文件。".to_string());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    })
+    .await
+    .map_err(|_| "本地 AI 任务线程异常。".to_string())??;
+    if !output.status.success() {
+        return Err("本地 AI 未正常完成生成，未写入任何文件。".to_string());
+    }
+    let advice = String::from_utf8_lossy(&output.stdout)
+        .chars()
+        .take(96_000)
+        .collect::<String>();
+    let files = extract_generated_files(&advice);
+    let (status, feedback) = if files.is_empty() {
+        (
+            "needs_cloud_assistance",
+            "本地 AI 未返回可验证的 files JSON；未写入文件，可继续请求云端协作。",
+        )
+    } else {
+        (
+            "awaiting_approval",
+            "本地 AI 已生成可审阅的工作区文件方案；批准后才会写入，不会执行系统命令。",
+        )
+    };
+    let cloud_advice = parse_cloud_advice(&advice);
+    let mut run = prepared.run;
+    run.status = status.to_string();
+    run.advice = Some(advice.clone());
+    run.cloud_advice = Some(cloud_advice);
+    run.feedback = feedback.to_string();
+    update_agent_run_status(&run_id, status, feedback, &state)?;
+    if let Some(conversation_id) = run.conversation_id.clone() {
+        let _ = save_conversation_message(
+            ConversationMessageInput {
+                conversation_id: Some(conversation_id),
+                title: None,
+                provider_id: None,
+                role: "assistant".to_string(),
+                source: "local".to_string(),
+                content: advice,
+            },
+            &state,
+        )?;
+    }
+    state
+        .prepared_runs
+        .lock()
+        .map_err(|_| "任务状态被占用。".to_string())?
+        .insert(
+            run.id.clone(),
+            PreparedCloudRun {
+                run: run.clone(),
+                request_body: prepared.request_body,
+                local_request_body: prepared.local_request_body,
+                last_diagnostic: prepared.last_diagnostic,
+                repair_attempts: prepared.repair_attempts,
+            },
+        );
+    Ok(run)
 }
 
 fn recent_cloud_context(
@@ -7040,6 +7182,24 @@ fn prepare_agent_run(
     if serialized.len() > MAX_CLOUD_REQUEST_BYTES {
         return Err("脱敏后的云端请求包超过安全大小限制。".to_string());
     }
+    let local_sources = sources
+        .iter()
+        .take(12)
+        .map(|source| {
+            serde_json::json!({
+                "name": source.name,
+                "pathHint": source.display_path,
+                "note": source.note,
+                "tags": source.tags,
+                "restricted": source.cloud_policy != CloudPolicy::CloudAllowed,
+            })
+        })
+        .collect::<Vec<_>>();
+    let local_request_body = serde_json::to_string(&serde_json::json!({
+        "task": question,
+        "sources": local_sources,
+        "instructions": "你是本地受控编码助手。仅返回 JSON 对象，字段为 answer、assumptions、files、steps、uncertainties。files 只能包含 pathHint（相对路径）、content、purpose。根据任务生成可直接写入的静态 HTML/CSS/JS 或项目文件；不得调用命令、不得联网、不得读取未列出的文件、不得返回绝对路径。"
+    })).map_err(|error| error.to_string())?;
     let provider = cloud_config(&state)?;
     let complex = is_complex_task(
         question,
@@ -7053,6 +7213,31 @@ fn prepare_agent_run(
             "local_complete",
             false,
             None,
+        )
+    } else if get_runtime_status(state.clone()).model_installed {
+        let provider_id = provider
+            .as_ref()
+            .filter(|config| config.configured)
+            .map(|config| config.provider_id.clone());
+        let route = if provider
+            .as_ref()
+            .is_some_and(|config| config.configured && config.auto_collaboration)
+        {
+            "cloud_auto"
+        } else if provider
+            .as_ref()
+            .is_some_and(|config| config.configured && config.review_each_request)
+        {
+            "cloud_needs_confirmation"
+        } else {
+            "local"
+        };
+        (
+            route,
+            "复杂任务先由本地 AI 基于已接入素材生成可审阅工作区方案；生成不足时再协作。",
+            "awaiting_local_execution",
+            false,
+            provider_id,
         )
     } else if ask_count > 0
         || provider
@@ -7100,7 +7285,9 @@ fn prepare_agent_run(
         status: status.into(),
         package_preview: safe_run_preview(allowed.len(), restricted, redactions),
         request_preview: serialized.clone(),
-        feedback: if route == "local" {
+        feedback: if status == "awaiting_local_execution" {
+            "本地 AI 即将生成受控工作区方案；只会提出相对路径文件，写入前仍需批准。".into()
+        } else if route == "local" {
             "已完成本地检索；未向云端发送内容。".into()
         } else {
             "已生成脱敏请求包，尚未执行云端写入或外部操作。".into()
@@ -7121,6 +7308,7 @@ fn prepare_agent_run(
             PreparedCloudRun {
                 run: run.clone(),
                 request_body: serialized,
+                local_request_body,
                 last_diagnostic: None,
                 repair_attempts: 0,
             },
@@ -7255,6 +7443,7 @@ async fn run_cloud_collaboration(
             PreparedCloudRun {
                 run: run.clone(),
                 request_body: prepared.request_body,
+                local_request_body: prepared.local_request_body,
                 last_diagnostic: prepared.last_diagnostic,
                 repair_attempts: prepared.repair_attempts,
             },
@@ -8621,6 +8810,7 @@ fn main() {
             get_agent_preferences,
             save_agent_preferences,
             prepare_agent_run,
+            run_local_agent_task,
             run_cloud_collaboration,
             cancel_agent_run,
             approve_agent_step,

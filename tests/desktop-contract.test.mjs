@@ -746,15 +746,55 @@ test('agent can modify an existing workspace file only after an explicit recover
   assert.match(shell, /allowExistingEdits: true/);
 });
 
-test('sidebar separates AI conversation history from assistant configuration and places warnings above forms', async () => {
+test('assistant workbench combines the task timeline and AI conversation while cloud configuration lives in settings', async () => {
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
-  assert.match(shell, /data-view="conversations"/);
-  assert.match(shell, /AI 对话/);
-  assert.match(shell, /conversationPage\(/);
+  assert.match(shell, /AI 协作台/);
+  assert.match(shell, /assistant-workbench/);
+  assert.match(shell, /cloudProviderSettings\(\)/);
+  assert.match(shell, /云端 AI 配置/);
+  assert.doesNotMatch(shell, /data-testid="nav-conversations"/);
+  assert.doesNotMatch(shell, /data-testid="nav-tasks"/);
   assert.match(shell, /form-warning/);
   assert.match(styles, /\.form-warning/);
   assert.match(styles, /\.control-cluster/);
+});
+
+test('metadata editing keeps values in an in-app editor and commits optimistically without a full status refresh', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(shell, /let metadataEditor:/);
+  assert.match(shell, /metadata-editor/);
+  assert.match(shell, /saveMetadataEditor/);
+  assert.match(shell, /updateMetadataOptimistically/);
+  const editHandler = shell.slice(shell.indexOf('async function editMetadata'), shell.indexOf('async function chooseAiOutputFolder'));
+  assert.doesNotMatch(editHandler, /refreshStatus\(\)/);
+  assert.doesNotMatch(editHandler, /window\.prompt/);
+});
+
+test('complex local tasks generate reviewed workspace files before escalating to cloud collaboration', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  assert.match(backend, /async fn run_local_agent_task/);
+  assert.match(backend, /running_local/);
+  assert.match(backend, /awaiting_approval/);
+  assert.match(backend, /needs_cloud_assistance/);
+  assert.match(backend, /仅返回 JSON/);
+  assert.match(shell, /run_local_agent_task/);
+  assert.match(shell, /runLocalAgentTask/);
+  assert.match(shell, /awaiting_local_execution/);
+});
+
+test('cloud escalation starts automatically only for a configured automatic route and otherwise guides users to configuration', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  assert.match(shell, /agentRun\.route === 'cloud_auto' && \['prepared', 'needs_cloud_assistance'\]\.includes\(agentRun\.status\)/);
+  assert.match(shell, /const cloudEscalation/);
+  assert.match(shell, /data-view="settings">前往云端 AI 配置/);
+});
+
+test('search result metadata uses explicit grid rows so indexing and cloud labels cannot overlap', async () => {
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(styles, /\.result > \.index-state\{grid-column:2;grid-row:3/);
+  assert.match(styles, /\.result > \.metadata-line\{grid-column:2\/4;grid-row:4/);
 });
 
 test('desktop refuses to replace an unreadable local database with an empty database', async () => {
@@ -897,7 +937,7 @@ test('watcher failures fall back to bounded scans and real WebView automation ha
   assert.match(backend, /FILE_TERMINAL_TEST_DATA_DIR/);
   assert.match(shell, /data-testid="nav-search"/);
   assert.match(shell, /data-testid="nav-diagnostics"/);
-  assert.match(shell, /data-testid="nav-tasks"/);
+  assert.match(shell, /assistant-workbench/);
   assert.match(e2e, /tauri:options/);
   assert.match(e2e, /TAURI_E2E_APP/);
 });

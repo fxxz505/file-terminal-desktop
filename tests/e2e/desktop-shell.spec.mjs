@@ -46,8 +46,8 @@ test('navigates across core desktop views', async ({ page }) => {
   await expect(page.locator('[data-testid="search-question"]')).toBeVisible();
   await page.locator('[data-testid="nav-diagnostics"]').click();
   await expect(page.locator('.diagnostics-page')).toBeVisible();
-  await page.locator('[data-testid="nav-tasks"]').click();
-  await expect(page.locator('[data-testid="task-list"]')).toBeVisible();
+  await page.locator('[data-testid="nav-assistant"]').click();
+  await expect(page.locator('.assistant-workbench')).toBeVisible();
   await page.locator('[data-testid="nav-settings"]').click();
   await expect(page.locator('[data-testid="nav-settings"]')).toHaveClass(/active/);
 });

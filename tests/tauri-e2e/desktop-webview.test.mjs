@@ -100,8 +100,8 @@ test('real Tauri WebView navigates between local search, diagnostics, and task c
   await find('[data-testid="search-question"]');
   await click('[data-testid="nav-diagnostics"]');
   await find('.diagnostics-page');
-  await click('[data-testid="nav-tasks"]');
-  await find('[data-testid="task-list"]');
+  await click('[data-testid="nav-assistant"]');
+  await find('.assistant-workbench');
 
   await mkdir(artifacts, { recursive: true });
   const screenshot = await request(`${base}/screenshot`, {}, sessionBaseUrl);
