@@ -758,6 +758,22 @@ struct CloudProviderConfigInput {
     api_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudConnectionProbeInput {
+    provider_id: Option<String>,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudConnectionProbeResult {
+    endpoint: String,
+    latency_ms: u128,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CloudModel {
@@ -5841,34 +5857,97 @@ fn chat_endpoint(base_url: &str) -> String {
     }
 }
 
-#[tauri::command]
-async fn fetch_cloud_models(
-    input: ProviderIdInput,
-    state: State<'_, AppState>,
-) -> Result<Vec<CloudModel>, String> {
-    let config = cloud_provider_by_id(input.provider_id.trim(), &state)?;
-    let api_key = cloud_key_entry(&config.provider_id)?
+fn cloud_http_error_message(status: reqwest::StatusCode, operation: &str) -> String {
+    match status.as_u16() {
+        401 | 403 => format!("{operation}失败：API Key 无效、已过期或没有访问权限。"),
+        404 => format!("{operation}失败：未找到兼容接口。请检查基础地址；通常填写服务根地址或以 /v1 结尾的地址即可。"),
+        429 => format!("{operation}失败：上游服务限流或额度不足，请稍后重试或检查账户配额。"),
+        500..=599 => format!("{operation}失败：上游服务暂时不可用（HTTP {status}），请稍后重试。"),
+        _ => format!("{operation}失败：上游服务返回 HTTP {status}。"),
+    }
+}
+
+fn cloud_network_error_message(operation: &str) -> String {
+    format!("{operation}失败：无法连接到上游服务。请检查网络、代理、TLS 证书和基础地址。")
+}
+
+fn probe_api_key(input: &CloudConnectionProbeInput) -> Result<String, String> {
+    if let Some(api_key) = input
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(api_key.to_string());
+    }
+    let provider_id = input
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "请输入 API Key；保存过的供应商可留空后再次测试。".to_string())?;
+    cloud_key_entry(provider_id)?
         .get_password()
-        .map_err(|_| "请先保存该提供商的 API 密钥。".to_string())?;
+        .map_err(|_| "未找到已保存的 API Key，请输入后再测试。".to_string())
+}
+
+#[tauri::command]
+async fn test_cloud_connection(
+    input: CloudConnectionProbeInput,
+) -> Result<CloudConnectionProbeResult, String> {
+    let base_url = validate_cloud_base_url(&input.base_url)?;
+    let model = input.model.trim();
+    if model.is_empty() || model.len() > 160 {
+        return Err("请输入要测试的模型名称。模型列表不可用时也可以手动填写。".to_string());
+    }
+    let api_key = probe_api_key(&input)?;
+    let endpoint = chat_endpoint(&base_url);
+    let started = std::time::Instant::now();
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(25))
+        .build()
+        .map_err(|_| "无法建立安全云端连接。".to_string())?
+        .post(&endpoint)
+        .bearer_auth(api_key)
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply with the single word OK."}],
+            "max_tokens": 4,
+            "temperature": 0
+        }))
+        .send()
+        .await
+        .map_err(|_| cloud_network_error_message("测试连接"))?;
+    if !response.status().is_success() {
+        return Err(cloud_http_error_message(response.status(), "测试连接"));
+    }
+    Ok(CloudConnectionProbeResult {
+        endpoint,
+        latency_ms: started.elapsed().as_millis(),
+    })
+}
+
+#[tauri::command]
+async fn discover_cloud_models(
+    input: CloudConnectionProbeInput,
+) -> Result<Vec<CloudModel>, String> {
+    let base_url = validate_cloud_base_url(&input.base_url)?;
+    let api_key = probe_api_key(&input)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|_| "无法建立安全云端连接。".to_string())?;
     let mut failures = Vec::new();
-    for endpoint in model_endpoint_candidates(&config.base_url) {
+    for endpoint in model_endpoint_candidates(&base_url) {
         let response = match client.get(&endpoint).bearer_auth(&api_key).send().await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
-                let status = response.status();
-                let detail = response.text().await.unwrap_or_default();
-                failures.push(format!(
-                    "{endpoint} 返回 HTTP {status}：{}",
-                    detail.chars().take(180).collect::<String>()
-                ));
+                failures.push(cloud_http_error_message(response.status(), "获取模型列表"));
                 continue;
             }
             Err(error) => {
-                failures.push(format!("{endpoint}：{error}"));
+                let _ = error;
+                failures.push(cloud_network_error_message("获取模型列表"));
                 continue;
             }
         };
@@ -5890,7 +5969,7 @@ async fn fetch_cloud_models(
         return Ok(models);
     }
     Err(format!(
-        "无法获取模型列表。{}。若该上游不提供模型列表，可直接填写模型名后保存。",
+        "无法获取模型列表。{}。这不影响手动填写模型名；请填写后点击“测试连接”，成功后再保存并启用。",
         failures.join("；")
     ))
 }
@@ -8516,7 +8595,8 @@ fn main() {
             list_cloud_providers,
             save_cloud_provider_config,
             select_cloud_provider,
-            fetch_cloud_models,
+            test_cloud_connection,
+            discover_cloud_models,
             delete_cloud_provider,
             list_conversations,
             list_conversation_messages,

@@ -26,6 +26,7 @@ type LocalToolStatus = { pdfText: boolean; ffmpeg: boolean; ocr: boolean; transc
 type CloudProviderConfig = { providerId: string; displayName: string; baseUrl: string; model: string; autoCollaboration: boolean; reviewEachRequest: boolean; configured: boolean };
 type CloudDraft = { providerId: string; previousProviderId?: string; displayName: string; baseUrl: string; model: string; apiKey: string; autoCollaboration: boolean; reviewEachRequest: boolean };
 type CloudModel = { id: string };
+type CloudConnectionProbeResult = { endpoint: string; latencyMs: number };
 type ParsedReply = { answer: string; steps: string[]; codeBlocks: number };
 type Conversation = { id: string; title: string; providerId?: string; updatedAt: string };
 type ConversationMessage = { id: string; conversationId: string; role: 'user' | 'assistant' | 'system'; source: 'local' | 'cloud' | 'system'; content: string; parsedReply?: ParsedReply; createdAt: string };
@@ -85,6 +86,7 @@ let cloudModels: CloudModel[] = [];
 let cloudDraft: CloudDraft = { providerId: '', displayName: '', baseUrl: '', model: '', apiKey: '', autoCollaboration: false, reviewEachRequest: false };
 let cloudOriginalProviderId: string | null = null;
 let cloudApiKeyVisible = false;
+let cloudConnectionStatus = '';
 let agentRun: AgentRun | null = null;
 let conversations: Conversation[] = [];
 let activeConversationId: string | null = null;
@@ -242,7 +244,7 @@ function conversationPage() {
 
 function cloudDraftFromConfig(config: CloudProviderConfig | null): CloudDraft {
   return {
-    providerId: config?.providerId ?? '',
+    providerId: config?.providerId ?? crypto.randomUUID(),
     previousProviderId: config?.providerId,
     displayName: config?.displayName ?? '',
     baseUrl: config?.baseUrl ?? '',
@@ -255,7 +257,7 @@ function cloudDraftFromConfig(config: CloudProviderConfig | null): CloudDraft {
 
 function syncCloudDraftFromDom() {
   cloudDraft = {
-    providerId: document.querySelector<HTMLInputElement>('#cloud-provider-id')?.value.trim() ?? cloudDraft.providerId,
+    providerId: cloudDraft.providerId || crypto.randomUUID(),
     displayName: document.querySelector<HTMLInputElement>('#cloud-display-name')?.value.trim() ?? cloudDraft.displayName,
     baseUrl: normalizeCloudBaseUrl(document.querySelector<HTMLInputElement>('#cloud-base-url')?.value ?? cloudDraft.baseUrl),
     model: document.querySelector<HTMLInputElement>('#cloud-model-input')?.value.trim() ?? cloudDraft.model,
@@ -272,13 +274,13 @@ function refreshCloudCredentialHint() {
   const savedForDraft = cloudConfig?.providerId === cloudDraft.providerId && cloudConfig.configured;
   if (!hint) return;
   if (input?.value) {
-    hint.textContent = '本次输入尚未保存；保存后将只写入 Windows 凭据管理器。';
+    hint.textContent = '本次输入尚未保存；可先测试连接或获取模型，只有“保存并启用”才会写入 Windows 凭据管理器。';
     hint.dataset.state = 'pending';
   } else if (savedForDraft) {
     hint.textContent = '已保存到 Windows 凭据管理器；留空会继续使用该密钥。';
     hint.dataset.state = 'saved';
   } else {
-    hint.textContent = '尚未保存密钥。输入后点击“保存供应商”或“保存并获取模型”。';
+    hint.textContent = '尚未保存密钥。填写后可先测试连接；测试不会保存密钥。';
     hint.dataset.state = 'missing';
   }
 }
@@ -290,7 +292,6 @@ function setupCloudProviderForm() {
   heading?.classList.add('cloud-provider-heading');
   document.querySelector('#cloud-provider-select')?.closest('label')?.classList.add('cloud-saved-provider-field');
   document.querySelector('#cloud-display-name')?.closest('label')?.classList.add('cloud-provider-name-field');
-  document.querySelector('#cloud-provider-id')?.closest('label')?.classList.add('cloud-provider-id-field');
   document.querySelector('#cloud-model-input')?.closest('label')?.classList.add('cloud-model-field');
   const apiKey = document.querySelector<HTMLInputElement>('#cloud-api-key');
   const apiKeyLabel = apiKey?.closest('label');
@@ -320,7 +321,7 @@ function setupCloudProviderForm() {
 }
 
 function restoreCloudDraftToDom() {
-  const fields: Array<[string, string]> = [['#cloud-provider-id', cloudDraft.providerId], ['#cloud-display-name', cloudDraft.displayName], ['#cloud-base-url', cloudDraft.baseUrl], ['#cloud-api-key', cloudDraft.apiKey]];
+  const fields: Array<[string, string]> = [['#cloud-display-name', cloudDraft.displayName], ['#cloud-base-url', cloudDraft.baseUrl], ['#cloud-api-key', cloudDraft.apiKey]];
   fields.forEach(([selector, value]) => { const input = document.querySelector<HTMLInputElement>(selector); if (input && value) input.value = value; });
   const model = document.querySelector<HTMLInputElement>('#cloud-model-input');
   if (model) model.value = cloudDraft.model;
@@ -333,11 +334,15 @@ function normalizeCloudBaseUrl(value: string) {
   return trimmed.replace(/\/(?:v1\/)?(?:models|chat\/completions)$/i, '').replace(/\/v1$/i, '');
 }
 
+function defaultCloudDisplayName(baseUrl: string) {
+  try { return new URL(baseUrl).hostname.replace(/^www\./i, '') || '云端 AI 服务'; }
+  catch { return '云端 AI 服务'; }
+}
+
 function assistantPanel() {
   const outputText = aiOutputTarget ? `本次工作区：${escapeHtml(aiOutputTarget.displayPath)}` : aiOutputFolder ? `下次写入：${escapeHtml(displayPath(aiOutputFolder))}` : '未指定时保存到软件的 AI Outputs 文件夹';
-  const configLabel = cloudConfig?.configured ? `已配置：${escapeHtml(cloudConfig.providerId)} / ${escapeHtml(cloudConfig.model)}` : '未配置云端服务；复杂任务仍只在本地准备。';
+  const configLabel = cloudConfig?.configured ? `已启用：${escapeHtml(cloudConfig.displayName)}${cloudConfig.model ? ` / ${escapeHtml(cloudConfig.model)}` : ''}` : '填写后可先测试连接；测试不会保存密钥。';
   const draftDisplayName = escapeHtml(cloudDraft.displayName);
-  const draftProviderId = escapeHtml(cloudDraft.providerId);
   const draftBaseUrl = escapeHtml(cloudDraft.baseUrl);
   const draftModel = escapeHtml(cloudDraft.model);
   const draftAuto = cloudDraft.autoCollaboration ? 'checked' : '';
@@ -356,7 +361,7 @@ function assistantPanel() {
   const auditReport = auditEntries.length ? `<ul class="audit-list">${auditEntries.map(item => `<li><b>${escapeHtml(item.targetType)}</b> · ${escapeHtml(item.action)} · ${escapeHtml(item.createdAt)} <small>${escapeHtml(item.oldPolicy ?? '-')} → ${escapeHtml(item.newPolicy ?? '-')}</small></li>`).join('')}</ul>` : '<p>尚未加载审计记录。</p>';
   const cloudWarning = formWarning?.target === 'cloud' ? `<p class="form-warning" role="alert">${escapeHtml(formWarning.message)}</p>` : '';
   const rulesWarning = formWarning?.target === 'rules' ? `<p class="form-warning" role="alert">${escapeHtml(formWarning.message)}</p>` : '';
-  return `<section class="single-panel panel"><header><div><small>LOCAL AI</small><h2>AI 助手</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><div class="assistant-page"><div class="assistant-intro"><span>${icons.spark}</span><div><h1>问资料助手</h1><p>本机检索和多轮理解优先；云端只接收经过策略筛选和脱敏的最小请求。</p></div></div><form id="ask-form"><label>你想完成什么？<div class="ask-row"><input id="question" value="现在想要玩游戏" maxlength="180" placeholder="例如：根据现有素材制作一款游戏"><button ${isWorking ? 'disabled' : ''} type="submit">${icons.spark} 开始分析</button></div></label></form><section class="cloud-settings"><form id="cloud-provider-form">${cloudWarning}<div class="cloud-settings-heading"><b>云端供应商</b><span>${configLabel}</span><small>兼容 OpenAI 格式上游。密钥只写入 Windows 凭据库，不保存在对话或数据库中。</small></div><label>已保存供应商<select id="cloud-provider-select"><option value="">新建供应商</option>${providerOptions}</select></label><label>名称<input id="cloud-display-name" maxlength="80" value="${draftDisplayName}" placeholder="例如：我的 OpenAI 兼容服务"></label><label>标识<input id="cloud-provider-id" maxlength="80" value="${draftProviderId}" placeholder="例如：my-provider"></label><label class="cloud-base-url-field">基础地址<input id="cloud-base-url" maxlength="240" value="${draftBaseUrl}" placeholder="https://api.example.com 或 https://api.example.com/v1"><small>可粘贴 CCSwitch 中的基础地址，也可包含 /v1、/models 或 /chat/completions。</small></label><label>模型<input id="cloud-model-input" list="cloud-model-options" maxlength="160" value="${draftModel}" placeholder="可手动填写，或点击获取模型"><datalist id="cloud-model-options">${cloudModels.map(item => `<option value="${escapeHtml(item.id)}"></option>`).join('')}</datalist><select id="cloud-model-select" aria-label="已发现模型"><option value="">选择已发现模型（可选）</option>${cloudModels.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === cloudDraft.model ? 'selected' : ''}>${escapeHtml(item.id)}</option>`).join('')}</select></label><label>API Key<input id="cloud-api-key" type="password" autocomplete="off" value="${escapeHtml(cloudDraft.apiKey)}" placeholder="输入新密钥，留空则使用 Windows 凭据库中已保存的密钥"></label><div class="cloud-actions control-cluster"><button class="quiet" id="fetch-cloud-models" type="button">保存并获取模型</button><button class="primary" type="submit">保存供应商</button>${cloudConfig ? `<button class="quiet danger" id="delete-cloud-provider" type="button">删除供应商</button>` : ''}</div><p class="cloud-form-note">获取模型不会清空当前输入。若上游没有模型列表接口，请直接填写 CCSwitch 中使用的模型名后保存。</p><label class="check-row"><input id="cloud-auto" type="checkbox" ${draftAuto}> 复杂任务自动协作</label><label class="check-row"><input id="cloud-review" type="checkbox" ${draftReview}> 每次请求先确认</label></form></section>${runFeedback}<section class="ai-output"><div><b>AI 写入位置</b><span>${outputText}</span></div><button class="quiet" id="choose-ai-output">选择 AI 写入文件夹</button><button class="quiet" id="create-ai-workspace">创建 AI 工作区</button></section><section class="sensitive-rules"><header><div><b>本地敏感规则</b><span>规则仅在准备云端请求时生效；无匹配的规则会阻止外发。</span></div></header>${rulesWarning}<form id="sensitive-rule-form"><input id="sensitive-rule-name" maxlength="80" placeholder="规则名称，例如：客户编号"><input id="sensitive-rule-pattern" maxlength="500" placeholder="正则表达式，例如：CLIENT-[0-9]+"><button class="quiet" type="submit">添加规则</button></form>${ruleList}</section><section class="governance-controls"><b>本地数据治理</b><span>导出不包含 API Key、云端原始请求或原始受限资料。</span><div class="control-cluster"><button class="quiet" id="create-encrypted-backup">创建加密备份</button><button class="quiet" id="restore-encrypted-backup">选择加密备份恢复</button><button class="quiet" id="scan-sensitive-index">生成敏感扫描报告</button><button class="quiet" id="load-metadata-audit">查看元数据审计</button><button class="quiet" id="export-local-governance">导出治理摘要</button><button class="quiet danger" id="clear-local-data" data-clear-scope="conversations">清理对话</button><button class="quiet danger" id="clear-local-data" data-clear-scope="audit">清理审计</button><button class="quiet danger" id="clear-local-data" data-clear-scope="rules">清理规则</button></div>${backup}${sensitiveReport}${auditReport}${governance}</section>${resultRows('完成本地检索后会显示命中资料；受限资料绝不会外发。')}</div></section>`;
+  return `<section class="single-panel panel"><header><div><small>LOCAL AI</small><h2>AI 助手</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><div class="assistant-page"><div class="assistant-intro"><span>${icons.spark}</span><div><h1>问资料助手</h1><p>本机检索和多轮理解优先；云端只接收经过策略筛选和脱敏的最小请求。</p></div></div><form id="ask-form"><label>你想完成什么？<div class="ask-row"><input id="question" value="现在想要玩游戏" maxlength="180" placeholder="例如：根据现有素材制作一款游戏"><button ${isWorking ? 'disabled' : ''} type="submit">${icons.spark} 开始分析</button></div></label></form><section class="cloud-settings"><form id="cloud-provider-form">${cloudWarning}<div class="cloud-settings-heading"><b>云端供应商</b><span>${configLabel}</span><small>兼容 OpenAI 格式上游。API Key 只会写入 Windows 凭据管理器，不进入对话或数据库。</small></div><label>已保存供应商<select id="cloud-provider-select"><option value="">新建供应商</option>${providerOptions}</select></label><label>配置名称<input id="cloud-display-name" maxlength="80" value="${draftDisplayName}" placeholder="例如：我的 OpenAI 兼容服务"></label><label class="cloud-base-url-field">基础地址<input id="cloud-base-url" maxlength="240" value="${draftBaseUrl}" placeholder="https://api.example.com 或 https://api.example.com/v1"><small>可直接粘贴 CCSwitch 的基础地址；即使末尾含 /models 或 /chat/completions 也会自动规范化。</small></label><label>模型<input id="cloud-model-input" list="cloud-model-options" maxlength="160" value="${draftModel}" placeholder="可手动填写，或点击获取模型"><datalist id="cloud-model-options">${cloudModels.map(item => `<option value="${escapeHtml(item.id)}"></option>`).join('')}</datalist><select id="cloud-model-select" aria-label="已发现模型"><option value="">选择已发现模型（可选）</option>${cloudModels.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === cloudDraft.model ? 'selected' : ''}>${escapeHtml(item.id)}</option>`).join('')}</select></label><label>API Key<input id="cloud-api-key" type="password" autocomplete="off" value="${escapeHtml(cloudDraft.apiKey)}" placeholder="输入新密钥，留空则使用已保存的 Windows 凭据"></label><div class="cloud-actions control-cluster"><button class="quiet" id="test-cloud-connection" type="button">测试连接</button><button class="quiet" id="fetch-cloud-models" type="button">获取模型</button><button class="primary" type="submit">保存并启用</button>${cloudConfig ? `<button class="quiet danger" id="delete-cloud-provider" type="button">删除供应商</button>` : ''}</div><p class="cloud-form-note">${cloudConnectionStatus ? escapeHtml(cloudConnectionStatus) : '测试连接和获取模型只使用本次输入，不会保存或清空 API Key。模型列表是辅助功能；上游不支持 /models 时，手动填写模型并测试连接即可。'}</p><label class="check-row"><input id="cloud-auto" type="checkbox" ${draftAuto}> 复杂任务自动协作</label><label class="check-row"><input id="cloud-review" type="checkbox" ${draftReview}> 每次请求先确认</label></form></section>${runFeedback}<section class="ai-output"><div><b>AI 写入位置</b><span>${outputText}</span></div><button class="quiet" id="choose-ai-output">选择 AI 写入文件夹</button><button class="quiet" id="create-ai-workspace">创建 AI 工作区</button></section><section class="sensitive-rules"><header><div><b>本地敏感规则</b><span>规则仅在准备云端请求时生效；无匹配的规则会阻止外发。</span></div></header>${rulesWarning}<form id="sensitive-rule-form"><input id="sensitive-rule-name" maxlength="80" placeholder="规则名称，例如：客户编号"><input id="sensitive-rule-pattern" maxlength="500" placeholder="正则表达式，例如：CLIENT-[0-9]+"><button class="quiet" type="submit">添加规则</button></form>${ruleList}</section><section class="governance-controls"><b>本地数据治理</b><span>导出不包含 API Key、云端原始请求或原始受限资料。</span><div class="control-cluster"><button class="quiet" id="create-encrypted-backup">创建加密备份</button><button class="quiet" id="restore-encrypted-backup">选择加密备份恢复</button><button class="quiet" id="scan-sensitive-index">生成敏感扫描报告</button><button class="quiet" id="load-metadata-audit">查看元数据审计</button><button class="quiet" id="export-local-governance">导出治理摘要</button><button class="quiet danger" id="clear-local-data" data-clear-scope="conversations">清理对话</button><button class="quiet danger" id="clear-local-data" data-clear-scope="audit">清理审计</button><button class="quiet danger" id="clear-local-data" data-clear-scope="rules">清理规则</button></div>${backup}${sensitiveReport}${auditReport}${governance}</section>${resultRows('完成本地检索后会显示命中资料；受限资料绝不会外发。')}</div></section>`;
 }
 
 function folderList() {
@@ -612,9 +617,46 @@ async function ask(question: string) {
   } catch (reason) { error = String(reason); } finally { isWorking = false; render(); }
 }
 async function loadConversationHistory() { conversations = await invoke<Conversation[]>('list_conversations'); if (activeConversationId) conversationMessages = await invoke<ConversationMessage[]>('list_conversation_messages', { input: { conversationId: activeConversationId } }); }
-async function saveCloudProvider(event: SubmitEvent) { event.preventDefault(); syncCloudDraftFromDom(); const draft = { ...cloudDraft }; isWorking = true; error = ''; formWarning = null; render(); try { cloudConfig = await invoke<CloudProviderConfig>('save_cloud_provider_config', { input: draft }); cloudOriginalProviderId = cloudConfig.providerId; cloudDraft = { ...cloudDraftFromConfig(cloudConfig), apiKey: '' }; cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; } finally { isWorking = false; render(); } }
-async function fetchCloudModels() { syncCloudDraftFromDom(); const draft = { ...cloudDraft }; const savedForDraft = cloudConfig?.providerId === draft.providerId && cloudConfig.configured; if (!draft.providerId || !draft.displayName || !draft.baseUrl || (!draft.apiKey && !savedForDraft)) { formWarning = { target: 'cloud', message: '请先填写名称、标识、基础地址和 API Key；已保存过密钥的供应商可留空。' }; render(); return; } isWorking = true; error = ''; formWarning = null; render(); try { cloudConfig = await invoke<CloudProviderConfig>('save_cloud_provider_config', { input: draft }); cloudOriginalProviderId = cloudConfig.providerId; cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); cloudModels = await invoke<CloudModel[]>('fetch_cloud_models', { input: { providerId: cloudConfig.providerId } }); cloudDraft = { ...cloudDraftFromConfig(cloudConfig), apiKey: '' }; if (!cloudDraft.model && cloudModels[0]) cloudDraft.model = cloudModels[0].id; } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; } finally { isWorking = false; render(); } }
-async function selectCloudProvider(providerId: string) { cloudConfig = providerId ? await invoke<CloudProviderConfig>('select_cloud_provider', { input: { providerId } }) : null; cloudOriginalProviderId = cloudConfig?.providerId ?? null; cloudDraft = cloudDraftFromConfig(cloudConfig); cloudModels = []; formWarning = null; if (cloudConfig) cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); render(); }
+function cloudProbeInput() {
+  syncCloudDraftFromDom();
+  return { providerId: cloudOriginalProviderId ?? undefined, baseUrl: cloudDraft.baseUrl, model: cloudDraft.model, apiKey: cloudDraft.apiKey || undefined };
+}
+async function saveCloudProvider(event: SubmitEvent) {
+  event.preventDefault(); syncCloudDraftFromDom(); const draft = { ...cloudDraft, displayName: cloudDraft.displayName || defaultCloudDisplayName(cloudDraft.baseUrl) };
+  cloudDraft = draft;
+  if (!draft.baseUrl || !draft.model) { formWarning = { target: 'cloud', message: '请填写基础地址和模型名称。配置名称留空时会自动使用服务域名。可先获取模型，或直接填写后测试连接。' }; render(); return; }
+  isWorking = true; error = ''; formWarning = null; cloudConnectionStatus = ''; render();
+  try {
+    cloudConfig = await invoke<CloudProviderConfig>('save_cloud_provider_config', { input: draft });
+    cloudOriginalProviderId = cloudConfig.providerId;
+    cloudDraft = { ...cloudDraftFromConfig(cloudConfig), apiKey: '' };
+    cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers');
+    cloudConnectionStatus = '已保存并启用。API Key 仅保存在 Windows 凭据管理器。';
+  } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; }
+  finally { isWorking = false; render(); }
+}
+async function testCloudConnection() {
+  const input = cloudProbeInput();
+  if (!input.baseUrl || !input.model || !input.apiKey && !input.providerId) { formWarning = { target: 'cloud', message: '请填写基础地址、模型和 API Key；已保存过的供应商可以留空 API Key。' }; render(); return; }
+  isWorking = true; error = ''; formWarning = null; cloudConnectionStatus = '正在测试连接…'; render();
+  try {
+    const result = await invoke<CloudConnectionProbeResult>('test_cloud_connection', { input });
+    cloudConnectionStatus = `连接成功 · ${result.latencyMs} ms · ${result.endpoint}`;
+  } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; cloudConnectionStatus = ''; }
+  finally { isWorking = false; render(); }
+}
+async function fetchCloudModels() {
+  const input = cloudProbeInput();
+  if (!input.baseUrl || !input.apiKey && !input.providerId) { formWarning = { target: 'cloud', message: '请填写基础地址和 API Key；已保存过的供应商可以留空 API Key。' }; render(); return; }
+  isWorking = true; error = ''; formWarning = null; cloudConnectionStatus = '正在获取模型列表…'; render();
+  try {
+    cloudModels = await invoke<CloudModel[]>('discover_cloud_models', { input });
+    if (!cloudDraft.model && cloudModels[0]) cloudDraft.model = cloudModels[0].id;
+    cloudConnectionStatus = cloudModels.length ? `已获取 ${cloudModels.length} 个模型；选择后建议再测试连接。` : '上游返回了空模型列表；仍可手动填写模型并测试连接。';
+  } catch (reason) { formWarning = { target: 'cloud', message: String(reason) }; cloudConnectionStatus = ''; }
+  finally { isWorking = false; render(); }
+}
+async function selectCloudProvider(providerId: string) { cloudConfig = providerId ? await invoke<CloudProviderConfig>('select_cloud_provider', { input: { providerId } }) : null; cloudOriginalProviderId = cloudConfig?.providerId ?? null; cloudDraft = cloudDraftFromConfig(cloudConfig); cloudModels = []; cloudConnectionStatus = ''; formWarning = null; if (cloudConfig) cloudProviders = await invoke<CloudProviderConfig[]>('list_cloud_providers'); render(); }
 async function openConversation(conversationId: string) { activeConversationId = conversationId; conversationMessages = await invoke<ConversationMessage[]>('list_conversation_messages', { input: { conversationId } }); render(); }
 async function autoApplyLowRiskAdvice() {
   if (!agentRun || !aiOutputTarget || !agentPreferences.autoApplyLowRisk || agentRun.status !== 'awaiting_approval') return;
@@ -767,8 +809,9 @@ function bind() {
   document.querySelector('#choose-ai-output')?.addEventListener('click', chooseAiOutputFolder);
   document.querySelector('#create-ai-workspace')?.addEventListener('click', createAiWorkspace);
   document.querySelector<HTMLFormElement>('#cloud-provider-form')?.addEventListener('submit', saveCloudProvider);
+  document.querySelector('#test-cloud-connection')?.addEventListener('click', testCloudConnection);
   document.querySelector('#fetch-cloud-models')?.addEventListener('click', fetchCloudModels);
-  ['#cloud-provider-id', '#cloud-display-name', '#cloud-base-url', '#cloud-api-key', '#cloud-model-input'].forEach(selector => document.querySelector(selector)?.addEventListener('input', () => { syncCloudDraftFromDom(); refreshCloudCredentialHint(); }));
+  ['#cloud-display-name', '#cloud-base-url', '#cloud-api-key', '#cloud-model-input'].forEach(selector => document.querySelector(selector)?.addEventListener('input', () => { syncCloudDraftFromDom(); cloudConnectionStatus = ''; refreshCloudCredentialHint(); }));
   document.querySelector<HTMLSelectElement>('#cloud-model-select')?.addEventListener('change', event => { const model = (event.target as HTMLSelectElement).value; const input = document.querySelector<HTMLInputElement>('#cloud-model-input'); if (input && model) input.value = model; syncCloudDraftFromDom(); });
   document.querySelector('#cloud-auto')?.addEventListener('change', syncCloudDraftFromDom);
   document.querySelector('#cloud-review')?.addEventListener('change', syncCloudDraftFromDom);

@@ -309,7 +309,7 @@ test('temporary connection checks keep the entered API key in the page and manua
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.match(backend, /模型可在获取列表后再选择/);
-  assert.doesNotMatch(backend, /model\.is_empty\(\)/);
+  assert.match(backend, /模型列表不可用时也可以手动填写/);
   const discoveryHandler = shell.slice(shell.indexOf('async function fetchCloudModels'), shell.indexOf('async function selectCloudProvider'));
   assert.match(discoveryHandler, /discover_cloud_models/);
   assert.doesNotMatch(discoveryHandler, /save_cloud_provider_config/);
