@@ -190,7 +190,7 @@ test('desktop updater verifies signed GitHub release updates before installation
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   assert.match(config, /createUpdaterArtifacts/);
-  assert.match(config, /github\.com\/fxxz505\/file-terminal-desktop\/releases\/latest\/download\/latest\.json/);
+  assert.match(config, /github\.com\/fxxz505\/file-terminal-desktop\/releases\/latest\/download\/latest\.json\?cache=\{\{current_version\}\}/);
   assert.match(capability, /updater:default/);
   assert.match(capability, /process:default/);
   assert.match(shell, /downloadAndInstall/);
@@ -839,6 +839,16 @@ test('update checks expose a separate loading state, retry path, and bounded net
   assert.match(shell, /GitHub 更新服务/);
   assert.match(styles, /\.update-check-progress/);
   assert.match(styles, /\.workspace-extras-grid/);
+});
+
+test('update installation reuses the checked signed update instead of decoding latest.json twice', async () => {
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const config = await readFile(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8');
+  assert.match(shell, /let pendingUpdate: Update \| null = null/);
+  assert.match(shell, /pendingUpdate = update/);
+  const installHandler = shell.slice(shell.indexOf('async function installUpdate'), shell.indexOf('function bind'));
+  assert.match(installHandler, /const update = pendingUpdate \?\? await check/);
+  assert.match(config, /latest\.json\?cache=\{\{current_version\}\}/);
 });
 
 test('desktop layout keeps wide pages readable and responsive', async () => {

@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { check, type DownloadEvent } from '@tauri-apps/plugin-updater';
+import { check, type DownloadEvent, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import './styles.css';
 
@@ -76,6 +76,7 @@ let updateVersion = '';
 let updateProgress: DownloadProgress | null = null;
 let updateCheckState: UpdateCheckState = 'idle';
 let updateStatus = '尚未检查更新';
+let pendingUpdate: Update | null = null;
 let contextTarget: MetadataTarget | null = null;
 let contextPosition = { x: 0, y: 0 };
 let aiOutputFolder: string | null = null;
@@ -694,6 +695,7 @@ async function revealPreview() { if (!preview) return; try { await invoke('revea
 async function checkForUpdate(showResult = false) {
   updateCheckState = 'checking';
   updateVersion = '';
+  pendingUpdate = null;
   isWorking = true;
   error = '';
   render();
@@ -710,6 +712,7 @@ async function checkForUpdate(showResult = false) {
       }
     }
     if (lastReason && !update) throw lastReason;
+    pendingUpdate = update;
     updateVersion = update?.version ?? '';
     updateStatus = updateVersion ? `发现可用版本 ${updateVersion}` : '当前已是最新版本';
     updateCheckState = 'success';
@@ -730,7 +733,7 @@ async function installUpdate() {
   updateProgress = { kind: 'runtime', completed: 0 };
   render();
   try {
-    const update = await check({ timeout: 30000 });
+    const update = pendingUpdate ?? await check({ timeout: 30000 });
     if (!update) {
       updateVersion = '';
       updateCheckState = 'success';
@@ -743,6 +746,7 @@ async function installUpdate() {
       if (event.event === 'Progress') completed += event.data.chunkLength;
       updateProgress = { kind: 'runtime', completed, total: total || undefined };
     }, { timeout: 30000 });
+    pendingUpdate = null;
     await relaunch();
   } catch (reason) {
     error = `Update failed: ${String(reason)}`;

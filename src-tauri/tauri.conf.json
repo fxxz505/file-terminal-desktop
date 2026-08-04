@@ -38,7 +38,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM2MkM5NkRDMTgzMzEzRDgKUldUWUV6TVkzSllzTnBWdHhkMGxtQ0s3ekErTmxWVENFb2hPRU5NcmR4dS82czRRWUR2Qnd2V2kK",
       "endpoints": [
-        "https://github.com/fxxz505/file-terminal-desktop/releases/latest/download/latest.json"
+        "https://github.com/fxxz505/file-terminal-desktop/releases/latest/download/latest.json?cache={{current_version}}"
       ]
     }
   }
