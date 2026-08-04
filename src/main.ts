@@ -56,6 +56,7 @@ type SensitiveFinding = { itemId: string; name: string; displayPath: string; cat
 type MetadataAuditEntry = { id: string; targetType: string; targetId: string; action: string; oldPolicy?: string; newPolicy?: string; createdAt: string };
 type StartupMode = { recoveryRequired: boolean; message?: string; dataDirectory: string; recoveryDirectory: string };
 type DataDirectoryStatus = { path: string; source: 'portable' | 'fresh_database'; portableAvailable: boolean; restartRequired: boolean };
+type ExecutionPreference = 'automatic' | 'local' | 'cloud';
 type View = 'workspace' | 'search' | 'assistant' | 'diagnostics' | 'settings' | 'about';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -146,6 +147,7 @@ let dataDirectoryStatus: DataDirectoryStatus | null = null;
 const folderRefreshTimers = new Map<string, number>();
 let embeddingUpdateTimer: number | null = null;
 let fontScale = Number(localStorage.getItem('file-terminal.font-scale') ?? '100');
+let executionPreference: ExecutionPreference = (localStorage.getItem('file-terminal.execution-preference') as ExecutionPreference) || 'automatic';
 
 const icon = (name: string) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${name}"/></svg>`;
 const icons = {
@@ -383,7 +385,7 @@ function assistantPanel() {
   const rulesWarning = formWarning?.target === 'rules' ? `<p class="form-warning" role="alert">${escapeHtml(formWarning.message)}</p>` : '';
   const taskButtonLabel = isWorking ? '正在启动任务…' : '开始任务';
   const taskStatus = isWorking ? '<p class="task-starting" role="status"><span></span>正在创建本地任务、检索素材并准备受控工作区…</p>' : '';
-  return `<section class="single-panel panel"><header><div><small>LOCAL / CLOUD COLLABORATION</small><h2>AI 协作台</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><div class="assistant-page"><div class="assistant-intro"><span>${icons.spark}</span><div><h1>把任务交给 AI 协作</h1><p>本地 AI 先检索、理解和生成；能力不足时按云端权限策略协作，所有写入均在受控工作区内。</p></div></div><form id="ask-form"><label>你想完成什么？<div class="ask-row"><input id="question" maxlength="180" placeholder="例如：使用已接入图片制作可点击切换的 HTML 网页"><button ${isWorking ? 'disabled' : ''} type="submit">${icons.spark} ${taskButtonLabel}</button></div></label>${taskStatus}</form><section class="ai-output"><div><b>AI 写入位置</b><span>${outputText}</span></div><button class="quiet" id="choose-ai-output">选择 AI 写入文件夹</button><button class="quiet" id="create-ai-workspace">创建 AI 工作区</button>${workspaceActions}</section>${runFeedback}<section class="assistant-workbench"><aside class="conversation-history"><header><b>任务与 AI 对话</b><small>${conversations.length} 段</small></header>${history}</aside><section class="conversation-messages"><header><div><b>当前任务对话</b><span>本地分析、云端协作与执行状态都保存在本机</span></div></header>${messages}</section></section><section class="sensitive-rules"><header><div><b>本地敏感规则</b><span>规则仅在准备云端请求时生效；无匹配的规则会阻止外发。</span></div></header>${rulesWarning}<form id="sensitive-rule-form"><input id="sensitive-rule-name" maxlength="80" placeholder="规则名称，例如：客户编号"><input id="sensitive-rule-pattern" maxlength="500" placeholder="正则表达式，例如：CLIENT-[0-9]+"><button class="quiet" type="submit">添加规则</button></form>${ruleList}</section><section class="governance-controls"><b>本地数据治理</b><span>导出不包含 API Key、云端原始请求或原始受限资料。</span><div class="control-cluster"><button class="quiet" id="create-encrypted-backup">创建加密备份</button><button class="quiet" id="restore-encrypted-backup">选择加密备份恢复</button><button class="quiet" id="scan-sensitive-index">生成敏感扫描报告</button><button class="quiet" id="load-metadata-audit">查看元数据审计</button><button class="quiet" id="export-local-governance">导出治理摘要</button><button class="quiet danger" id="clear-local-data" data-clear-scope="conversations">清理对话</button><button class="quiet danger" id="clear-local-data" data-clear-scope="audit">清理审计</button><button class="quiet danger" id="clear-local-data" data-clear-scope="rules">清理规则</button></div>${backup}${sensitiveReport}${auditReport}${governance}</section>${resultRows('完成本地检索后会显示命中资料；受限资料绝不会外发。')}</div></section>`;
+  return `<section class="assistant-shell"><aside class="conversation-history assistant-history"><header><div><small>CHATS</small><b>任务与对话</b></div><button class="quiet" data-new-conversation="true">新建</button></header>${history}</aside><section class="assistant-main"><header class="assistant-toolbar"><div><small>LOCAL / CLOUD COLLABORATION</small><h2>AI 协作</h2></div><span class="local-chip">${icons.check} 本机优先</span></header><section class="conversation-messages assistant-messages"><header><div><b>当前任务</b><span>本地分析、云端协作与执行状态都保存在本机</span></div></header>${messages}</section>${runFeedback}<section class="ai-output ai-output-primary"><div><b>AI 写入位置</b><span>${outputText}</span></div><button class="quiet" id="choose-ai-output">选择文件夹</button><button class="quiet" id="create-ai-workspace">新建工作区</button>${workspaceActions}</section><form id="ask-form" class="composer"><div class="composer-top">${assistantModelChoice()}<span>本地与云端模型同时可选；受限资料不会外发。</span></div><label for="question">你想完成什么？</label><div class="ask-row"><textarea id="question" rows="3" maxlength="2000" placeholder="例如：使用已接入图片制作可点击切换的 HTML 网页"></textarea><button ${isWorking ? 'disabled' : ''} type="submit" aria-label="${taskButtonLabel}">${icons.spark}<span>${taskButtonLabel}</span></button></div>${taskStatus}</form></section><section class="assistant-details"><details><summary>敏感规则与本地数据治理</summary><section class="sensitive-rules"><header><div><b>本地敏感规则</b><span>规则仅在准备云端请求时生效；无匹配的规则会阻止外发。</span></div></header>${rulesWarning}<form id="sensitive-rule-form"><input id="sensitive-rule-name" maxlength="80" placeholder="规则名称，例如：客户编号"><input id="sensitive-rule-pattern" maxlength="500" placeholder="正则表达式，例如：CLIENT-[0-9]+"><button class="quiet" type="submit">添加规则</button></form>${ruleList}</section><section class="governance-controls"><b>本地数据治理</b><span>导出不包含 API Key、云端原始请求或原始受限资料。</span><div class="control-cluster"><button class="quiet" id="create-encrypted-backup">创建加密备份</button><button class="quiet" id="restore-encrypted-backup">选择加密备份恢复</button><button class="quiet" id="scan-sensitive-index">生成敏感扫描报告</button><button class="quiet" id="load-metadata-audit">查看元数据审计</button><button class="quiet" id="export-local-governance">导出治理摘要</button><button class="quiet danger" id="clear-local-data" data-clear-scope="conversations">清理对话</button><button class="quiet danger" id="clear-local-data" data-clear-scope="audit">清理审计</button><button class="quiet danger" id="clear-local-data" data-clear-scope="rules">清理规则</button></div>${backup}${sensitiveReport}${auditReport}${governance}</section></details></section>${resultRows('完成本地检索后会显示命中资料；受限资料绝不会外发。')}</section>`;
 }
 
 function folderList() {
@@ -459,7 +461,10 @@ function render() {
   const menu = contextTarget ? `<div class="context-menu" style="left:${contextPosition.x}px;top:${contextPosition.y}px" role="menu"><b>${escapeHtml(contextTarget.name)}</b><button data-metadata-action="note">编辑备注</button><button data-metadata-action="tags">编辑标签</button><button data-metadata-action="local_only">云端：禁止上传</button><button data-metadata-action="cloud_allowed">云端：允许上传</button><button data-metadata-action="ask_each_time">云端：每次询问</button></div>` : '';
   const editor = metadataEditor && metadataEditorAction ? `<div class="metadata-editor-backdrop"><form class="metadata-editor" id="metadata-editor-form"><header><b>${metadataEditorAction === 'note' ? '编辑备注' : '编辑标签'}</b><button type="button" class="quiet" id="cancel-metadata-editor">取消</button></header><p>${escapeHtml(metadataEditor.name)}</p><label>${metadataEditorAction === 'note' ? '备注' : '标签（用逗号分隔）'}<input id="metadata-editor-value" autofocus maxlength="600" value="${escapeHtml(metadataEditorAction === 'note' ? metadataEditor.note : metadataEditor.tags.join(', '))}"></label><div><button type="submit" class="primary">保存</button></div></form></div>` : '';
   app.style.setProperty('--user-font-scale', `${fontScale / 100}`);
-  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL AI WORKSPACE</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-testid="nav-workspace" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-testid="nav-search" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-testid="nav-assistant" data-view="assistant">${icons.spark}<span>AI 协作台</span></button><button class="nav ${activeView === 'diagnostics' ? 'active' : ''}" data-testid="nav-diagnostics" data-view="diagnostics">${icons.file}<span>索引诊断</span></button></nav><div class="sidebar-bottom"><button class="nav ${activeView === 'settings' ? 'active' : ''}" data-testid="nav-settings" data-view="settings">${icons.settings}<span>设置</span></button><button class="nav ${activeView === 'about' ? 'active' : ''}" data-testid="nav-about" data-view="about">${icons.file}<span>关于</span></button><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${folderBrowser()}${previewPanel()}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>${menu}${editor}`;
+  const inspectorOpen = Boolean(activeFolder || preview);
+  app.classList.toggle('inspector-open', inspectorOpen);
+  app.classList.toggle('assistant-workbench', activeView === 'assistant');
+  app.innerHTML = `<aside class="sidebar"><div class="brand"><span class="brand-mark">${icons.mark}</span><span>资料终端<small>LOCAL AI WORKSPACE</small></span></div><nav><button class="nav ${activeView === 'workspace' ? 'active' : ''}" data-testid="nav-workspace" data-view="workspace">${icons.folder}<span>资料空间</span></button><button class="nav ${activeView === 'search' ? 'active' : ''}" data-testid="nav-search" data-view="search">${icons.search}<span>本地搜索</span></button><button class="nav ${activeView === 'assistant' ? 'active' : ''}" data-testid="nav-assistant" data-view="assistant">${icons.spark}<span>AI 协作台</span></button><button class="nav ${activeView === 'diagnostics' ? 'active' : ''}" data-testid="nav-diagnostics" data-view="diagnostics">${icons.file}<span>索引诊断</span></button></nav><div class="sidebar-bottom"><button class="nav ${activeView === 'settings' ? 'active' : ''}" data-testid="nav-settings" data-view="settings">${icons.settings}<span>设置</span></button><button class="nav ${activeView === 'about' ? 'active' : ''}" data-testid="nav-about" data-view="about">${icons.file}<span>关于</span></button><div class="sidebar-foot"><span class="online-dot"></span><span>仅在本机运行</span></div></div></aside><main><header class="topbar"><div><strong>${page.title}</strong><span>${page.subtitle}</span></div><button class="import" id="import-folder">${icons.folder} 接入文件夹</button></header><section class="canvas">${page.content}${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}</section></main>${rightInspector()}${menu}${editor}`;
   restoreCloudDraftToDom();
   setupCloudProviderForm();
   bind();
@@ -495,6 +500,28 @@ async function browserBack() {
     return;
   }
   await openFolder(activeFolder.id, previous);
+}
+
+function rightInspector() {
+  const hasFolder = Boolean(activeFolder);
+  const inspectorTitle = preview ? preview.name : activeFolder?.name ?? '文件与预览';
+  const inspectorSubtitle = preview ? preview.displayPath : activeFolder ? displayPath(browserPath ?? activeFolder.displayPath) : '从资料空间、搜索结果或 AI 输出中选择一个文件夹或文件';
+  const folderContent = !hasFolder ? `<section class="inspector-empty"><span>${icons.folder}</span><b>在此查看文件</b><p>打开资料夹后，目录树会固定显示在右侧；选择文件即可在此预览。</p></section>` : `<section class="inspector-browser"><header><div><small>FILES</small><b>${escapeHtml(activeFolder!.name)}</b></div><div><button class="quiet" id="browser-back" ${browserHistory.length ? '' : 'disabled'}>返回</button><button class="quiet" id="browser-reveal">打开</button></div></header><div class="inspector-path" title="${escapeHtml(displayPath(browserPath ?? activeFolder!.displayPath))}">${escapeHtml(displayPath(browserPath ?? activeFolder!.displayPath))}</div><div class="browser-items">${folderEntries.length ? folderEntries.map(entry => `<button class="browser-entry ${entry.itemType === 'folder' ? 'browser-folder' : 'preview-file'} metadata-target" data-target-type="item" data-target-id="${escapeHtml(entry.id)}" data-note="${escapeHtml(entry.note)}" data-tags="${escapeHtml(JSON.stringify(entry.tags))}" data-cloud-policy="${entry.cloudPolicy}" data-name="${escapeHtml(entry.name)}" data-path="${escapeHtml(entry.path)}"><span>${entry.itemType === 'folder' ? icons.folder : icons.file}</span><div><b>${escapeHtml(entry.name)}</b><small>${entry.itemType === 'folder' ? '文件夹' : escapeHtml(entry.displayPath)}</small>${metadataLine(entry.tags, entry.cloudPolicy)}</div></button>`).join('') : '<p>此文件夹为空。</p>'}</div></section>`;
+  const previewContent = preview ? `<section class="inspector-preview"><header><div><small>PREVIEW</small><b>${escapeHtml(preview.name)}</b></div><div><button class="quiet" id="reveal-file">打开</button><button class="quiet" id="close-preview">关闭预览</button></div></header><div class="preview-body">${preview.kind === 'image' ? `<img src="data:${preview.mimeType};base64,${preview.content}" alt="${escapeHtml(preview.name)}">` : preview.kind === 'pdf' ? `<iframe title="${escapeHtml(preview.name)}" src="data:application/pdf;base64,${preview.content}"></iframe>` : preview.kind === 'text' ? `<pre>${escapeHtml(preview.content)}</pre>` : `<p>${escapeHtml(preview.message)}</p>`}</div></section>` : '';
+  return `<aside class="right-inspector ${hasFolder || preview ? 'is-open' : ''}" aria-label="文件浏览与预览"><header class="inspector-heading"><div><small>CONTEXT</small><h2>${escapeHtml(inspectorTitle)}</h2><span>${escapeHtml(inspectorSubtitle)}</span></div><button class="quiet" id="close-inspector" ${hasFolder || preview ? '' : 'disabled'}>关闭</button></header>${folderContent}${previewContent}</aside>`;
+}
+
+function assistantModelChoice() {
+  const activeLocal = localModels.find(model => model.active);
+  const selected = executionPreference === 'local'
+    ? `local:${activeLocal?.id ?? 'default'}`
+    : executionPreference === 'cloud' && cloudConfig?.configured
+      ? `cloud:${cloudConfig.providerId}`
+      : 'automatic';
+  const defaultLocal = status.modelInstalled ? `默认本地模型 · ${escapeHtml(status.activeModelName)}` : '默认本地模型 · 未安装';
+  const localOptions = [`<option value="local:default" ${selected === 'local:default' ? 'selected' : ''} ${status.modelInstalled ? '' : 'disabled'}>${defaultLocal}</option>`, ...localModels.map(model => `<option value="local:${escapeHtml(model.id)}" ${selected === `local:${model.id}` ? 'selected' : ''}>${escapeHtml(model.displayName)}${model.active ? ' · 当前' : ''}</option>`)].join('');
+  const cloudOptions = cloudProviders.filter(provider => provider.configured).map(provider => `<option value="cloud:${escapeHtml(provider.providerId)}" ${selected === `cloud:${provider.providerId}` ? 'selected' : ''}>${escapeHtml(provider.displayName)}${provider.model ? ` · ${escapeHtml(provider.model)}` : ''}</option>`).join('') || '<option value="" disabled>请先在设置中添加云端模型</option>';
+  return `<label class="assistant-model-picker">模型与路由<select id="assistant-model-choice" aria-label="选择本地或云端模型"><option value="automatic" ${selected === 'automatic' ? 'selected' : ''}>自动选择 · 本地优先</option><optgroup label="本地模型">${localOptions}</optgroup><optgroup label="云端模型">${cloudOptions}</optgroup></select></label>`;
 }
 async function revealFolder() { if (!activeFolder) return; try { await invoke('reveal_in_explorer', { path: browserPath ?? activeFolder.path }); } catch (reason) { error = `无法打开资源管理器：${String(reason)}`; render(); } }
 async function openAiOutputFolder() {
@@ -660,7 +687,7 @@ async function loadAgentEvidenceReport() { if (!agentRun) return; isWorking = tr
 async function ask(question: string) {
   isWorking = true; error = ''; agentRun = null; render();
   try {
-    [results, agentRun] = await Promise.all([invoke<Result[]>('ask_assistant', { question }), invoke<AgentRun>('prepare_agent_run', { input: { question, conversationId: activeConversationId } })]);
+    [results, agentRun] = await Promise.all([invoke<Result[]>('ask_assistant', { question }), invoke<AgentRun>('prepare_agent_run', { input: { question, conversationId: activeConversationId, executionPreference } })]);
     activeConversationId = agentRun.conversationId ?? activeConversationId;
     if (agentRun.status === 'awaiting_local_execution') {
       await ensureAiWorkspace();
@@ -695,6 +722,23 @@ async function runLocalAgentTask() {
     if (agentRun) agentRun = { ...agentRun, status: 'failed', feedback: error };
   }
   finally { isWorking = false; render(); }
+}
+async function selectAssistantModel(value: string) {
+  if (value === 'automatic') {
+    executionPreference = 'automatic';
+  } else if (value.startsWith('local:')) {
+    const localId = value.slice('local:'.length);
+    if (localId !== 'default') await invoke('select_local_model', { input: { id: localId } });
+    executionPreference = 'local';
+  } else if (value.startsWith('cloud:')) {
+    const providerId = value.slice('cloud:'.length);
+    cloudConfig = await invoke<CloudProviderConfig>('select_cloud_provider', { input: { providerId } });
+    cloudOriginalProviderId = cloudConfig.providerId;
+    cloudDraft = cloudDraftFromConfig(cloudConfig);
+    executionPreference = 'cloud';
+  }
+  localStorage.setItem('file-terminal.execution-preference', executionPreference);
+  await refreshStatus();
 }
 async function saveCloudProvider(event: SubmitEvent) {
   event.preventDefault(); syncCloudDraftFromDom(); const draft = { ...cloudDraft, displayName: cloudDraft.displayName || defaultCloudDisplayName(cloudDraft.baseUrl) };
@@ -862,6 +906,7 @@ function bind() {
   document.querySelector('#browser-back')?.addEventListener('click', () => browserBack().catch(reason => { error = `无法返回上级：${String(reason)}`; render(); }));
   document.querySelector('#browser-reveal')?.addEventListener('click', revealFolder);
   document.querySelector('#close-browser')?.addEventListener('click', () => { activeFolder = null; browserPath = null; browserHistory = []; folderEntries = []; render(); });
+  document.querySelector('#close-inspector')?.addEventListener('click', () => { activeFolder = null; browserPath = null; browserHistory = []; folderEntries = []; preview = null; render(); });
   document.querySelectorAll<HTMLElement>('.preview-file').forEach(button => button.addEventListener('click', () => loadPreview(button.dataset.path ?? '')));
   document.querySelector('#close-preview')?.addEventListener('click', () => { preview = null; render(); });
   document.querySelector('#reveal-file')?.addEventListener('click', revealPreview);
@@ -909,6 +954,8 @@ function bind() {
   document.querySelector('#create-ai-workspace')?.addEventListener('click', createAiWorkspace);
   document.querySelector('#open-ai-output-folder')?.addEventListener('click', openAiOutputFolder);
   document.querySelector('#reveal-ai-output-folder')?.addEventListener('click', revealAiOutputFolder);
+  document.querySelector<HTMLSelectElement>('#assistant-model-choice')?.addEventListener('change', event => selectAssistantModel((event.target as HTMLSelectElement).value).catch(reason => { error = `无法切换模型：${String(reason)}`; render(); }));
+  document.querySelector('[data-new-conversation]')?.addEventListener('click', () => { activeConversationId = null; conversationMessages = []; agentRun = null; agentEvents = []; workspaceAction = null; render(); });
   document.querySelector<HTMLFormElement>('#cloud-provider-form')?.addEventListener('submit', saveCloudProvider);
   document.querySelector('#test-cloud-connection')?.addEventListener('click', testCloudConnection);
   document.querySelector('#fetch-cloud-models')?.addEventListener('click', fetchCloudModels);

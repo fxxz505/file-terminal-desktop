@@ -840,6 +840,7 @@ struct AgentRunRequest {
     question: String,
     scope: Option<Vec<String>>,
     conversation_id: Option<String>,
+    execution_preference: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -7403,7 +7404,44 @@ fn prepare_agent_run(
         sources.len(),
         get_runtime_status(state.clone()).model_installed,
     );
-    let (route, reason, status, automatic, provider_id) = if !complex {
+    let execution_preference = input.execution_preference.as_deref().unwrap_or("automatic");
+    if !matches!(execution_preference, "automatic" | "local" | "cloud") {
+        return Err("无效的模型路由偏好。".to_string());
+    }
+    let (route, reason, status, automatic, provider_id) = if execution_preference == "local" {
+        (
+            "local",
+            "用户已选择本地模型；不会自动发送云端请求。",
+            if get_runtime_status(state.clone()).model_installed {
+                "awaiting_local_execution"
+            } else {
+                "local_only"
+            },
+            false,
+            None,
+        )
+    } else if execution_preference == "cloud" {
+        let config = provider
+            .filter(|config| config.configured)
+            .ok_or_else(|| "请选择已配置且可用的云端模型，或改用自动/本地模型。".to_string())?;
+        if ask_count > 0 || config.review_each_request {
+            (
+                "cloud_needs_confirmation",
+                "用户已选择云端模型；包含每次询问资料或全局审阅开关，等待确认。",
+                "awaiting_confirmation",
+                false,
+                Some(config.provider_id),
+            )
+        } else {
+            (
+                "cloud_auto",
+                "用户已选择云端模型；仅发送允许上传且经过脱敏的最小资料包。",
+                "prepared",
+                true,
+                Some(config.provider_id),
+            )
+        }
+    } else if !complex {
         (
             "local",
             "本地检索足以处理当前任务。",

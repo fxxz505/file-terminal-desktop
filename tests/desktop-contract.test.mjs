@@ -781,7 +781,7 @@ test('assistant workbench combines the task timeline and AI conversation while c
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
   assert.match(shell, /AI 协作台/);
-  assert.match(shell, /assistant-workbench/);
+  assert.match(shell, /assistant-shell/);
   assert.match(shell, /cloudProviderSettings\(\)/);
   assert.match(shell, /云端 AI 配置/);
   assert.doesNotMatch(shell, /data-testid="nav-conversations"/);
@@ -935,7 +935,7 @@ test('start-task control exposes an immediate in-progress label while local plan
   assert.match(shell, /isWorking \? '正在启动任务…' : '开始任务'/);
   const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
   assert.match(styles, /\.task-starting/);
-  assert.match(styles, /\.assistant-workbench \.chat-message\.user/);
+  assert.match(styles, /\.assistant-shell \.chat-message\.user/);
 });
 
 test('desktop layout keeps wide pages readable and responsive', async () => {
@@ -984,7 +984,22 @@ test('watcher failures fall back to bounded scans and real WebView automation ha
   assert.match(backend, /FILE_TERMINAL_TEST_DATA_DIR/);
   assert.match(shell, /data-testid="nav-search"/);
   assert.match(shell, /data-testid="nav-diagnostics"/);
-  assert.match(shell, /assistant-workbench/);
+  assert.match(shell, /assistant-shell/);
   assert.match(e2e, /tauri:options/);
   assert.match(e2e, /TAURI_E2E_APP/);
+});
+
+test('Codex-style workbench keeps files in a right inspector and offers local and cloud model choices', async () => {
+  const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(shell, /function rightInspector\(\)/);
+  assert.match(shell, /id="assistant-model-choice"/);
+  assert.match(shell, /<optgroup label="本地模型">/);
+  assert.match(shell, /<optgroup label="云端模型">/);
+  assert.match(shell, /executionPreference/);
+  assert.match(backend, /execution_preference/);
+  assert.match(styles, /\.right-inspector\{position:fixed/);
+  assert.match(styles, /\.assistant-shell\{display:grid/);
+  assert.match(styles, /\.inspector-open main\{margin-right:420px/);
 });
