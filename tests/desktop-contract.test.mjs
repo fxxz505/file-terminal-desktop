@@ -38,7 +38,7 @@ test('metadata editing preserves notes and tags while showing fixed cloud policy
   assert.match(backend, /metadata_audit/);
   assert.match(shell, /contextmenu/);
   assert.match(shell, /editMetadata/);
-  assert.match(shell, /???????/);
+  assert.match(shell, /云端：禁止上传/);
 });
 
 test('AI output uses an explicitly selected folder or a dedicated application folder', async () => {
@@ -48,7 +48,7 @@ test('AI output uses an explicitly selected folder or a dedicated application fo
   assert.match(backend, /fn write_ai_file/);
   assert.match(backend, /ai_output_roots/);
   assert.match(backend, /safe_relative_path/);
-  assert.match(shell, /?? AI ?????/);
+  assert.match(shell, /选择 AI 写入文件夹/);
   assert.match(shell, /prepare_ai_output/);
 });
 
@@ -131,17 +131,17 @@ test('recovery mode can preserve unreadable data and start a separate empty loca
   const workflow = await readFile(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
   assert.match(backend, /fn create_fresh_data_directory/);
   assert.match(backend, /fn start_fresh_database/);
-  assert.match(backend, /??????-??/);
+  assert.match(backend, /资料终端数据-新建/);
   assert.match(backend, /fn executable_data_dir/);
-  assert.match(backend, /??????/);
+  assert.match(backend, /资料终端数据/);
   assert.match(shell, /start_fresh_database/);
-  assert.match(shell, /???????????/);
+  assert.match(shell, /进入软件（新建资料库）/);
   assert.match(workflow, /Package portable bundle/);
 });
 
 test('assistant contract includes a deterministic fallback for game intent', async () => {
   const source = await readFile(new URL('../src-tauri/src/assistant.rs', import.meta.url), 'utf8');
-  assert.match(source, /normalized\.contains\("??"\) \|\| normalized\.contains\("?"\)/);
+  assert.match(source, /normalized\.contains\("游戏"\) \|\| normalized\.contains\("玩"\)/);
   assert.match(source, /"steam"/);
 });
 
@@ -239,7 +239,7 @@ test('cloud collaboration keeps credentials outside SQLite and records only safe
   assert.match(backend, /CREATE TABLE IF NOT EXISTS agent_runs/);
   assert.match(backend, /fn prepare_agent_run/);
   assert.match(backend, /async fn run_cloud_collaboration/);
-  assert.match(backend, /???????????????/);
+  assert.match(backend, /数据库未保存原始问题或请求正文/);
   assert.doesNotMatch(backend, /api_key TEXT/);
 });
 
@@ -284,7 +284,7 @@ test('renaming a saved provider keeps its credential bound to the edited provide
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.match(backend, /previous_provider_id/);
-  assert.match(backend, /?????????/);
+  assert.match(backend, /迁移云端提供商密钥/);
   assert.match(backend, /UPDATE cloud_provider_config SET provider_id/);
   assert.match(backend, /delete_credential/);
   assert.doesNotMatch(backend, /api_key TEXT/);
@@ -295,10 +295,10 @@ test('renaming a saved provider keeps its credential bound to the edited provide
 test('cloud provider form hides the internal identifier and distinguishes saved credentials from temporary input', async () => {
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   const css = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
-  assert.match(shell, /???? Windows ?????/);
-  assert.match(shell, /????????/);
+  assert.match(shell, /已保存到 Windows 凭据管理器/);
+  assert.match(shell, /本次输入尚未保存/);
   assert.match(shell, /cloud-api-key-visibility/);
-  assert.match(shell, /setAttribute\('aria-label'.*?? API Key/);
+  assert.match(shell, /setAttribute\('aria-label'.*显示 API Key/);
   assert.match(shell, /crypto\.randomUUID/);
   assert.doesNotMatch(shell, /id="cloud-provider-id"/);
   assert.match(css, /cloud-provider-card/);
@@ -308,15 +308,15 @@ test('cloud provider form hides the internal identifier and distinguishes saved 
 test('temporary connection checks keep the entered API key in the page and manual models remain valid', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
-  assert.match(backend, /????????????/);
-  assert.match(backend, /???????????????/);
+  assert.match(backend, /模型可在获取列表后再选择/);
+  assert.match(backend, /模型列表不可用时也可以手动填写/);
   const discoveryHandler = shell.slice(shell.indexOf('async function fetchCloudModels'), shell.indexOf('async function selectCloudProvider'));
   assert.match(discoveryHandler, /discover_cloud_models/);
   assert.doesNotMatch(discoveryHandler, /save_cloud_provider_config/);
   assert.doesNotMatch(discoveryHandler, /cloudDraft = \{ \.\.\.draft, apiKey: '' \}/);
   assert.match(shell, /id="cloud-model-input"/);
   assert.match(backend, /model_endpoint_candidates/);
-  assert.match(backend, /????????/);
+  assert.match(backend, /模型列表接口返回/);
 });
 
 test('local and cloud conversations are persisted and AI replies are parsed without executing them', async () => {
@@ -398,14 +398,14 @@ test('folder refresh preserves metadata and users can choose an existing local G
   assert.match(backend, /fn select_local_model/);
   assert.match(backend, /fn active_model_path/);
   assert.match(shell, /register-local-model/);
-  assert.match(shell, /???? GGUF ??/);
+  assert.match(shell, /选择本地 GGUF 模型/);
 });
 
 test('cloud-bound source content is guarded against injection and local model records can be removed safely', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.match(backend, /fn contains_prompt_injection/);
-  assert.match(backend, /?????/);
+  assert.match(backend, /提示词注入/);
   assert.match(backend, /fn delete_local_model/);
   assert.match(backend, /DELETE FROM local_models/);
   assert.match(shell, /delete-local-model/);
@@ -464,9 +464,9 @@ test('model provisioning supports verified resumes and local privacy reports are
   assert.match(backend, /Range/);
   assert.match(backend, /partial/);
   assert.match(backend, /fn get_privacy_status/);
-  assert.match(backend, /????/);
+  assert.match(backend, /磁盘加密/);
   assert.match(shell, /privacy-status/);
-  assert.match(shell, /????/);
+  assert.match(shell, /磁盘加密/);
 });
 
 test('document search pages directly in SQLite and does not materialize every matching item', async () => {
@@ -481,7 +481,7 @@ test('document search pages directly in SQLite and does not materialize every ma
 test('folder indexing rejects overlapping references and agent auto-apply remains opt-in and constrained', async () => {
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
-  assert.match(backend, /?????????/);
+  assert.match(backend, /拒绝接入重叠文件夹/);
   assert.match(backend, /fn auto_apply_low_risk_agent_advice/);
   assert.match(backend, /auto_apply_low_risk/);
   assert.match(backend, /is_low_risk_advice/);
@@ -500,7 +500,7 @@ test('all AI write paths reject existing targets and verified model downloads re
   const directWrite = backend.slice(backend.indexOf('fn write_ai_file('), backend.indexOf('fn workspace_root('));
   const download = backend.slice(backend.indexOf('async fn download_to('), backend.indexOf('async fn download_with_fallback('));
   assert.match(directWrite, /target\.exists\(\)/);
-  assert.match(directWrite, /???????????/);
+  assert.match(directWrite, /拒绝覆盖已有工作区文件/);
   assert.match(directWrite, /create_new\(true\)/);
   assert.match(download, /RANGE_NOT_SATISFIABLE/);
   assert.match(download, /verify_sha256\(&temporary/);
@@ -522,7 +522,7 @@ test('desktop automatically notices referenced-folder changes and schedules a sa
   assert.match(shell, /folder-change-detected/);
   assert.match(shell, /scheduleFolderRefresh/);
   assert.match(shell, /enqueue_index_job/);
-  assert.match(shell, /??????????/);
+  assert.match(shell, /正在监听已接入资料夹/);
 });
 
 test('index refreshes use a persisted single-worker queue with pause, resume, and per-file change tracking', async () => {
@@ -624,7 +624,7 @@ test('database key recovery never replaces an existing database after an update'
   assert.match(backend, /CryptProtectData/);
   assert.match(backend, /CryptUnprotectData/);
   assert.match(backend, /fn load_database_key\(data_dir: &Path, database_exists: bool\)/);
-  assert.match(backend, /?????????????????????????????????/);
+  assert.match(backend, /已有本地数据库但找不到可用密钥；为保护原数据，应用未创建空数据库。/);
   assert.doesNotMatch(backend, /quarantine_unreadable_database\(data_dir, &database\)/);
 });
 
@@ -651,7 +651,7 @@ test('local agent has a deterministic image-gallery fallback when llama runtime 
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   assert.match(backend, /fn deterministic_image_gallery_advice/);
   assert.match(backend, /fn deterministic_image_gallery_from_request/);
-  assert.match(backend, /???????|????/);
+  assert.match(backend, /可点击切换图片|切换图片/);
   assert.match(backend, /deterministic_image_gallery_from_request/);
   assert.match(backend, /fn local_file_uri/);
   assert.match(backend, /file:\/\/\//);
@@ -718,7 +718,7 @@ test('Office high-fidelity preview converts a referenced file with isolated loca
   assert.match(backend, /--outdir/);
   assert.match(backend, /OFFICE_PREVIEW_TIMEOUT/);
   assert.match(shell, /convert_office_preview/);
-  assert.match(shell, /?????/);
+  assert.match(shell, /高保真预览/);
 });
 
 test('agent repair uses a maximum two-attempt diagnostic to cloud advice loop with controlled writes and fixed rechecks', async () => {
@@ -727,11 +727,11 @@ test('agent repair uses a maximum two-attempt diagnostic to cloud advice loop wi
   assert.match(backend, /MAX_AGENT_REPAIR_ATTEMPTS/);
   assert.match(backend, /async fn auto_repair_agent_run/);
   assert.match(backend, /repair_attempts/);
-  assert.match(backend, /????/);
+  assert.match(backend, /最小修复/);
   assert.match(backend, /run_workspace_check/);
   assert.match(backend, /apply_agent_advice_inner/);
   assert.match(shell, /auto_repair_agent_run/);
-  assert.match(shell, /??????/);
+  assert.match(shell, /自动最小修复/);
 });
 
 test('desktop accepts a dropped folder and keeps native selection as a fallback', async () => {
@@ -740,7 +740,7 @@ test('desktop accepts a dropped folder and keeps native selection as a fallback'
   assert.match(shell, /onDragDropEvent/);
   assert.match(shell, /event\.payload\.paths/);
   assert.match(shell, /importFolderPath/);
-  assert.match(shell, /?????/);
+  assert.match(shell, /拖入文件夹/);
 });
 
 test('changed folder indexes automatically schedule an incremental embedding update', async () => {
@@ -762,7 +762,7 @@ test('local tool manager installs only fixed winget packages and reports each to
   assert.match(backend, /Gyan\.FFmpeg/);
   assert.match(backend, /TheDocumentFoundation\.LibreOffice/);
   assert.match(backend, /accept-package-agreements/);
-  assert.match(shell, /??????/);
+  assert.match(shell, /本机工具管理/);
   assert.match(shell, /install_local_tool/);
 });
 
@@ -771,19 +771,19 @@ test('agent can modify an existing workspace file only after an explicit recover
   const backend = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
   assert.match(backend, /allow_existing_edits/);
   assert.match(backend, /agent-edit-backups/);
-  assert.match(backend, /???????????/);
-  assert.match(backend, /????????/);
-  assert.match(shell, /?????????/);
+  assert.match(backend, /拒绝修改已有工作区文件/);
+  assert.match(backend, /已创建可恢复备份/);
+  assert.match(shell, /批准后修改已有文件/);
   assert.match(shell, /allowExistingEdits: true/);
 });
 
 test('assistant workbench combines the task timeline and AI conversation while cloud configuration lives in settings', async () => {
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
-  assert.match(shell, /AI ???/);
+  assert.match(shell, /AI 协作台/);
   assert.match(shell, /assistant-shell/);
   assert.match(shell, /cloudProviderSettings\(\)/);
-  assert.match(shell, /?? AI ??/);
+  assert.match(shell, /云端 AI 配置/);
   assert.doesNotMatch(shell, /data-testid="nav-conversations"/);
   assert.doesNotMatch(shell, /data-testid="nav-tasks"/);
   assert.match(shell, /form-warning/);
@@ -809,7 +809,7 @@ test('complex local tasks generate reviewed workspace files before escalating to
   assert.match(backend, /running_local/);
   assert.match(backend, /awaiting_approval/);
   assert.match(backend, /needs_cloud_assistance/);
-  assert.match(backend, /??? JSON/);
+  assert.match(backend, /仅返回 JSON/);
   assert.match(shell, /run_local_agent_task/);
   assert.match(shell, /runLocalAgentTask/);
   assert.match(shell, /awaiting_local_execution/);
@@ -819,7 +819,7 @@ test('cloud escalation starts automatically only for a configured automatic rout
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.match(shell, /agentRun\.route === 'cloud_auto' && \['prepared', 'needs_cloud_assistance'\]\.includes\(agentRun\.status\)/);
   assert.match(shell, /const cloudEscalation/);
-  assert.match(shell, /data-view="settings">???? AI ??/);
+  assert.match(shell, /data-view="settings">前往云端 AI 配置/);
 });
 
 test('search result metadata uses explicit grid rows so indexing and cloud labels cannot overlap', async () => {
@@ -833,9 +833,9 @@ test('desktop refuses to replace an unreadable local database with an empty data
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.match(backend, /database-recovery/);
   assert.match(backend, /startup_recovery_notice/);
-  assert.match(backend, /?????????/);
+  assert.match(backend, /应用未创建空数据库/);
   assert.match(shell, /recoveryNotice/);
-  assert.match(shell, /???????/);
+  assert.match(shell, /数据库恢复提示/);
 });
 
 test('desktop automatically retries preserved encrypted databases and merges readable records without replacing newer data', async () => {
@@ -845,7 +845,7 @@ test('desktop automatically retries preserved encrypted databases and merges rea
   assert.match(backend, /ATTACH DATABASE/);
   assert.match(backend, /INSERT OR IGNORE INTO main/);
   assert.match(backend, /AUTO_RESTORE_STATUS\.txt/);
-  assert.match(backend, /???????/);
+  assert.match(backend, /已自动尝试恢复/);
   assert.match(shell, /recoveryNotice/);
 });
 
@@ -855,12 +855,12 @@ test('upgrades preserve and automatically restore the executable sibling library
   const config = await readFile(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8');
   const hooks = await readFile(new URL('../src-tauri/nsis-hooks.nsh', import.meta.url), 'utf8');
   assert.match(backend, /fn restore_install_backup/);
-  assert.match(backend, /??????\.install-backup/);
+  assert.match(backend, /资料终端数据\.install-backup/);
   assert.match(backend, /restore_install_backup\(&executable_dir\)/);
   assert.match(config, /"installerHooks":\s*"nsis-hooks\.nsh"/);
   assert.match(hooks, /NSIS_HOOK_PREINSTALL/);
   assert.match(hooks, /NSIS_HOOK_POSTINSTALL/);
-  assert.match(hooks, /??????\.install-backup/);
+  assert.match(hooks, /资料终端数据\.install-backup/);
   assert.doesNotMatch(hooks, /\ndone:/);
   assert.match(hooks, /preserve_done:/);
   assert.match(hooks, /restore_done:/);
@@ -907,7 +907,7 @@ test('update checks expose a separate loading state, retry path, and bounded net
   assert.match(shell, /attempts < 3/);
   assert.match(shell, /id="check-update-retry"/);
   assert.match(shell, /update-check-progress/);
-  assert.match(shell, /GitHub ????/);
+  assert.match(shell, /GitHub 更新服务/);
   assert.match(styles, /\.update-check-progress/);
   assert.match(styles, /\.workspace-extras-grid/);
 });
@@ -932,7 +932,7 @@ test('updater requests an uncompressed response for proxy-safe GitHub downloads'
 
 test('start-task control exposes an immediate in-progress label while local planning starts', async () => {
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
-  assert.match(shell, /isWorking \? '???????' : '????'/);
+  assert.match(shell, /isWorking \? '正在启动任务…' : '开始任务'/);
   const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
   assert.match(styles, /\.task-starting/);
   assert.match(styles, /\.assistant-shell \.chat-message\.user/);
@@ -953,7 +953,7 @@ test('workspace folders and local conversation history use readable desktop info
   const shell = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
   const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
   assert.match(shell, /conversation-empty/);
-  assert.match(shell, /??????<\/b><small>/);
+  assert.match(shell, /本机对话记录<\/b><small>/);
   assert.match(styles, /\.folder-reference-row \.remove-folder-reference\{width:106px/);
   assert.match(styles, /\.conversation-layout\.standalone\{grid-template-columns:280px minmax\(0,1fr\)/);
   assert.match(styles, /\.chat-empty\{display:grid;place-items:center/);
@@ -995,8 +995,8 @@ test('Codex-style workbench keeps files in a right inspector and offers local an
   const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
   assert.match(shell, /function rightInspector\(\)/);
   assert.match(shell, /id="assistant-model-choice"/);
-  assert.match(shell, /<optgroup label="????">/);
-  assert.match(shell, /<optgroup label="????">/);
+  assert.match(shell, /<optgroup label="本地模型">/);
+  assert.match(shell, /<optgroup label="云端模型">/);
   assert.match(shell, /executionPreference/);
   assert.match(backend, /execution_preference/);
   assert.match(styles, /\.right-inspector\{position:fixed/);
